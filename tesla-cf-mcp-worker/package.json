@@ -1,0 +1,16 @@
+{
+  "name": "tesla-cf-mcp-worker",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Cloudflare Workers MCP server for the Tesla Fleet API (telemetry-aware reads + signed vehicle commands)",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20250505.0",
+    "typescript": "^5.5.0",
+    "wrangler": "^4.14.0"
+  }
+}
