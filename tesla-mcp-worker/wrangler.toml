@@ -1,0 +1,23 @@
+# tesla-mcp-worker — Cloudflare Workers MCP server for the Tesla Fleet API.
+#
+# Secrets (set with `wrangler secret put <NAME>`, never in this file):
+#   TESLA_CLIENT_ID      — Tesla developer app client ID
+#   TESLA_CLIENT_SECRET  — Tesla developer app client secret
+#   TESLA_PRIVATE_KEY    — PEM EC (P-256) private key used for Vehicle Command signing
+#   TESLA_REFRESH_TOKEN  — (optional seed) owner refresh token; rotated copies live in KV
+#   MCP_AUTH_TOKEN       — shared secret gating /mcp (Claude Code bearer / claude.ai OAuth)
+
+name = "tesla-mcp-worker"
+main = "src/index.ts"
+compatibility_date = "2025-05-05"
+
+[[kv_namespaces]]
+binding = "TESLA_KV"
+id = "REPLACE_WITH_KV_NAMESPACE_ID" # wrangler kv namespace create TESLA_KV
+
+[vars]
+# Fleet API region: "na", "eu" or "cn". Must match where the account/vehicles live.
+TESLA_REGION = "na"
+# Public origin this Worker is served from. Used for OAuth redirect URIs and the
+# partner-account domain registration. Set to your custom domain once routed.
+PUBLIC_ORIGIN = "https://tesla-mcp-worker.YOUR_SUBDOMAIN.workers.dev"
