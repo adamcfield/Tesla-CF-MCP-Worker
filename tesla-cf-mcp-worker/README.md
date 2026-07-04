@@ -54,6 +54,10 @@ separate file, and the private key never leaves Worker secrets.
 
 ### 3. Deploy
 
+**Easiest**: `./setup.sh` — does everything below (login, keygen, KV/D1
+creation, secrets, double-deploy) and prints every URL you need, filled in.
+Safe to re-run. Manual equivalent:
+
 ```sh
 npm install
 wrangler kv namespace create TESLA_KV       # put the id into wrangler.toml
