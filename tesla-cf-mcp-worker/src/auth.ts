@@ -270,11 +270,11 @@ export async function handleOauthRegister(request: Request): Promise<Response> {
 }
 
 const AUTHORIZE_PAGE = (action: string, error = "") => `<!doctype html>
-<html><head><meta charset="utf-8"><title>tesla-mcp-worker</title>
+<html><head><meta charset="utf-8"><title>tesla-cf-mcp-worker</title>
 <style>body{font-family:system-ui;max-width:26rem;margin:15vh auto;padding:0 1rem}
 input,button{font-size:1rem;padding:.5rem;width:100%;box-sizing:border-box;margin-top:.5rem}
 .err{color:#b00}</style></head><body>
-<h2>tesla-mcp-worker</h2>
+<h2>tesla-cf-mcp-worker</h2>
 <p>Enter the server access token (<code>MCP_AUTH_TOKEN</code>) to connect this MCP server.</p>
 ${error ? `<p class="err">${error}</p>` : ""}
 <form method="post" action="${action}">

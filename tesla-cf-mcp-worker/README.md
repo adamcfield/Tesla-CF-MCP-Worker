@@ -1,4 +1,4 @@
-# tesla-mcp-worker
+# Tesla CF MCP Worker
 
 Cloudflare Workers MCP server for the **Tesla Fleet API**: vehicle data reads and
 **signed vehicle commands** (Vehicle Command Protocol — not the deprecated plain

@@ -1,5 +1,5 @@
 /**
- * tesla-mcp-worker — entrypoint/router.
+ * tesla-cf-mcp-worker — entrypoint/router.
  *
  * Public (no auth):
  *   GET  /.well-known/appspecific/com.tesla.3p.public-key.pem  (Tesla key hosting)
@@ -55,7 +55,7 @@ export default {
 
       if (path === "/" || path === "") {
         return new Response(
-          "tesla-mcp-worker — Tesla Fleet API MCP server.\n" +
+          "tesla-cf-mcp-worker — Tesla Fleet API MCP server.\n" +
             "MCP endpoint: POST /mcp (Bearer auth). See README for setup.\n",
           { headers: { "content-type": "text/plain" } },
         );

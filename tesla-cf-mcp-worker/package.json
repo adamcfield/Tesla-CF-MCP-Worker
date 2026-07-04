@@ -1,5 +1,5 @@
 {
-  "name": "tesla-mcp-worker",
+  "name": "tesla-cf-mcp-worker",
   "version": "0.1.0",
   "private": true,
   "description": "Cloudflare Workers MCP server for the Tesla Fleet API (telemetry-aware reads + signed vehicle commands)",
