@@ -8,6 +8,8 @@
 
 import * as api from "./api";
 import * as cmd from "./commands";
+import * as rules from "./rules";
+import * as store from "./store";
 import * as telemetry from "./telemetry";
 import { Env, TeslaError } from "./types";
 
@@ -211,6 +213,40 @@ const TOOLS: Tool[] = [
     handler: async (env, a) => commandResult(await cmd.honkHorn(env, a.vin)),
   },
   {
+    name: "set_charging_amps",
+    description: "Set the charging current in amps (e.g. for load-shifting or solar-surplus matching).",
+    inputSchema: {
+      type: "object",
+      properties: { ...vinProp, amps: { type: "number", minimum: 1, maximum: 48 } },
+      required: ["vin", "amps"],
+    },
+    handler: async (env, a) => commandResult(await cmd.setChargingAmps(env, a.vin, Math.round(a.amps))),
+  },
+  {
+    name: "set_sentry_mode",
+    description: "Turn Sentry Mode on or off.",
+    inputSchema: {
+      type: "object",
+      properties: { ...vinProp, on: { type: "boolean" } },
+      required: ["vin", "on"],
+    },
+    handler: async (env, a) => commandResult(await cmd.setSentryMode(env, a.vin, a.on)),
+  },
+  {
+    name: "navigate_to",
+    description: "Send a destination (lat/lon) to the vehicle's navigation, replacing the current route.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        ...vinProp,
+        latitude: { type: "number" },
+        longitude: { type: "number" },
+      },
+      required: ["vin", "latitude", "longitude"],
+    },
+    handler: async (env, a) => commandResult(await cmd.navigateToCoords(env, a.vin, a.latitude, a.longitude)),
+  },
+  {
     name: "open_charge_port",
     description: "Open the charge port door (also unlatches a plugged-in cable when not charging).",
     inputSchema: vinSchema,
@@ -374,6 +410,104 @@ const TOOLS: Tool[] = [
     description: "Remove the Fleet Telemetry streaming config from a vehicle.",
     inputSchema: vinSchema,
     handler: (env, a) => telemetry.deleteTelemetryConfig(env, a.vin),
+  },
+
+  // ------------------------------------------------- history & latest state
+  {
+    name: "get_latest_state",
+    description:
+      "Latest known vehicle state from the local store (telemetry ingest / last poll). Free and instant — " +
+      "prefer this over get_vehicle_data when telemetry streaming is set up.",
+    inputSchema: vinSchema,
+    handler: async (env, a) => (await store.getLatest(env, a.vin)) ?? { vin: a.vin, note: "no data ingested yet" },
+  },
+  {
+    name: "get_history",
+    description:
+      "Time series from the local history store (D1), e.g. field=soc for battery/degradation tracking, " +
+      "field=odometer for mileage logs, field=lat/lon for trips. Use list_history_fields to see what's stored.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        ...vinProp,
+        field: { type: "string", description: "Canonical field, e.g. soc, odometer, outside_temp, tpms_fl" },
+        hours: { type: "number", default: 24 },
+      },
+      required: ["vin", "field"],
+    },
+    handler: (env, a) => store.querySeries(env, a.vin, a.field, a.hours ?? 24),
+  },
+  {
+    name: "list_history_fields",
+    description: "List which fields have stored history for a vehicle.",
+    inputSchema: vinSchema,
+    handler: (env, a) => store.listFields(env, a.vin),
+  },
+  {
+    name: "get_charge_sessions",
+    description:
+      "Charge session log (start/end time & SoC, kWh added, location, cost when a price rule supplied one).",
+    inputSchema: {
+      type: "object",
+      properties: { ...vinProp, limit: { type: "number", default: 20 } },
+      required: ["vin"],
+    },
+    handler: (env, a) => store.listChargeSessions(env, a.vin, a.limit ?? 20),
+  },
+  {
+    name: "get_alert_log",
+    description: "Recent automation/alert firings (including rule errors and skipped runs).",
+    inputSchema: {
+      type: "object",
+      properties: { vin: { type: "string" }, limit: { type: "number", default: 50 } },
+    },
+    handler: (env, a) => store.listAlerts(env, a.vin, a.limit ?? 50),
+  },
+
+  // ------------------------------------------------------------ automations
+  {
+    name: "list_automations",
+    description: "List configured automation rules (price/solar charging, geofences, alerts, schedules).",
+    inputSchema: { type: "object", properties: {} },
+    handler: (env) => rules.getAutomations(env),
+  },
+  {
+    name: "set_automation",
+    description:
+      "Create or update an automation rule (upsert by id; omit id to create). `rule` is the full JSON rule " +
+      "document. Types: price_charging (feed, cheap_below_cents, amps_cheap, limit_cheap, expensive_above_cents), " +
+      "solar_surplus (source, start_above_w, stop_below_w, volts, phases, min/max_amps, at{lat,lon,radius_m}), " +
+      "scheduled_precondition (time, days, tz_offset_minutes, conditions{outside_temp_below_c, soc_above}, temp_celsius), " +
+      "geofence (lat, lon, radius_m, on_enter[], on_exit[] of {command,args}), " +
+      "alert (when: door_unlocked_while_away|soc_below|tire_pressure_drop|charging_started|charging_stopped|unexpected_wake, " +
+      "notify[] webhook URLs). Common fields: vin, enabled, notify, allow_poll, cooldown_minutes. " +
+      "Automations can never unlock or open trunks, and never wake a sleeping vehicle. See README for examples.",
+    inputSchema: {
+      type: "object",
+      properties: { rule: { type: "object", description: "Full automation rule JSON" } },
+      required: ["rule"],
+    },
+    handler: async (env, a) => {
+      const rule = a.rule as rules.AutomationRule;
+      if (!rule.type || !rule.vin) throw new TeslaError("rule.type and rule.vin are required");
+      return rules.saveAutomation(env, rule);
+    },
+  },
+  {
+    name: "delete_automation",
+    description: "Delete an automation rule by id.",
+    inputSchema: {
+      type: "object",
+      properties: { id: { type: "string" } },
+      required: ["id"],
+    },
+    handler: async (env, a) => ({ deleted: await rules.deleteAutomation(env, a.id) }),
+  },
+  {
+    name: "run_automations_now",
+    description: "Run one automation-engine tick immediately (same as the 15-min cron) — useful for testing rules.",
+    inputSchema: { type: "object", properties: {} },
+    handler: (env) => rules.runCronTick(env),
   },
 ];
 

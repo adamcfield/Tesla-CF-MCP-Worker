@@ -214,6 +214,15 @@ export const flashLights = (env: Env, vin: string) =>
 export const honkHorn = (env: Env, vin: string) =>
   infotainment(env, vin, CarServer.honkHorn());
 
+export const setSentryMode = (env: Env, vin: string, on: boolean) =>
+  infotainment(env, vin, CarServer.setSentryMode(on));
+
+export const setChargingAmps = (env: Env, vin: string, amps: number) =>
+  infotainment(env, vin, CarServer.setChargingAmps(amps));
+
+export const navigateToCoords = (env: Env, vin: string, lat: number, lon: number) =>
+  infotainment(env, vin, CarServer.navigateToCoords(lat, lon));
+
 export const addChargeSchedule = (
   env: Env,
   vin: string,

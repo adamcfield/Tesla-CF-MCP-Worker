@@ -65,6 +65,14 @@ export class PbWriter {
     return this;
   }
 
+  double(field: number, v: number): this {
+    const dv = new DataView(new ArrayBuffer(8));
+    dv.setFloat64(0, v, true);
+    this.tag(field, 1);
+    for (let i = 0; i < 8; i++) this.buf.push(dv.getUint8(i));
+    return this;
+  }
+
   bytes(field: number, v: Uint8Array): this {
     this.tag(field, 2);
     this.varint(v.length);
@@ -539,6 +547,16 @@ export const CarServer = {
   },
   flashLights(): Uint8Array {
     return carAction(26, new PbWriter());
+  },
+  setSentryMode(on: boolean): Uint8Array {
+    return carAction(30, new PbWriter().bool(1, on));
+  },
+  setChargingAmps(amps: number): Uint8Array {
+    return carAction(43, new PbWriter().uint32(1, amps));
+  },
+  /** navigationGpsRequest — order 1 = replace the current destination. */
+  navigateToCoords(lat: number, lon: number): Uint8Array {
+    return carAction(53, new PbWriter().double(1, lat).double(2, lon).uint32(3, 1));
   },
   honkHorn(): Uint8Array {
     return carAction(27, new PbWriter());

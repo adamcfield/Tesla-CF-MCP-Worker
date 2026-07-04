@@ -2,6 +2,8 @@
 
 export interface Env {
   TESLA_KV: KVNamespace;
+  /** D1 database for telemetry history, charge sessions and the alert log. */
+  DB: D1Database;
 
   // vars (wrangler.toml)
   TESLA_REGION: "na" | "eu" | "cn";
@@ -15,6 +17,10 @@ export interface Env {
   /** Optional seed refresh token; once used, the rotated token is kept in KV. */
   TESLA_REFRESH_TOKEN?: string;
   MCP_AUTH_TOKEN: string;
+  /** Optional separate bearer for POST /ingest/telemetry (falls back to MCP_AUTH_TOKEN). */
+  INGEST_TOKEN?: string;
+  /** Optional shared secret sent as x-webhook-token on outbound alert webhooks. */
+  WEBHOOK_SECRET?: string;
 }
 
 /** Regional Fleet API bases — https://developer.tesla.com/docs/fleet-api */

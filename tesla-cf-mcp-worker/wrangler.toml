@@ -6,14 +6,27 @@
 #   TESLA_PRIVATE_KEY    — PEM EC (P-256) private key used for Vehicle Command signing
 #   TESLA_REFRESH_TOKEN  — (optional seed) owner refresh token; rotated copies live in KV
 #   MCP_AUTH_TOKEN       — shared secret gating /mcp (Claude Code bearer / claude.ai OAuth)
+#   INGEST_TOKEN         — (optional) separate bearer for POST /ingest/telemetry
+#   WEBHOOK_SECRET       — (optional) x-webhook-token header on outbound alert webhooks
 
 name = "tesla-cf-mcp-worker"
 main = "src/index.ts"
 compatibility_date = "2025-05-05"
 
+# Automation engine tick (price/solar charging, scheduled preconditioning,
+# wake alerts). Only free connectivity checks by default — billed vehicle_data
+# polls happen solely for rules with "allow_poll": true.
+[triggers]
+crons = ["*/15 * * * *"]
+
 [[kv_namespaces]]
 binding = "TESLA_KV"
 id = "REPLACE_WITH_KV_NAMESPACE_ID" # wrangler kv namespace create TESLA_KV
+
+[[d1_databases]]
+binding = "DB"
+database_name = "tesla-cf-mcp-worker"
+database_id = "REPLACE_WITH_D1_DATABASE_ID" # wrangler d1 create tesla-cf-mcp-worker
 
 [vars]
 # Fleet API region: "na", "eu" or "cn". Must match where the account/vehicles live.
