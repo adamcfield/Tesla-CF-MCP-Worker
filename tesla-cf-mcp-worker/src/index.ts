@@ -35,13 +35,26 @@ import {
   isMcpAuthorized,
   oauthProtectedResourceMetadata,
   oauthServerMetadata,
+  timingSafeEqual,
   unauthorized,
 } from "./auth";
 import { handleIngest } from "./ingest";
 import { handleMcp } from "./mcp";
 import { loadCommandKey } from "./protocol";
 import { runCronTick } from "./rules";
-import { getLatest, listChargeSessions, querySeries } from "./store";
+import { getLatest, querySeries } from "./store";
+import {
+  getBatteryDegradation,
+  getChargeCurve,
+  getChargeSessions,
+  getDrive,
+  getDrives,
+  getLocationStats,
+  getStateTimeline,
+  getTrackingSummary,
+  getVampireDrain,
+  listLocations,
+} from "./tracking";
 import { Env } from "./types";
 
 const json = (data: unknown, status = 200): Response =>
@@ -54,27 +67,85 @@ const json = (data: unknown, status = 200): Response =>
 function tokenAuthorized(request: Request, url: URL, expected: string): boolean {
   const header = request.headers.get("authorization")?.match(/^Bearer\s+(.+)$/i)?.[1]?.trim();
   const candidate = header ?? url.searchParams.get("token") ?? "";
-  return candidate.length > 0 && candidate === expected;
+  return candidate.length > 0 && timingSafeEqual(candidate, expected);
 }
 
+/**
+ * Read-only dashboard API. Every route reads the same D1 query layer as the MCP
+ * tools (tracking.ts / store.ts) — no duplicated logic. All are free and never
+ * wake the vehicle.
+ *
+ *   /data/latest?vin=            /data/summary?vin=
+ *   /data/series?vin=&field=&hours=
+ *   /data/drives?vin=&limit=     /data/drive?id=
+ *   /data/charge-sessions?vin=&limit=   /data/charge-curve?session_id=
+ *   /data/degradation?vin=       /data/vampire?vin=&days=
+ *   /data/states?vin=&hours=
+ *   /data/locations              /data/location-stats?id=
+ */
 async function handleData(url: URL, env: Env): Promise<Response> {
-  const vin = url.searchParams.get("vin");
+  const p = url.pathname;
+  const q = url.searchParams;
+  const numParam = (name: string, def: number): number => {
+    const raw = q.get(name);
+    if (raw === null || raw === "") return def;
+    const n = Number(raw);
+    return Number.isFinite(n) ? n : def;
+  };
+  // Required integer id — Number(null)/Number("") both coerce to 0, so guard the
+  // raw string before parsing rather than trusting Number.isFinite alone.
+  const requireId = (name: string): number | null => {
+    const raw = q.get(name);
+    if (raw === null || raw.trim() === "") return null;
+    const n = Number(raw);
+    return Number.isFinite(n) ? n : null;
+  };
+
+  // Routes keyed by id / session_id (no vin needed).
+  if (p === "/data/locations") return json(await listLocations(env));
+  if (p === "/data/drive") {
+    const id = requireId("id");
+    if (id === null) return json({ error: "id query param required" }, 400);
+    return json(await getDrive(env, id));
+  }
+  if (p === "/data/charge-curve") {
+    const id = requireId("session_id");
+    if (id === null) return json({ error: "session_id query param required" }, 400);
+    return json(await getChargeCurve(env, id));
+  }
+  if (p === "/data/location-stats") {
+    const id = requireId("id");
+    if (id === null) return json({ error: "id query param required" }, 400);
+    return json(await getLocationStats(env, id));
+  }
+
+  // Everything else is per-vehicle.
+  const vin = q.get("vin");
   if (!vin) return json({ error: "vin query param required" }, 400);
 
-  if (url.pathname === "/data/latest") {
-    return json((await getLatest(env, vin)) ?? { vin, note: "no data ingested yet" });
+  switch (p) {
+    case "/data/latest":
+      return json((await getLatest(env, vin)) ?? { vin, note: "no data ingested yet" });
+    case "/data/summary":
+      return json(await getTrackingSummary(env, vin));
+    case "/data/series": {
+      const field = q.get("field");
+      if (!field) return json({ error: "field query param required" }, 400);
+      return json(await querySeries(env, vin, field, numParam("hours", 24)));
+    }
+    case "/data/drives":
+      return json(await getDrives(env, vin, numParam("limit", 50)));
+    case "/data/charge-sessions":
+      return json(await getChargeSessions(env, vin, numParam("limit", 50)));
+    case "/data/degradation":
+      return json(await getBatteryDegradation(env, vin));
+    case "/data/vampire":
+      return json(await getVampireDrain(env, vin, numParam("days", 30)));
+    case "/data/states":
+      return json(await getStateTimeline(env, vin, numParam("hours", 168)));
+    default:
+      return json({ error: "not found" }, 404);
   }
-  if (url.pathname === "/data/series") {
-    const field = url.searchParams.get("field");
-    if (!field) return json({ error: "field query param required" }, 400);
-    const hours = Number(url.searchParams.get("hours") ?? 24);
-    return json(await querySeries(env, vin, field, Number.isFinite(hours) ? hours : 24));
-  }
-  if (url.pathname === "/data/charge-sessions") {
-    const limit = Number(url.searchParams.get("limit") ?? 20);
-    return json(await listChargeSessions(env, vin, Number.isFinite(limit) ? limit : 20));
-  }
-  return json({ error: "not found" }, 404);
 }
 
 export default {

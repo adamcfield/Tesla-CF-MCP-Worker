@@ -14,6 +14,7 @@ for claude.ai remote connectors.
 
 ```
 wrangler.toml        bindings + vars + cron (no secrets)
+schema.sql           full D1 schema (reference; ensureSchema applies it automatically)
 src/index.ts         router: /mcp, /ingest, /data, /.well-known, /auth, /setup, /oauth + cron handler
 src/mcp.ts           MCP JSON-RPC + tool registry
 src/auth.ts          Tesla tokens (KV-rotated refresh), partner setup, MCP auth + OAuth shim
@@ -22,7 +23,10 @@ src/commands.ts      signed commands via signed_command
 src/protocol.ts      protobuf codec + HMAC-personalized command signing
 src/telemetry.ts     fleet_telemetry_config lifecycle
 src/ingest.ts        POST /ingest/telemetry sink (fleet-telemetry bridge / webhooks / polls)
-src/store.ts         D1 history (events, charge sessions, alert log) + KV latest state
+src/store.ts         D1 schema + generic history + KV latest state
+src/tracking.ts      TeslaMate-grade derivation engine (drives, charge curve, states,
+                     degradation, vampire drain, locations) + the read queries behind
+                     both the MCP tools and the /data routes
 src/rules.ts         automation engine: cron tick + ingest-time evaluation
 src/types.ts         Env bindings, regional bases, shared types
 ```
@@ -131,7 +135,13 @@ Signed commands: `lock`, `unlock`, `set_charge_limit`, `set_charging_amps`,
 Telemetry: `get_telemetry_config`, `configure_telemetry`, `delete_telemetry_config`.
 
 History & state: `get_latest_state` (free, from the local store),
-`get_history`, `list_history_fields`, `get_charge_sessions`, `get_alert_log`.
+`get_history`, `list_history_fields`, `get_alert_log`.
+
+Tracking (TeslaMate-grade, all free — read logged D1 data, never wake):
+`get_tracking_summary`, `get_drives`, `get_drive` (with GPS route),
+`get_charge_sessions`, `get_charge_curve`, `get_battery_degradation`,
+`get_vampire_drain`, `get_state_timeline`, `list_locations`, `set_location`,
+`delete_location`, `get_location_stats`.
 
 Automations: `list_automations`, `set_automation`, `delete_automation`,
 `run_automations_now`.
@@ -162,8 +172,74 @@ and batches (`{"events":[…]}`). Bridge options:
    billed `vehicle_data` polls on the cron tick — works, costs more (see below).
 
 Register the vehicle-side config with the `configure_telemetry` tool. Every
-ingest updates the KV latest-state doc, appends to D1 history, advances the
-charge-session tracker, and evaluates geofence/alert rules.
+ingest updates the KV latest-state doc, writes a structured `positions` sample,
+advances the drive/charge/state derivation engine, appends arbitrary fields to
+the generic history store, and evaluates geofence/alert rules.
+
+### Recommended stream fields
+
+For full TeslaMate-parity tracking, stream at least these (interval seconds are
+a starting point — the engine derives everything from whatever arrives):
+
+```json
+{
+  "Soc": {"interval_seconds": 60}, "BatteryLevel": {"interval_seconds": 60},
+  "EnergyRemaining": {"interval_seconds": 120},
+  "RatedRange": {"interval_seconds": 120}, "IdealBatteryRange": {"interval_seconds": 300},
+  "Location": {"interval_seconds": 30}, "VehicleSpeed": {"interval_seconds": 10},
+  "Gear": {"interval_seconds": 5}, "Odometer": {"interval_seconds": 120},
+  "GpsHeading": {"interval_seconds": 30},
+  "DetailedChargeState": {"interval_seconds": 30},
+  "ACChargingPower": {"interval_seconds": 30}, "DCChargingPower": {"interval_seconds": 30},
+  "ACChargingEnergyIn": {"interval_seconds": 60}, "DCChargingEnergyIn": {"interval_seconds": 60},
+  "ChargerVoltage": {"interval_seconds": 30}, "ChargeAmps": {"interval_seconds": 30},
+  "ChargeLimitSoc": {"interval_seconds": 300},
+  "InsideTemp": {"interval_seconds": 120}, "OutsideTemp": {"interval_seconds": 120}
+}
+```
+
+`Gear` is what lets the engine cleanly bound a drive (D/R/N → driving, P →
+parked) and not split at every stoplight; without it, it falls back to speed.
+
+## Tracking (TeslaMate-grade history)
+
+Session boundaries are **derived from raw telemetry state transitions**, not
+taken from Tesla — the ingest path watches shift/speed and `charging_state`,
+opens a row when a drive or charge begins, and closes it (computing the
+aggregates) when it ends. An open row is the source of truth in D1, so
+derivation survives Worker restarts with no bookkeeping. Nothing here ever calls
+the Fleet API or wakes the car; it only processes data already pushed in.
+
+- **Drives** (`get_drives` / `get_drive`) — start/end time & location, distance,
+  duration, energy used, efficiency (Wh/km), SoC & range delta, avg/max speed &
+  power, and the full GPS route for map rendering. Sub-50 m parking jitter is
+  discarded.
+- **Charge sessions + curve** (`get_charge_sessions` / `get_charge_curve`) —
+  energy added, AC/DC type, max power, duration, cost (from a per-location price
+  or a price rule), plus the per-sample curve (SoC vs power/voltage/current).
+- **Battery degradation** (`get_battery_degradation`) — projected range at 100 %
+  from each completed charge, and % loss since the first record. Usable pack kWh
+  self-calibrates from clean charge sessions (no per-model constants).
+- **Vampire drain** (`get_vampire_drain`) — SoC lost while parked, awake-idle and
+  asleep (telemetry pauses on sleep and resumes on wake, so the gap is the
+  drain), per-span with an average %/day.
+- **State timeline** (`get_state_timeline`) — continuous driving / charging /
+  online / asleep / offline / updating spans. Ingest owns the active sub-states;
+  the cron's free connectivity check supplies asleep/offline/wake.
+- **Locations** (`list_locations` / `set_location` / `get_location_stats`) —
+  named geofences that tag drives (start/end) and charges, give per-site stats,
+  and can carry a `cost_per_kwh` to price charging there. (These are for
+  *logging*; the automation `geofence` rules that fire *actions* are separate.)
+
+All of the above are exposed identically as `/data/*` REST routes (see
+Dashboards) reading the same query layer.
+
+> **Units.** Distances, ranges and derived efficiency are stored in whatever unit
+> the feed sends. Fleet **Telemetry** streams metric (km) for EU/metric vehicles;
+> the Fleet **REST** `vehicle_data` used by the poll/`allow_poll` path reports
+> **miles** on US-market cars. If you mix sources or run a US vehicle, normalize
+> to one unit before charting (a single conversion at ingest is the natural spot).
+> The worker does not guess the unit — it can't be inferred reliably per-sample.
 
 ## Automations
 
@@ -247,14 +323,30 @@ explicitly opt-in because it's billed polling.
 ## Dashboards & integrations
 
 Read-only JSON endpoints (Authorization header **or** `?token=` for
-header-less consumers — note the token then appears in that consumer's logs):
+header-less consumers — note the token then appears in that consumer's logs).
+Every route reads the **same D1 query layer as the MCP tools** — no duplicate
+logic, so the dashboard and Claude always agree.
 
-- `GET /data/latest?vin=…` — Home Assistant `rest` sensor, OBS browser-source
-  overlay, status widgets.
-- `GET /data/series?vin=…&field=soc&hours=168` — Grafana (JSON API
-  datasource), degradation charts (`field=soc`, `field=rated_range`), mileage
-  logs for insurance (`field=odometer`), TPMS trends.
-- `GET /data/charge-sessions?vin=…` — charge cost/energy table.
+State & series:
+- `GET /data/latest?vin=…` — Home Assistant `rest` sensor, OBS overlay, widgets.
+- `GET /data/summary?vin=…` — odometer, lifetime km/energy, avg efficiency,
+  drive/charge counts, total charge cost, current SoC, pack kWh.
+- `GET /data/series?vin=…&field=soc&hours=168` — Grafana (JSON API datasource).
+  Structured fields (soc, rated_range, speed, power, charger_power, …) come from
+  `positions`; anything else from the generic history store.
+- `GET /data/states?vin=…&hours=168` — driving/charging/online/asleep timeline.
+
+Tracking:
+- `GET /data/drives?vin=…&limit=50` — drive log (distance, energy, efficiency…).
+- `GET /data/drive?id=…` — one drive **with its full GPS route** (map polyline).
+- `GET /data/charge-sessions?vin=…&limit=50` — charge cost/energy/type table.
+- `GET /data/charge-curve?session_id=…` — per-sample charge curve (SoC vs power).
+- `GET /data/degradation?vin=…` — projected range at 100% + % loss over time.
+- `GET /data/vampire?vin=…&days=30` — idle SoC loss, per-span + avg %/day.
+
+Locations:
+- `GET /data/locations` — named geofences.
+- `GET /data/location-stats?id=…` — drives from/to, charge energy & cost here.
 
 Make/n8n can call any MCP tool directly: `POST /mcp` with
 `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_latest_state","arguments":{"vin":"…"}}}`.

@@ -11,6 +11,7 @@ import * as cmd from "./commands";
 import * as rules from "./rules";
 import * as store from "./store";
 import * as telemetry from "./telemetry";
+import * as tracking from "./tracking";
 import { Env, TeslaError } from "./types";
 
 const SERVER_INFO = { name: "tesla-cf-mcp-worker", title: "Tesla CF MCP Worker", version: "0.1.0" };
@@ -444,17 +445,6 @@ const TOOLS: Tool[] = [
     handler: (env, a) => store.listFields(env, a.vin),
   },
   {
-    name: "get_charge_sessions",
-    description:
-      "Charge session log (start/end time & SoC, kWh added, location, cost when a price rule supplied one).",
-    inputSchema: {
-      type: "object",
-      properties: { ...vinProp, limit: { type: "number", default: 20 } },
-      required: ["vin"],
-    },
-    handler: (env, a) => store.listChargeSessions(env, a.vin, a.limit ?? 20),
-  },
-  {
     name: "get_alert_log",
     description: "Recent automation/alert firings (including rule errors and skipped runs).",
     inputSchema: {
@@ -462,6 +452,145 @@ const TOOLS: Tool[] = [
       properties: { vin: { type: "string" }, limit: { type: "number", default: 50 } },
     },
     handler: (env, a) => store.listAlerts(env, a.vin, a.limit ?? 50),
+  },
+
+  // ------------------------------------------------- tracking (TeslaMate-grade)
+  {
+    name: "get_tracking_summary",
+    description:
+      "Roll-up for a vehicle: odometer, lifetime driven km & energy, avg efficiency, drive/charge counts, " +
+      "total charge cost, current SoC, and self-calibrated usable pack kWh. Free — reads logged D1 data, never wakes.",
+    inputSchema: vinSchema,
+    handler: (env, a) => tracking.getTrackingSummary(env, a.vin),
+  },
+  {
+    name: "get_drives",
+    description:
+      "Drive history (segmented from telemetry state transitions): start/end time & location, distance, duration, " +
+      "energy used, efficiency (Wh/km), SoC & range delta, avg/max speed & power. Free — reads logged data.",
+    inputSchema: {
+      type: "object",
+      properties: { ...vinProp, limit: { type: "number", default: 50 } },
+      required: ["vin"],
+    },
+    handler: (env, a) => tracking.getDrives(env, a.vin, a.limit ?? 50),
+  },
+  {
+    name: "get_drive",
+    description: "One drive with its full GPS route/telemetry path (for map rendering). Pass the drive id from get_drives.",
+    inputSchema: {
+      type: "object",
+      properties: { id: { type: "number", description: "Drive id" } },
+      required: ["id"],
+    },
+    handler: (env, a) => tracking.getDrive(env, a.id),
+  },
+  {
+    name: "get_charge_sessions",
+    description:
+      "Charge session log: start/end time & SoC, kWh added, AC/DC type, max power, duration, location, and cost " +
+      "(from a per-location price or a price rule). Free — reads logged data.",
+    inputSchema: {
+      type: "object",
+      properties: { ...vinProp, limit: { type: "number", default: 50 } },
+      required: ["vin"],
+    },
+    handler: (env, a) => tracking.getChargeSessions(env, a.vin, a.limit ?? 50),
+  },
+  {
+    name: "get_charge_curve",
+    description: "The charge curve for one session (per-sample SoC, power, voltage, current, kWh added). Pass session_id from get_charge_sessions.",
+    inputSchema: {
+      type: "object",
+      properties: { session_id: { type: "number" } },
+      required: ["session_id"],
+    },
+    handler: (env, a) => tracking.getChargeCurve(env, a.session_id),
+  },
+  {
+    name: "get_battery_degradation",
+    description:
+      "Battery degradation over time, derived from completed charges: projected range at 100% and % loss since the " +
+      "first record, plus the self-calibrated usable pack kWh. Free — reads logged data.",
+    inputSchema: vinSchema,
+    handler: (env, a) => tracking.getBatteryDegradation(env, a.vin),
+  },
+  {
+    name: "get_vampire_drain",
+    description:
+      "Idle/vampire drain: SoC lost while parked (awake-idle and sleep), with per-span detail and an avg %/day. " +
+      "Free — reads logged data.",
+    inputSchema: {
+      type: "object",
+      properties: { ...vinProp, days: { type: "number", default: 30 } },
+      required: ["vin"],
+    },
+    handler: (env, a) => tracking.getVampireDrain(env, a.vin, a.days ?? 30),
+  },
+  {
+    name: "get_state_timeline",
+    description:
+      "Continuous state timeline (driving | charging | online | asleep | offline | updating) with durations. " +
+      "Free — reads logged data.",
+    inputSchema: {
+      type: "object",
+      properties: { ...vinProp, hours: { type: "number", default: 168 } },
+      required: ["vin"],
+    },
+    handler: (env, a) => tracking.getStateTimeline(env, a.vin, a.hours ?? 168),
+  },
+  {
+    name: "list_locations",
+    description: "List named locations (geofences used to tag drives & charges and to price charging per site).",
+    inputSchema: { type: "object", properties: {} },
+    handler: (env) => tracking.listLocations(env),
+  },
+  {
+    name: "set_location",
+    description:
+      "Create or update a named location (omit id to create). radius_m defaults to 150; cost_per_kwh (optional) " +
+      "prices charge sessions that start inside it. Drives and charges are tagged with the nearest containing location.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        id: { type: "number", description: "Existing location id to update" },
+        name: { type: "string" },
+        latitude: { type: "number" },
+        longitude: { type: "number" },
+        radius_m: { type: "number", default: 150 },
+        cost_per_kwh: { type: "number", description: "Price per kWh at this location (same currency as reports)" },
+      },
+      required: ["name", "latitude", "longitude"],
+    },
+    handler: (env, a) =>
+      tracking.setLocation(env, {
+        id: a.id,
+        name: a.name,
+        lat: a.latitude,
+        lon: a.longitude,
+        radius_m: a.radius_m,
+        cost_per_kwh: a.cost_per_kwh,
+      }),
+  },
+  {
+    name: "delete_location",
+    description: "Delete a named location by id.",
+    inputSchema: {
+      type: "object",
+      properties: { id: { type: "number" } },
+      required: ["id"],
+    },
+    handler: (env, a) => tracking.deleteLocation(env, a.id),
+  },
+  {
+    name: "get_location_stats",
+    description: "Per-location stats: drives from/to here, charge sessions, total kWh and cost. Pass the location id.",
+    inputSchema: {
+      type: "object",
+      properties: { id: { type: "number" } },
+      required: ["id"],
+    },
+    handler: (env, a) => tracking.getLocationStats(env, a.id),
   },
 
   // ------------------------------------------------------------ automations

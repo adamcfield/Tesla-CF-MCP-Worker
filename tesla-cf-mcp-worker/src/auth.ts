@@ -31,7 +31,30 @@ const randomHex = (bytes: number): string =>
  * rotated refresh token in KV. Tesla rotates refresh tokens on every use, so
  * the newest one always lives in KV; TESLA_REFRESH_TOKEN only seeds it.
  */
+// Tesla refresh tokens are single-use and rotate on every redemption. Two
+// concurrent callers presenting the same stored token would both refresh —
+// the loser gets invalid_grant, and if Tesla treats that as theft-detection
+// it can revoke the whole grant family. This in-isolate single-flight closes
+// the common case (multiple calls landing on the same warm isolate); it does
+// not cover two different colos refreshing in the same ~60s KV-propagation
+// window, which would need a Durable Object to fully serialize.
+let inFlightRefresh: Promise<string> | null = null;
+
 export async function getOwnerToken(env: Env): Promise<string> {
+  const cached = await env.TESLA_KV.get<{ token: string; exp: number }>(KV_ACCESS, "json");
+  if (cached && cached.exp - 120 > Date.now() / 1000) return cached.token;
+
+  if (inFlightRefresh) return inFlightRefresh;
+  const refreshPromise = refreshOwnerToken(env).finally(() => {
+    if (inFlightRefresh === refreshPromise) inFlightRefresh = null;
+  });
+  inFlightRefresh = refreshPromise;
+  return refreshPromise;
+}
+
+async function refreshOwnerToken(env: Env): Promise<string> {
+  // Re-check in case a refresh from another call (or another isolate, once
+  // KV propagates) already landed while we were waiting to get here.
   const cached = await env.TESLA_KV.get<{ token: string; exp: number }>(KV_ACCESS, "json");
   if (cached && cached.exp - 120 > Date.now() / 1000) return cached.token;
 
@@ -43,6 +66,29 @@ export async function getOwnerToken(env: Env): Promise<string> {
     );
   }
 
+  const tok = await redeemRefreshToken(env, refresh);
+  if (tok) {
+    await storeOwnerTokens(env, tok);
+    return tok.access_token;
+  }
+
+  // The presented token was rejected — it may already have been rotated by a
+  // concurrent refresh on another colo. Re-read once and retry with whatever
+  // is now stored, if it differs from what we just tried.
+  const latest = await env.TESLA_KV.get(KV_REFRESH);
+  if (latest && latest !== refresh) {
+    const retryTok = await redeemRefreshToken(env, latest);
+    if (retryTok) {
+      await storeOwnerTokens(env, retryTok);
+      return retryTok.access_token;
+    }
+  }
+  throw new TeslaError(
+    "Tesla token refresh failed. If the refresh token was revoked, re-run /auth/login.",
+  );
+}
+
+async function redeemRefreshToken(env: Env, refresh: string): Promise<TokenResponse | null> {
   const resp = await fetch(`${authBase(env)}/oauth2/v3/token`, {
     method: "POST",
     headers: { "content-type": "application/x-www-form-urlencoded" },
@@ -52,25 +98,38 @@ export async function getOwnerToken(env: Env): Promise<string> {
       refresh_token: refresh,
     }),
   });
-  if (!resp.ok) {
-    const body = await resp.text();
-    throw new TeslaError(
-      `Tesla token refresh failed (${resp.status}). If the refresh token was revoked, re-run /auth/login.`,
-      resp.status,
-      body,
-    );
-  }
-  const tok = (await resp.json()) as TokenResponse;
-  await storeOwnerTokens(env, tok);
-  return tok.access_token;
+  if (!resp.ok) return null;
+  return (await resp.json()) as TokenResponse;
 }
 
+/**
+ * Persists rotated tokens. The refresh token is written FIRST: by the time
+ * this runs, Tesla has already invalidated the old one, so it exists nowhere
+ * but here and in-memory — losing it (a failed put) requires manual
+ * re-authorization, whereas losing the access-token write just costs one
+ * extra refresh. Retries the refresh-token write since it's the one KV
+ * value that must not be silently dropped.
+ */
 export async function storeOwnerTokens(env: Env, tok: TokenResponse): Promise<void> {
   const exp = Math.floor(Date.now() / 1000) + (tok.expires_in ?? 3600);
+  if (tok.refresh_token) {
+    const refreshToken = tok.refresh_token;
+    let lastErr: unknown;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        await env.TESLA_KV.put(KV_REFRESH, refreshToken);
+        lastErr = undefined;
+        break;
+      } catch (e) {
+        lastErr = e;
+        await new Promise((r) => setTimeout(r, 200 * (attempt + 1)));
+      }
+    }
+    if (lastErr) throw lastErr;
+  }
   await env.TESLA_KV.put(KV_ACCESS, JSON.stringify({ token: tok.access_token, exp }), {
     expirationTtl: Math.max(60, tok.expires_in ?? 3600),
   });
-  if (tok.refresh_token) await env.TESLA_KV.put(KV_REFRESH, tok.refresh_token);
 }
 
 /** Client-credentials partner token, needed only for one-time endpoint registration. */
@@ -98,7 +157,7 @@ export async function getPartnerToken(env: Env): Promise<string> {
 
 export async function handleAuthLogin(request: Request, env: Env): Promise<Response> {
   const url = new URL(request.url);
-  if (url.searchParams.get("key") !== env.MCP_AUTH_TOKEN) {
+  if (!timingSafeEqual(url.searchParams.get("key") ?? "", env.MCP_AUTH_TOKEN)) {
     return new Response("Forbidden — pass ?key=<MCP_AUTH_TOKEN>", { status: 403 });
   }
   const state = randomHex(16);
@@ -193,10 +252,13 @@ export async function isMcpAuthorized(request: Request, env: Env): Promise<boole
   if (!m || !m[1]) return false;
   const token = m[1].trim();
   if (timingSafeEqual(token, env.MCP_AUTH_TOKEN)) return true;
-  return (await env.TESLA_KV.get(KV_MCP_TOKEN(token))) !== null;
+  // Shim-issued refresh tokens live under the same KV prefix as access
+  // tokens but must never authorize /mcp themselves — only a token stored
+  // with value "access" may.
+  return (await env.TESLA_KV.get(KV_MCP_TOKEN(token))) === "access";
 }
 
-function timingSafeEqual(a: string, b: string): boolean {
+export function timingSafeEqual(a: string, b: string): boolean {
   if (a.length !== b.length) return false;
   let diff = 0;
   for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
@@ -347,7 +409,7 @@ export async function handleOauthToken(request: Request, env: Env): Promise<Resp
 
   if (grant === "refresh_token") {
     const rt = form.get("refresh_token") ?? "";
-    if (!(await env.TESLA_KV.get(KV_MCP_TOKEN(rt)))) return json({ error: "invalid_grant" }, 400);
+    if ((await env.TESLA_KV.get(KV_MCP_TOKEN(rt))) !== "refresh") return json({ error: "invalid_grant" }, 400);
     await env.TESLA_KV.delete(KV_MCP_TOKEN(rt));
     return issueTokens(env);
   }
