@@ -19,11 +19,16 @@ export class PbWriter {
   private buf: number[] = [];
 
   private varint(v: number): void {
-    // JS numbers are safe here: all our varints fit in 32 bits.
-    let n = v >>> 0;
+    if (!Number.isSafeInteger(v) || v < 0) {
+      throw new Error(`protobuf: varint value out of range: ${v}`);
+    }
+    // Schedule ids (uint64 in Tesla's proto) can exceed 2^32 while staying a
+    // safe JS integer. Bitwise ops (`>>>`, `&`) coerce to Int32 and would
+    // silently truncate those, so use modulo/division instead.
+    let n = v;
     while (n > 0x7f) {
-      this.buf.push((n & 0x7f) | 0x80);
-      n >>>= 7;
+      this.buf.push((n % 128) | 0x80);
+      n = Math.floor(n / 128);
     }
     this.buf.push(n);
   }

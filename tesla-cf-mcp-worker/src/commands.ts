@@ -141,9 +141,16 @@ async function runCommand(
       throw new TeslaError(`Vehicle rejected command: ${MESSAGE_FAULTS[decoded.fault] ?? decoded.fault}`);
     }
 
-    if (decoded.operationStatus === OPERATION_STATUS.WAIT && attempt < 2) {
-      await new Promise((r) => setTimeout(r, 2000));
-      continue;
+    if (decoded.operationStatus === OPERATION_STATUS.WAIT) {
+      if (attempt < 2) {
+        await new Promise((r) => setTimeout(r, 2000));
+        continue;
+      }
+      return { result: false, reason: "vehicle still busy after 3 attempts" };
+    }
+
+    if (decoded.operationStatus === OPERATION_STATUS.ERROR && !(decoded.payload && decoded.payload.length > 0)) {
+      return { result: false, reason: "vehicle rejected the command (operation error)" };
     }
 
     if (decoded.payload && decoded.payload.length > 0) {

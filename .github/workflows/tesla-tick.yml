@@ -1,0 +1,57 @@
+# Automation-engine tick for tesla-cf-mcp-worker.
+#
+# The Cloudflare account is at the free plan's 5-cron-trigger limit (all slots
+# held by other workers), so the worker's own `*/15 * * * *` schedule cannot
+# register. This workflow provides the tick instead: it calls the
+# run_automations_now MCP tool, which executes the identical runCronTick()
+# code path. The worker's KV tick-lock dedupes any overlap with a real cron
+# if a slot ever frees up, so both can safely coexist.
+#
+# GitHub cron is best-effort (runs can lag by a few minutes under load) —
+# acceptable for 15-minute automation granularity.
+#
+# Requires the repo secret MCP_AUTH_TOKEN (set via: gh secret set MCP_AUTH_TOKEN).
+
+name: tesla-automation-tick
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch: {}
+
+concurrency:
+  group: tesla-tick
+  cancel-in-progress: false
+
+jobs:
+  tick:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Health check (non-fatal)
+        # Diagnostic only: a transient 503/timeout on the probe must not
+        # suppress the tick itself — the tick step fails red on its own if the
+        # worker is genuinely broken. continue-on-error keeps the signal (step
+        # shows failed) without aborting the job.
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          curl -sS --fail --retry 3 --retry-all-errors --max-time 60 \
+            "https://tesla-cf-mcp-worker.adamcfield.workers.dev/health"
+      - name: Run automation tick
+        run: |
+          set -euo pipefail
+          RESPONSE=$(curl -sS --max-time 120 -X POST \
+            "https://tesla-cf-mcp-worker.adamcfield.workers.dev/mcp" \
+            -H "Authorization: Bearer ${{ secrets.MCP_AUTH_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"run_automations_now","arguments":{}}}')
+          echo "$RESPONSE"
+          # Fail the run if the worker reported a tool-level error, so a broken
+          # tick shows up red in the Actions tab instead of silently "passing".
+          echo "$RESPONSE" | python3 -c '
+          import json, sys
+          body = json.load(sys.stdin)
+          if body.get("error") or body.get("result", {}).get("isError"):
+              sys.exit(1)
+          '

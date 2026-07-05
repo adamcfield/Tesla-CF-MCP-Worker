@@ -21,16 +21,16 @@ crons = ["*/15 * * * *"]
 
 [[kv_namespaces]]
 binding = "TESLA_KV"
-id = "REPLACE_WITH_KV_NAMESPACE_ID" # wrangler kv namespace create TESLA_KV
+id = "5e83ba18debc4f84a8a54ebd23bb880e" # wrangler kv namespace create TESLA_KV
 
 [[d1_databases]]
 binding = "DB"
 database_name = "tesla-cf-mcp-worker"
-database_id = "REPLACE_WITH_D1_DATABASE_ID" # wrangler d1 create tesla-cf-mcp-worker
+database_id = "60b5405f-783e-4cb5-9197-562db099a6b9" # wrangler d1 create tesla-cf-mcp-worker
 
 [vars]
 # Fleet API region: "na", "eu" or "cn". Must match where the account/vehicles live.
-TESLA_REGION = "na"
+TESLA_REGION = "eu"
 # Public origin this Worker is served from. Used for OAuth redirect URIs and the
 # partner-account domain registration. Set to your custom domain once routed.
-PUBLIC_ORIGIN = "https://tesla-cf-mcp-worker.YOUR_SUBDOMAIN.workers.dev"
+PUBLIC_ORIGIN = "https://tesla-cf-mcp-worker.adamcfield.workers.dev"

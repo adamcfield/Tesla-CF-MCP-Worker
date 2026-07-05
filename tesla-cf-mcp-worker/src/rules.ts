@@ -27,6 +27,7 @@ import { getVehicle, getVehicleData } from "./api";
 import * as cmd from "./commands";
 import { applyVehicleData } from "./ingest";
 import { getLatest, LatestState, logAlert } from "./store";
+import { recordConnectivityState } from "./tracking";
 import { Env } from "./types";
 
 // ---------------------------------------------------------------------------
@@ -157,6 +158,19 @@ async function underCooldown(env: Env, rule: AutomationRule, defaultMinutes: num
   if (await env.TESLA_KV.get(key)) return true;
   await env.TESLA_KV.put(key, "1", { expirationTtl: Math.max(60, minutes * 60) });
   return false;
+}
+
+/**
+ * Edge-trigger: returns true only when `regime` differs from the last regime
+ * recorded for this rule. Control rules (price/solar) use it so a persisting
+ * condition acts + notifies ONCE per transition rather than every cron tick.
+ */
+async function regimeChanged(env: Env, rule: AutomationRule, regime: string): Promise<boolean> {
+  const key = `regime:${rule.id}:${rule.vin}`;
+  const prev = await env.TESLA_KV.get(key);
+  if (prev === regime) return false;
+  await env.TESLA_KV.put(key, regime);
+  return true;
 }
 
 async function runActions(env: Env, rule: AutomationRule, actions: Action[]): Promise<string[]> {
@@ -365,6 +379,20 @@ async function evalAlert(
 // ---------------------------------------------------------------------------
 
 export async function runCronTick(env: Env): Promise<Record<string, unknown>> {
+  // Lock so the 15-min cron and an on-demand run_automations_now can't overlap
+  // and double-execute commands. KV is eventually consistent, so this dedupes
+  // the common (same-colo, seconds-apart) case rather than being a hard mutex.
+  const LOCK_KEY = "tick_lock";
+  if (await env.TESLA_KV.get(LOCK_KEY)) return { skipped: "another automation tick is in progress" };
+  await env.TESLA_KV.put(LOCK_KEY, "1", { expirationTtl: 120 });
+  try {
+    return await runCronTickInner(env);
+  } finally {
+    await env.TESLA_KV.delete(LOCK_KEY);
+  }
+}
+
+async function runCronTickInner(env: Env): Promise<Record<string, unknown>> {
   const rules = (await getAutomations(env)).filter((r) => r.enabled !== false);
   const summary: Record<string, unknown> = { evaluated: rules.length, fired: [] as string[] };
   const fired = summary.fired as string[];
@@ -376,6 +404,8 @@ export async function runCronTick(env: Env): Promise<Record<string, unknown>> {
     try {
       const v = await getVehicle(env, vin);
       connectivity.set(vin, v.state);
+      // Feed the state timeline: asleep/offline/wake come from this free check.
+      await recordConnectivityState(env, vin, v.state).catch(() => {});
       await detectWakeTransition(env, rules, vin, v.state, fired);
     } catch {
       connectivity.set(vin, "unknown");
@@ -410,7 +440,33 @@ export async function runCronTick(env: Env): Promise<Record<string, unknown>> {
       });
     }
   }
+
+  await purgeExpiredHistory(env, summary);
   return summary;
+}
+
+/**
+ * Optional raw-history retention (RETENTION_DAYS env var; unset = keep forever).
+ * Only the bulky raw stores are pruned: the generic telemetry_events EAV table
+ * and positions NOT attached to a drive (idle samples). Derived history —
+ * drives, charge sessions + curves, state timeline — and drive-route positions
+ * are never touched: they are the long-term value (degradation trends need
+ * years) and grow far slower than raw samples.
+ */
+async function purgeExpiredHistory(env: Env, summary: Record<string, unknown>): Promise<void> {
+  const days = Number(env.RETENTION_DAYS ?? "");
+  if (!Number.isFinite(days) || days <= 0) return;
+  const cutoff = Math.floor(Date.now() / 1000) - Math.round(days * 86400);
+  try {
+    const events = await env.DB.prepare(`DELETE FROM telemetry_events WHERE ts < ?1`).bind(cutoff).run();
+    const positions = await env.DB.prepare(
+      `DELETE FROM positions WHERE ts < ?1 AND drive_id IS NULL`,
+    ).bind(cutoff).run();
+    const purged = (events.meta.changes ?? 0) + (positions.meta.changes ?? 0);
+    if (purged > 0) summary.purged_rows = purged;
+  } catch (e) {
+    summary.purge_error = e instanceof Error ? e.message : String(e);
+  }
 }
 
 async function detectWakeTransition(
@@ -475,22 +531,30 @@ async function evalPriceCharging(
   const cheapBelow = asNum(rule.cheap_below_cents);
   const expensiveAbove = asNum(rule.expensive_above_cents);
   const charging = chargingState === "Charging" || chargingState === "Starting";
-  let acted = false;
 
-  if (cheapBelow !== undefined && price <= cheapBelow) {
+  // Classify the price regime and act only when it changes (edge-trigger),
+  // so a price that stays cheap for hours doesn't re-command + re-notify every
+  // 15-min tick.
+  let regime = "neutral";
+  if (cheapBelow !== undefined && price <= cheapBelow) regime = "cheap";
+  else if (expensiveAbove !== undefined && price >= expensiveAbove) regime = "expensive";
+  if (!(await regimeChanged(env, rule, `price:${regime}`))) return false;
+
+  if (regime === "cheap") {
     const amps = asNum(rule.amps_cheap);
     const limit = asNum(rule.limit_cheap);
     if (amps) await cmd.setChargingAmps(env, rule.vin, amps);
     if (limit) await cmd.setChargeLimit(env, rule.vin, limit);
     if (!charging) await cmd.startCharging(env, rule.vin);
-    acted = true;
     await dispatchWebhooks(env, rule, "price_charging", `price ${price}c ≤ ${cheapBelow}c — charging at ${amps ?? "current"}A`, { price });
-  } else if (expensiveAbove !== undefined && price >= expensiveAbove && charging) {
-    await cmd.stopCharging(env, rule.vin);
-    acted = true;
-    await dispatchWebhooks(env, rule, "price_charging", `price ${price}c ≥ ${expensiveAbove}c — stopped charging`, { price });
+    return true;
   }
-  return acted;
+  if (regime === "expensive" && charging) {
+    await cmd.stopCharging(env, rule.vin);
+    await dispatchWebhooks(env, rule, "price_charging", `price ${price}c ≥ ${expensiveAbove}c — stopped charging`, { price });
+    return true;
+  }
+  return false;
 }
 
 async function evalSolarSurplus(
@@ -512,43 +576,103 @@ async function evalSolarSurplus(
     if (haversineMeters(lat, lon, at.lat, at.lon) > (at.radius_m ?? 300)) return false;
   }
 
-  const surplus = await fetchNumber(rule.source as FeedSource);
+  const surplusRaw = await fetchNumber(rule.source as FeedSource);
   const volts = asNum(rule.volts) ?? 230;
   const phases = asNum(rule.phases) ?? 1;
   const minAmps = asNum(rule.min_amps) ?? 5;
   const maxAmps = asNum(rule.max_amps) ?? 16;
+  const charging = chargingState === "Charging" || chargingState === "Starting";
+
+  // Add the car's own charging draw back into the reading. A grid-export feed
+  // already has the car's consumption subtracted, so regulating on the raw
+  // figure oscillates: start → export drops → below stop → stop → export rises
+  // → above start → start. `surplus` here is PV surplus as if the car were idle.
+  const measuredKw = asNum(state.latest.charger_power);
+  const measuredAmps = asNum(state.latest.charger_current);
+  const carDrawW = charging
+    ? measuredKw !== undefined
+      ? measuredKw * 1000
+      : (measuredAmps ?? 0) * volts * phases
+    : 0;
+  const surplus = surplusRaw + carDrawW;
+
   const startAbove = asNum(rule.start_above_w) ?? volts * phases * minAmps;
   const stopBelow = asNum(rule.stop_below_w) ?? Math.round(startAbove / 2);
-  const charging = chargingState === "Charging" || chargingState === "Starting";
-  const targetAmps = Math.min(maxAmps, Math.floor(surplus / (volts * phases)));
+  const targetAmps = Math.min(maxAmps, Math.max(minAmps, Math.floor(surplus / (volts * phases))));
 
   if (surplus >= startAbove && targetAmps >= minAmps) {
-    await cmd.setChargingAmps(env, rule.vin, targetAmps);
-    if (!charging) await cmd.startCharging(env, rule.vin);
-    await dispatchWebhooks(env, rule, "solar_surplus", `surplus ${surplus}W → charging at ${targetAmps}A`, { surplus, amps: targetAmps });
-    return true;
+    if (!charging) {
+      await cmd.setChargingAmps(env, rule.vin, targetAmps);
+      await cmd.startCharging(env, rule.vin);
+      if (await regimeChanged(env, rule, "solar:charging")) {
+        await dispatchWebhooks(env, rule, "solar_surplus", `surplus ${Math.round(surplus)}W → charging at ${targetAmps}A`, { surplus, amps: targetAmps });
+      }
+      return true;
+    }
+    // Already charging — track the sun by nudging amps only when they change
+    // (no command/webhook spam when steady).
+    if (targetAmps !== asNum(state.latest.charger_current)) {
+      await cmd.setChargingAmps(env, rule.vin, targetAmps);
+      return true;
+    }
+    return false;
   }
   if (charging && surplus <= stopBelow) {
     await cmd.stopCharging(env, rule.vin);
-    await dispatchWebhooks(env, rule, "solar_surplus", `surplus ${surplus}W ≤ ${stopBelow}W → stopped charging`, { surplus });
-    return true;
-  }
-  if (charging && targetAmps >= minAmps && targetAmps !== asNum(state.latest.charge_amps)) {
-    await cmd.setChargingAmps(env, rule.vin, targetAmps);
+    if (await regimeChanged(env, rule, "solar:stopped")) {
+      await dispatchWebhooks(env, rule, "solar_surplus", `surplus ${Math.round(surplus)}W ≤ ${stopBelow}W → stopped charging`, { surplus });
+    }
     return true;
   }
   return false;
 }
 
-const DAY_BITS: Record<string, number> = { sun: 1, mon: 2, tue: 4, wed: 8, thu: 16, fri: 32, sat: 64 };
+const DAY_ORDER = ["sun", "mon", "tue", "wed", "thu", "fri", "sat"];
 
+/** Bit for a day token (first 3 letters), or -1 if unrecognized. */
+function dayIndex(token: string): number {
+  return DAY_ORDER.indexOf(token.trim().toLowerCase().slice(0, 3));
+}
+
+/**
+ * Parses a days spec into a bitmask (bit 0 = Sunday, matching getUTCDay()).
+ * Accepts "All"/"Everyday"/"Daily", "Weekdays", "Weekend(s)", comma lists
+ * ("Mon,Tue"), and inclusive (wrapping) ranges ("Mon-Fri", "Sun-Thu").
+ * Throws on genuinely unrecognized tokens rather than silently mis-gating —
+ * the old version dropped unknown tokens and fell back to all-days.
+ */
 function daysMask(days: unknown): number {
-  if (typeof days !== "string" || days.trim().toLowerCase() === "all") return 127;
+  if (typeof days !== "string") return 127;
+  const s = days.trim().toLowerCase();
+  if (s === "" || s === "all" || s === "every" || s === "everyday" || s === "daily") return 127;
+  if (s === "weekday" || s === "weekdays") return bits(["mon", "tue", "wed", "thu", "fri"]);
+  if (s === "weekend" || s === "weekends") return bits(["sat", "sun"]);
+
   let mask = 0;
-  for (const part of days.split(",")) {
-    mask |= DAY_BITS[part.trim().toLowerCase().slice(0, 3)] ?? 0;
+  for (const rawPart of s.split(",")) {
+    const part = rawPart.trim();
+    if (!part) continue;
+    if (part.includes("-")) {
+      const [a, b] = part.split("-");
+      const ia = dayIndex(a ?? "");
+      const ib = dayIndex(b ?? "");
+      if (ia < 0 || ib < 0) throw new Error(`Unrecognized day range "${part}" — use e.g. "Mon-Fri"`);
+      for (let i = ia; ; i = (i + 1) % 7) {
+        mask |= 1 << i;
+        if (i === ib) break;
+      }
+    } else {
+      const idx = dayIndex(part);
+      if (idx < 0) throw new Error(`Unrecognized day "${part}" — use e.g. "Mon,Tue", "Mon-Fri", "Weekdays", or "All"`);
+      mask |= 1 << idx;
+    }
   }
-  return mask || 127;
+  if (mask === 0) throw new Error(`No valid days parsed from "${days}"`);
+  return mask;
+}
+
+function bits(names: string[]): number {
+  return names.reduce((m, n) => m | (1 << dayIndex(n)), 0);
 }
 
 async function evalScheduledPrecondition(

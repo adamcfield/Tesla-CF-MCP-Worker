@@ -21,6 +21,12 @@ export interface Env {
   INGEST_TOKEN?: string;
   /** Optional shared secret sent as x-webhook-token on outbound alert webhooks. */
   WEBHOOK_SECRET?: string;
+  /**
+   * Optional raw-history retention in days (wrangler.toml [vars] or secret).
+   * Prunes telemetry_events and non-drive positions older than this on each
+   * automation tick. Unset/invalid = keep everything forever.
+   */
+  RETENTION_DAYS?: string;
 }
 
 /** Regional Fleet API bases — https://developer.tesla.com/docs/fleet-api */
