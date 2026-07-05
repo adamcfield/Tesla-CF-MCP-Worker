@@ -139,7 +139,35 @@ const EVENT_COLOR = { drive: "var(--accent)", charge: "var(--good)", sleep: "var
 // Boot / auth gate
 // ---------------------------------------------------------------------------
 
+/**
+ * One-tap login from a pre-filled link (?token=&vin=&origin=), for saving the
+ * dashboard to a phone home screen. Credentials are copied into localStorage
+ * and then stripped from the URL via replaceState, so the token doesn't linger
+ * in the address bar, browser history, or any bookmark the URL gets saved into.
+ * The token is read-only (the worker only exposes read /data/* + read MCP tools
+ * to it), but it's still a bearer secret — treat the link as private.
+ */
+function consumeUrlCredentials() {
+  // Accept params from the query string or the hash (hash keeps them out of
+  // referer headers if the page ever links out).
+  const fromQuery = new URLSearchParams(location.search);
+  const fromHash = new URLSearchParams(location.hash.replace(/^#/, ""));
+  const pick = (k) => fromQuery.get(k) ?? fromHash.get(k);
+  const token = pick("token");
+  const vinParam = pick("vin");
+  const origin = pick("origin");
+  if (!token && !vinParam && !origin) return;
+  if (token) auth.token = token.trim();
+  if (vinParam) auth.vin = vinParam.trim().toUpperCase();
+  if (origin) localStorage.setItem("tm_origin", origin.replace(/\/+$/, ""));
+  // Scrub the credentials out of the visible URL + history entry.
+  try {
+    history.replaceState(null, "", location.pathname);
+  } catch { /* non-browser / sandbox */ }
+}
+
 async function boot() {
+  consumeUrlCredentials();
   if (!auth.hasToken || !auth.vin) return renderGate();
   try {
     await verifyToken(auth.vin);
