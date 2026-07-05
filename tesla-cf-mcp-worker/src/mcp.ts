@@ -497,6 +497,32 @@ const TOOLS: Tool[] = [
     handler: (env, a) => tracking.getDrive(env, a.id),
   },
   {
+    name: "assign_drive_driver",
+    description:
+      "Attribute a drive to a named driver (for per-driver behaviour/risk scoring). Pass the drive id and a driver " +
+      "name; pass an empty/blank name to clear. Tesla exposes no reliable native driver identity, so drives are " +
+      "tagged manually here, then get_driver_scores aggregates by driver.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        id: { type: "number", description: "Drive id" },
+        driver: { type: "string", description: "Driver name (blank to clear)" },
+      },
+      required: ["id", "driver"],
+    },
+    handler: (env, a) => tracking.setDriveDriver(env, a.id, a.driver),
+  },
+  {
+    name: "get_driver_scores",
+    description:
+      "Insurance-style driving-behaviour roll-up per driver: distance, avg/max speed, harsh braking/acceleration/" +
+      "cornering per 100 km, peak deceleration (m/s² and g), speeding %, night-driving %, and a 0-100 safety score " +
+      "(100 = safest). Harsh-event metrics are derived from speed samples and need dense sampling (~10s) to be " +
+      "reliable — the 'fidelity' field flags this per driver. Free — reads logged data.",
+    inputSchema: vinSchema,
+    handler: (env, a) => tracking.getDriverScores(env, a.vin),
+  },
+  {
     name: "get_charge_sessions",
     description:
       "Charge session log: start/end time & SoC, kWh added, AC/DC type, max power, duration, location, and cost " +

@@ -166,6 +166,21 @@ export async function ensureSchema(env: Env): Promise<void> {
     `CREATE UNIQUE INDEX IF NOT EXISTS idx_charge_sessions_ext ON charge_sessions (external_id) WHERE external_id IS NOT NULL`,
   ).run();
 
+  // Per-drive driver attribution + driving-behaviour metrics (insurance-style
+  // scoring). Behaviour fields are derived from the drive's position samples
+  // at close time; accuracy scales with polling cadence (see tracking.ts).
+  await addMissingColumns(env, "drives", {
+    driver: "TEXT", // assigned driver label (manual/assisted tagging)
+    max_accel_ms2: "REAL", // peak longitudinal acceleration, m/s^2
+    max_decel_ms2: "REAL", // peak deceleration (braking), m/s^2 (positive magnitude)
+    harsh_accel_count: "INTEGER",
+    harsh_brake_count: "INTEGER",
+    harsh_turn_count: "INTEGER", // heading-change spikes at speed
+    over_limit_frac: "REAL", // fraction of samples above OVER_SPEED_KMH
+    night_frac: "REAL", // fraction of duration in local night hours
+    behavior_score: "REAL", // 0-100 composite (100 = safest)
+  });
+
   schemaReady = true;
 }
 

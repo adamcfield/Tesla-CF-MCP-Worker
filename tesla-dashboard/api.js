@@ -136,6 +136,11 @@ export const data = {
   states: (vin, hours) => getJson("/data/states", { vin, hours }),
   locations: () => getJson("/data/locations"),
   locationStats: (id) => getJson("/data/location-stats", { id }),
+  driverScores: (vin) => getJson("/data/driver-scores", { vin }),
+  /** Benign metadata write (token-gated POST) — assign/clear a drive's driver. */
+  assignDriver: (id, driver) =>
+    fetch(workerOrigin() + "/data/assign-driver?" + new URLSearchParams({ id, driver: driver || "", token: auth.token }), { method: "POST" })
+      .then((r) => (r.ok ? r.json() : Promise.reject(new ApiError("assign failed", r.status)))),
 };
 
 export { ApiError };

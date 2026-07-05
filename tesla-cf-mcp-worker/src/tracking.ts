@@ -17,6 +17,7 @@
 
 import { getChargingHistory } from "./api";
 import { getBudgetStatus } from "./budget";
+import { scoreDrive } from "./scoring";
 import {
   ensureSchema,
   haversineMeters,
@@ -223,21 +224,40 @@ async function closeDrive(env: Env, drive: DriveRow, s: LatestState, ts: number)
     return;
   }
 
+  // Driving-behaviour metrics from the drive's speed/heading samples.
+  const samplesRs = await env.DB.prepare(
+    `SELECT ts, speed, heading FROM positions WHERE drive_id = ?1 ORDER BY ts ASC`,
+  )
+    .bind(drive.id)
+    .all<{ ts: number; speed: number | null; heading: number | null }>();
+  const tzOffsetMin = (await getVehicleTz(env, drive.vin)) ?? 0;
+  const behavior = scoreDrive(samplesRs.results ?? [], { distanceKm, tzOffsetMin });
+
   await env.DB.prepare(
     `UPDATE drives SET
        end_ts = ?2, status = 'complete', end_lat = ?3, end_lon = ?4, end_location_id = ?5,
        end_odometer = ?6, distance_km = ?7, end_soc = ?8, end_rated_range = ?9,
        end_ideal_range = ?10, duration_min = ?11, energy_used_kwh = ?12, efficiency_wh_km = ?13,
        avg_speed = ?14, max_speed = ?15, avg_power = ?16, max_power = ?17,
-       outside_temp_avg = ?18, sample_count = ?19
+       outside_temp_avg = ?18, sample_count = ?19,
+       max_accel_ms2 = ?20, max_decel_ms2 = ?21, harsh_accel_count = ?22, harsh_brake_count = ?23,
+       harsh_turn_count = ?24, over_limit_frac = ?25, night_frac = ?26, behavior_score = ?27
      WHERE id = ?1`,
   )
     .bind(
       drive.id, ts, lat, lon, endLocId, endOdo, distanceKm, num(s.soc), num(s.rated_range),
       num(s.ideal_range), durationMin, energyUsed, efficiency, avgSpeed, num(agg?.max_speed),
       num(agg?.avg_power), num(agg?.max_power), num(agg?.outside_temp_avg), agg?.n ?? 0,
+      behavior.max_accel_ms2, behavior.max_decel_ms2, behavior.harsh_accel_count, behavior.harsh_brake_count,
+      behavior.harsh_turn_count, behavior.over_limit_frac, behavior.night_frac, behavior.behavior_score,
     )
     .run();
+}
+
+/** Per-vehicle timezone offset (minutes) for night-driving calc, if a rule set one. */
+async function getVehicleTz(env: Env, vin: string): Promise<number | null> {
+  const v = await env.TESLA_KV.get(`tz_offset:${vin}`);
+  return v != null ? Number(v) : null;
 }
 
 /**
@@ -554,6 +574,79 @@ export async function getDrives(env: Env, vin: string, limit = 50): Promise<unkn
     .bind(vin, limit)
     .all();
   return rs.results ?? [];
+}
+
+/** Assign (or clear, with driver=null) the driver of a drive. */
+export async function setDriveDriver(env: Env, id: number, driver: string | null): Promise<{ updated: boolean }> {
+  await ensureSchema(env);
+  const res = await env.DB.prepare(`UPDATE drives SET driver = ?2 WHERE id = ?1`)
+    .bind(id, driver && driver.trim() ? driver.trim() : null)
+    .run();
+  return { updated: (res.meta.changes ?? 0) > 0 };
+}
+
+/**
+ * Per-driver behaviour roll-up — an insurance-style risk profile. Aggregates
+ * completed drives grouped by the assigned `driver` label (unassigned drives
+ * are grouped as "Unassigned"). Harsh-event rates are per 100 km so drivers
+ * are comparable regardless of mileage. The behaviour score is distance-
+ * weighted. `fidelity` flags whether sampling was dense enough to trust the
+ * harsh-event metrics (they need ~10 s or faster; 60 s polling under-reports).
+ */
+export async function getDriverScores(env: Env, vin: string): Promise<unknown> {
+  await ensureSchema(env);
+  const rs = await env.DB.prepare(
+    `SELECT COALESCE(driver, 'Unassigned') AS driver,
+            COUNT(*) AS drives,
+            COALESCE(SUM(distance_km), 0) AS km,
+            COALESCE(SUM(duration_min), 0) AS minutes,
+            MAX(max_speed) AS max_speed,
+            AVG(avg_speed) AS avg_speed,
+            MAX(max_decel_ms2) AS max_decel_ms2,
+            COALESCE(SUM(harsh_brake_count), 0) AS harsh_brakes,
+            COALESCE(SUM(harsh_accel_count), 0) AS harsh_accels,
+            COALESCE(SUM(harsh_turn_count), 0) AS harsh_turns,
+            AVG(over_limit_frac) AS over_limit_frac,
+            AVG(night_frac) AS night_frac,
+            SUM(behavior_score * COALESCE(distance_km, 0)) AS score_wsum,
+            SUM(CASE WHEN behavior_score IS NOT NULL THEN COALESCE(distance_km, 0) ELSE 0 END) AS score_wden,
+            SUM(sample_count) AS samples
+     FROM drives WHERE vin = ?1 AND status = 'complete'
+     GROUP BY COALESCE(driver, 'Unassigned')
+     ORDER BY km DESC`,
+  )
+    .bind(vin)
+    .all<any>();
+
+  const drivers = (rs.results ?? []).map((r) => {
+    const km = r.km || 0;
+    const per100 = (n: number) => (km > 0 ? round((n / km) * 100, 2) : null);
+    const samplesPerKm = km > 0 ? (r.samples || 0) / km : 0;
+    return {
+      driver: r.driver,
+      drives: r.drives,
+      distance_km: round(km, 1),
+      duration_min: round(r.minutes || 0, 0),
+      avg_speed_kmh: r.avg_speed != null ? round(r.avg_speed, 0) : null,
+      max_speed_kmh: r.max_speed != null ? round(r.max_speed, 0) : null,
+      max_decel_ms2: r.max_decel_ms2 != null ? round(r.max_decel_ms2, 2) : null,
+      max_decel_g: r.max_decel_ms2 != null ? round(r.max_decel_ms2 / 9.81, 2) : null,
+      harsh_brakes_per_100km: per100(r.harsh_brakes || 0),
+      harsh_accels_per_100km: per100(r.harsh_accels || 0),
+      harsh_turns_per_100km: per100(r.harsh_turns || 0),
+      over_limit_pct: r.over_limit_frac != null ? round(r.over_limit_frac * 100, 1) : null,
+      night_pct: r.night_frac != null ? round(r.night_frac * 100, 1) : null,
+      behavior_score: r.score_wden > 0 ? round(r.score_wsum / r.score_wden, 0) : null,
+      // Harsh-event metrics need dense sampling to be reliable.
+      fidelity: samplesPerKm >= 3 ? "good" : samplesPerKm >= 1 ? "coarse" : "sparse",
+    };
+  });
+
+  return {
+    vin,
+    drivers,
+    note: "Harsh braking/acceleration/cornering are DERIVED from speed samples; they need ~10s (or faster) sampling to be reliable. At the current logging cadence, 'sparse'/'coarse' fidelity means harsh-event counts under-report — avg/max speed, night %, and mileage are always reliable.",
+  };
 }
 
 export async function getDrive(env: Env, id: number): Promise<unknown> {

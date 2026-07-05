@@ -105,7 +105,7 @@ const state = {
 
 const NAV = [
   { label: "", items: [["ov", "Overview"], ["tl", "Timeline"], ["st", "Statistics"]] },
-  { label: "Driving", items: [["dr", "Drives"], ["map", "Lifetime map"]] },
+  { label: "Driving", items: [["dr", "Drives"], ["dv", "Drivers"], ["map", "Lifetime map"]] },
   { label: "Charging", items: [["ch", "Charges"], ["cs", "Charging stats"]] },
   { label: "Battery", items: [["bh", "Battery health"], ["vd", "Vampire drain"]] },
 ];
@@ -115,6 +115,7 @@ const TITLES = {
   tl: ["Timeline", "drives, charges & sleep/wake"],
   st: ["Statistics", "last 12 months"],
   dr: ["Drives", ""],
+  dv: ["Drivers", "behaviour & risk scoring"],
   map: ["Lifetime map", ""],
   ch: ["Charges", ""],
   cs: ["Charging stats", "lifetime"],
@@ -305,6 +306,15 @@ function onRootClick(e) {
   } else if (action === "open-drive") {
     state.openDriveId = Number(t.dataset.id);
     renderDriveDetail();
+  } else if (action === "save-driver") {
+    const input = document.getElementById("tm-driver-input");
+    const name = input ? input.value.trim() : "";
+    t.textContent = "Saving…";
+    data.assignDriver(Number(t.dataset.id), name).then(() => {
+      // Clear cached driver aggregates + drive lists so they reflect the change.
+      delete state.cache.all_drives;
+      t.textContent = "Saved ✓";
+    }).catch(() => { t.textContent = "Failed"; });
   } else if (action === "back-drives") {
     state.openDriveId = null;
     renderDrives();
@@ -345,6 +355,7 @@ async function showScreen() {
       case "tl": await renderTimeline(); break;
       case "st": await renderStatistics(); break;
       case "dr": await renderDrives(); break;
+      case "dv": await renderDrivers(); break;
       case "map": await renderLifetimeMapScreen(); break;
       case "ch": await renderCharges(); break;
       case "cs": await renderChargingStats(); break;
@@ -839,11 +850,23 @@ async function renderDriveDetail() {
   const elevPts = path.filter((p) => p.elevation != null).map((p) => [(p.ts - d.start_ts) / 60, p.elevation]);
 
   setContent(`
-    <div class="tm-flex-row" style="gap:14px;">
+    <div class="tm-flex-row" style="gap:14px;flex-wrap:wrap;">
       <button class="tm-back-btn" data-action="back-drives">← Drives</button>
       <div style="font-size:15px;font-weight:600;">${esc(locName(d.start_location_id))} <span style="color:var(--faint);">→</span> ${esc(locName(d.end_location_id))}</div>
       <div style="font-size:12.5px;color:var(--faint);">${fmtDateTime(d.start_ts)}</div>
+      <div class="tm-flex-row" style="margin-left:auto;gap:6px;">
+        <span style="font-size:12px;color:var(--sub);">Driver:</span>
+        <input id="tm-driver-input" class="tm-gate-input" style="width:140px;padding:5px 9px;font-family:var(--ui);" placeholder="unassigned" value="${esc(d.driver || "")}">
+        <button class="tm-chip-btn" style="padding:5px 12px;" data-action="save-driver" data-id="${d.id}">Save</button>
+      </div>
     </div>
+    ${d.behavior_score != null || d.max_decel_ms2 != null ? `
+    <div class="tm-grid-metrics">
+      <div class="tm-card tm-card-pad-metric"><div class="tm-stat-label">Safety score</div><div class="tm-stat-value" style="color:${scoreColor(d.behavior_score)};">${d.behavior_score != null ? d.behavior_score : "—"}</div></div>
+      <div class="tm-card tm-card-pad-metric"><div class="tm-stat-label">Peak braking</div><div class="tm-stat-value">${d.max_decel_ms2 != null ? fmt2(d.max_decel_ms2 / 9.81) : "—"} <span class="tm-stat-unit">g</span></div></div>
+      <div class="tm-card tm-card-pad-metric"><div class="tm-stat-label">Harsh brakes · accels</div><div class="tm-stat-value">${d.harsh_brake_count ?? 0} · ${d.harsh_accel_count ?? 0}</div></div>
+      <div class="tm-card tm-card-pad-metric"><div class="tm-stat-label">Speeding · night</div><div class="tm-stat-value">${d.over_limit_frac != null ? fmt0(d.over_limit_frac * 100) : "—"} · ${d.night_frac != null ? fmt0(d.night_frac * 100) : "—"} <span class="tm-stat-unit">%</span></div></div>
+    </div>` : ""}
     <div class="tm-grid-2-wide">
       <div class="tm-card tm-map-card" style="min-height:300px;">
         <div id="tm-drive-map" class="tm-map-canvas"></div>
@@ -879,6 +902,72 @@ async function renderDriveDetail() {
   if (path.length >= 2) {
     requestAnimationFrame(() => renderRouteMap(document.getElementById("tm-drive-map"), path));
   }
+}
+
+// ---------------------------------------------------------------------------
+// Drivers — behaviour & risk scoring
+// ---------------------------------------------------------------------------
+
+function scoreColor(score) {
+  if (score == null) return "var(--faint)";
+  if (score >= 85) return "var(--good)";
+  if (score >= 65) return "var(--warn)";
+  return "var(--bad)";
+}
+const FIDELITY_LABEL = {
+  good: "reliable",
+  coarse: "coarse — harsh-event counts under-report",
+  sparse: "sparse — harsh-event metrics not meaningful at this sampling",
+};
+
+async function renderDrivers() {
+  const res = await data.driverScores(vin());
+  const drivers = res?.drivers || [];
+  if (!drivers.length) return setContent(emptyHtml("No drives recorded yet", "Once trips are logged you can assign each drive to a driver (on the Drives page) and their risk profile appears here."));
+
+  const hasScores = drivers.some((d) => d.behavior_score != null);
+
+  setContent(`
+    <div class="tm-card tm-card-pad" style="background:color-mix(in oklab, var(--accent) 5%, var(--card));">
+      <div style="font-size:13px;color:var(--sub);line-height:1.5;">
+        <b>How this works.</b> Tesla exposes no way to know <i>who</i> is driving, so assign each trip to a driver on the
+        <b>Drives</b> page — then their profile aggregates here. Speed, speeding %, night-driving and mileage are always
+        reliable; <b>harsh braking / acceleration / g-force need ~1-second sampling</b> to be meaningful, so at the current
+        logging cadence those show as low-fidelity. ${hasScores ? "" : "No behaviour scores yet — they populate as multi-sample drives accumulate."}
+      </div>
+    </div>
+    <div class="tm-grid-3col">
+      ${drivers.map((d) => `
+        <div class="tm-card tm-card-pad">
+          <div class="tm-flex-row" style="justify-content:space-between;align-items:flex-start;">
+            <div>
+              <div style="font-size:15px;font-weight:600;">${esc(d.driver)}</div>
+              <div style="font-size:12px;color:var(--faint);margin-top:2px;">${d.drives} drive${d.drives === 1 ? "" : "s"} · ${fmt0(d.distance_km)} km</div>
+            </div>
+            <div style="text-align:right;">
+              <div style="font-size:30px;font-weight:600;font-family:var(--mono);color:${scoreColor(d.behavior_score)};line-height:1;">${d.behavior_score != null ? d.behavior_score : "—"}</div>
+              <div style="font-size:10.5px;color:var(--faint);">safety score</div>
+            </div>
+          </div>
+          <div class="tm-grid-half" style="gap:12px;margin-top:16px;">
+            ${driverStat("Avg speed", d.avg_speed_kmh, "km/h")}
+            ${driverStat("Top speed", d.max_speed_kmh, "km/h")}
+            ${driverStat("Speeding", d.over_limit_pct, "%")}
+            ${driverStat("Night", d.night_pct, "%")}
+            ${driverStat("Peak braking", d.max_decel_g, "g")}
+            ${driverStat("Harsh brakes", d.harsh_brakes_per_100km, "/100km")}
+          </div>
+          <div class="tm-stat-note" style="margin-top:12px;">Harsh-event fidelity: ${esc(FIDELITY_LABEL[d.fidelity] || d.fidelity)}</div>
+        </div>`).join("")}
+    </div>
+  `);
+}
+
+function driverStat(label, value, unit) {
+  return `<div>
+    <div class="tm-readout-label">${esc(label)}</div>
+    <div class="tm-readout-value">${value != null ? fmt1(value) : "—"} <span style="font-size:11px;color:var(--sub);font-weight:400;">${esc(unit)}</span></div>
+  </div>`;
 }
 
 // ---------------------------------------------------------------------------

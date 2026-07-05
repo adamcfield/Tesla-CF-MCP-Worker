@@ -52,12 +52,14 @@ import {
   getChargeCurve,
   getChargeSessions,
   getDrive,
+  getDriverScores,
   getDrives,
   getLocationStats,
   getStateTimeline,
   getTrackingSummary,
   getVampireDrain,
   listLocations,
+  setDriveDriver,
 } from "./tracking";
 import { Env } from "./types";
 
@@ -207,6 +209,8 @@ async function handleData(url: URL, env: Env): Promise<Response> {
     }
     case "/data/drives":
       return json(await getDrives(env, vin, numParam("limit", 50)));
+    case "/data/driver-scores":
+      return json(await getDriverScores(env, vin));
     case "/data/charge-sessions":
       return json(await getChargeSessions(env, vin, numParam("limit", 50)));
     case "/data/degradation":
@@ -261,6 +265,14 @@ export default {
           return json({ error: "unauthorized" }, 401);
         }
         return handleIngest(request, env);
+      }
+
+      // --- driver assignment (benign metadata write; token-gated for the dashboard)
+      if (path === "/data/assign-driver" && request.method === "POST") {
+        if (!tokenAuthorized(request, url, env.MCP_AUTH_TOKEN)) return json({ error: "unauthorized" }, 401);
+        const id = Number(url.searchParams.get("id"));
+        if (!Number.isFinite(id)) return json({ error: "id query param required" }, 400);
+        return json(await setDriveDriver(env, id, url.searchParams.get("driver")));
       }
 
       // --- read-only data endpoints (header or ?token=) ------------------
