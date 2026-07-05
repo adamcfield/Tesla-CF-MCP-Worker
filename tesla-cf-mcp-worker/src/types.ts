@@ -64,6 +64,12 @@ export interface Env {
   TESLA_AUTH_BASE?: string;
   /** GovMap (Israeli national map) API key — enables GovMap geocoding/tiles over OSM fallback. */
   GOVMAP_API_KEY?: string;
+  /**
+   * Comma/space-separated VINs the Cloudflare cron (scheduled handler) should
+   * poll each fire — a reliable native alternative to the throttled GitHub
+   * poll loop. Unset = cron only runs the automation tick, no polling.
+   */
+  POLL_VINS?: string;
 }
 
 /** Regional Fleet API bases — https://developer.tesla.com/docs/fleet-api */

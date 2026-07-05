@@ -59,7 +59,7 @@ import { handleMcp, SERVER_VERSION } from "./mcp";
 import { pollOnce } from "./poll";
 import { loadCommandKey } from "./protocol";
 import { runCronTick } from "./rules";
-import { getAppState, getLatest, listAlerts, querySeries } from "./store";
+import { getAppState, getLatest, listAlerts, putAppState, querySeries } from "./store";
 import {
   backfillChargeAddresses,
   backfillChargeHistory,
@@ -492,9 +492,28 @@ export default {
     }
   },
 
-  async scheduled(_controller: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
-    ctx.waitUntil(
-      runCronTick(env).catch((e) => console.error("cron tick failed:", e instanceof Error ? e.message : e)),
+  async scheduled(controller: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
+    // If POLL_VINS is set, each cron fire also polls those vehicles — a
+    // Cloudflare-native, reliable alternative/complement to the GitHub poll
+    // loop (Cloudflare cron fires on time; GitHub throttles the schedule). One
+    // pollOnce per fire; free connectivity checks when parked, budget-governed
+    // billed reads only when online. The car can still sleep. Never wakes it.
+    const pollVins = (env.POLL_VINS ?? "").split(/[,\s]+/).map((v) => v.trim()).filter(Boolean);
+    const jobs: Promise<unknown>[] = pollVins.map((vin) =>
+      pollOnce(env, vin).catch((e) => console.error("cron poll failed:", e instanceof Error ? e.message : e)),
     );
+    // Run the automation tick at most ~every 13 min even if the cron fires more
+    // often for polling (so a */2 poll cron doesn't re-run the tick 7× as much).
+    jobs.push(
+      (async () => {
+        const now = Math.floor(Date.now() / 1000);
+        const last = Number((await getAppState(env, "last_cf_tick_ts").catch(() => "0")) ?? "0");
+        if (now - last >= 13 * 60) {
+          await putAppState(env, "last_cf_tick_ts", String(now)).catch(() => {});
+          await runCronTick(env).catch((e) => console.error("cron tick failed:", e instanceof Error ? e.message : e));
+        }
+      })(),
+    );
+    ctx.waitUntil(Promise.allSettled(jobs).then(() => undefined));
   },
 } satisfies ExportedHandler<Env>;

@@ -20,7 +20,7 @@ compatibility_date = "2025-05-05"
 # wake alerts). Only free connectivity checks by default — billed vehicle_data
 # polls happen solely for rules with "allow_poll": true.
 [triggers]
-crons = ["*/15 * * * *"]
+crons = ["*/2 * * * *"]
 
 [[kv_namespaces]]
 binding = "TESLA_KV"
@@ -45,6 +45,8 @@ BUDGET_POLL_USD = "9"
 QUIET_HOURS_UTC = "21-3"
 # IANA zone for night-scoring, monthly buckets, DST-aware schedules.
 DEFAULT_TZ = "Asia/Jerusalem"
+# Vehicles the Cloudflare cron polls each fire (reliable native polling).
+POLL_VINS = "LRW3E7ET1RC159967"
 
 # Workers AI (Llama, free tier) — powers Ask-Tessa, proactive briefings, coach notes.
 [ai]
