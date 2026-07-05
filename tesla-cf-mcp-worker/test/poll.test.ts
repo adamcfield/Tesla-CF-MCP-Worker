@@ -68,7 +68,7 @@ describe("pollOnce adaptive interval", () => {
     const r = await pollOnce(makeEnv(kv), VIN);
     expect(r.activity).toBe("driving");
     expect(r.active).toBe(true);
-    expect(r.next_interval_s).toBe(30); // budget-tuned driving cadence
+    expect(r.next_interval_s).toBe(60); // logging-tuned driving cadence
     expect(r.polled).toBe(true);
   });
 
@@ -77,17 +77,17 @@ describe("pollOnce adaptive interval", () => {
     const r = await pollOnce(makeEnv(kv), VIN);
     expect(r.activity).toBe("charging");
     expect(r.active).toBe(true);
-    expect(r.next_interval_s).toBe(90);
+    expect(r.next_interval_s).toBe(150);
   });
 
-  it("idle-online → watch at 60s while recently active, then suspend so it can sleep", async () => {
+  it("idle-online → watch at the idle cadence while recently active, then suspend so it can sleep", async () => {
     const env = makeEnv(kv);
     // Fresh idle: last_active defaults to now → watch cadence, still active.
     stubTesla({ state: "online", shift: "P", speed: 0 });
     const first = await pollOnce(env, VIN);
     expect(first.activity).toBe("idle");
     expect(first.active).toBe(true);
-    expect(first.next_interval_s).toBe(60);
+    expect(first.next_interval_s).toBe(90);
 
     // Simulate 15 min of idle by ageing the stored marker, then poll again.
     await kv.put(`poll_state:${VIN}`, JSON.stringify({ last_active_ts: Math.floor(Date.now() / 1000) - 15 * 60 }));

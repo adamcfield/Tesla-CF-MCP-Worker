@@ -39,9 +39,13 @@ export interface PollResult {
   budget_spent_usd?: number;
 }
 
-const INTERVAL_DRIVING = 30;
-const INTERVAL_CHARGING = 90;
-const INTERVAL_IDLE = 60;
+// Tuned for LOGGING/analysis over real-time: coarser per-drive sampling (still
+// ample to reconstruct routes, efficiency, charge curves) buys far more
+// coverage-hours per month within the free budget. A 60s driving point is
+// ~every 250m-1km — a recognizable route — at ~half the cost of 30s.
+const INTERVAL_DRIVING = 60;
+const INTERVAL_CHARGING = 150;
+const INTERVAL_IDLE = 90;
 const INTERVAL_SLEEP = 300;
 /** After this many idle-online minutes, stop per-minute reads (car can sleep). */
 const IDLE_SUSPEND_MIN = 12;
