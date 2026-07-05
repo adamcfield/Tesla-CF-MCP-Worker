@@ -28,6 +28,16 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
+      - name: Health check (non-fatal)
+        # Diagnostic only: a transient 503/timeout on the probe must not
+        # suppress the tick itself — the tick step fails red on its own if the
+        # worker is genuinely broken. continue-on-error keeps the signal (step
+        # shows failed) without aborting the job.
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          curl -sS --fail --retry 3 --retry-all-errors --max-time 60 \
+            "https://tesla-cf-mcp-worker.adamcfield.workers.dev/health"
       - name: Run automation tick
         run: |
           set -euo pipefail

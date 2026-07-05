@@ -1,0 +1,275 @@
+/* Design tokens ported 1:1 from "TeslaMate UI redesign" mockup. */
+html, body { margin: 0; padding: 0; }
+*, *::before, *::after { box-sizing: border-box; }
+body {
+  background: #F5F6F8;
+  font-family: "Helvetica Neue", Helvetica, Arial, sans-serif;
+}
+
+[data-tm-root] {
+  --ui: "Helvetica Neue", Helvetica, Arial, sans-serif;
+  --mono: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+  --bg: #F5F6F8; --card: #FFFFFF; --text: #181B20; --sub: #5F6670; --faint: #98A0AA;
+  --line: rgba(18,24,38,0.09); --line2: rgba(18,24,38,0.05); --chip: #EDEFF2;
+  --good: #0F9960; --warn: #C97A0A; --bad: #D6453D; --accent: #2E62E8;
+}
+[data-tm-root][data-theme="dark"] {
+  --bg: #0E0F12; --card: #16181D; --text: #EFF1F4; --sub: #9AA2AD; --faint: #646C77;
+  --line: rgba(230,238,255,0.09); --line2: rgba(230,238,255,0.05); --chip: #1F2229;
+}
+
+@keyframes tmPulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
+@keyframes tmSpin { to { transform: rotate(360deg); } }
+
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-thumb { background: rgba(128,136,148,0.35); border-radius: 8px; border: 3px solid transparent; background-clip: content-box; }
+::-webkit-scrollbar-track { background: transparent; }
+
+[data-tm-root] {
+  display: flex; width: 100%; height: 100vh; overflow: hidden;
+  background: var(--bg); color: var(--text); font-family: var(--ui);
+  font-size: 14px; line-height: 1.45;
+}
+/* Used by the login gate, which doesn't want the app-shell flex/height rules
+   above but still needs the CSS custom properties (colors, fonts) to resolve. */
+[data-tm-root].tm-root-plain { display: block; width: auto; height: auto; overflow: visible; }
+
+/* ---------- sidebar ---------- */
+.tm-aside {
+  width: 228px; flex: none; display: flex; flex-direction: column;
+  padding: 20px 12px 14px; border-right: 1px solid var(--line); overflow-y: auto;
+}
+.tm-brand { display: flex; align-items: center; gap: 10px; padding: 2px 10px 16px; }
+.tm-brand-badge {
+  width: 36px; height: 36px; border-radius: 10px;
+  background: color-mix(in oklab, var(--accent) 13%, var(--card));
+  display: grid; place-items: center; font-weight: 700; font-size: 15px; color: var(--accent);
+  flex: none;
+}
+.tm-brand-name { font-weight: 600; font-size: 14px; letter-spacing: -0.01em; }
+.tm-brand-status { font-size: 12px; color: var(--sub); display: flex; align-items: center; gap: 6px; margin-top: 2px; }
+.tm-dot { width: 7px; height: 7px; border-radius: 50%; flex: none; }
+.tm-dot-live { background: var(--good); animation: tmPulse 2.6s ease-in-out infinite; }
+
+.tm-navgroup { margin-top: 12px; }
+.tm-navlabel {
+  font-size: 10.5px; font-weight: 600; letter-spacing: 0.1em; text-transform: uppercase;
+  color: var(--faint); padding: 0 10px 6px;
+}
+.tm-navitem {
+  display: flex; align-items: center; padding: 7px 10px; border-radius: 8px;
+  cursor: pointer; font-size: 13.5px; font-weight: 450; color: var(--sub);
+  margin-bottom: 1px; background: transparent; border: none; text-align: left; width: 100%;
+  font-family: var(--ui);
+}
+.tm-navitem:hover { background: color-mix(in oklab, var(--text) 5%, transparent); }
+.tm-navitem.active { font-weight: 600; color: var(--text); background: color-mix(in oklab, var(--text) 7%, transparent); }
+
+.tm-sidefoot { margin-top: auto; padding-top: 16px; }
+.tm-segment { display: flex; background: var(--chip); border-radius: 9px; padding: 3px; gap: 2px; }
+.tm-segbtn {
+  flex: 1; text-align: center; padding: 5px 0; border-radius: 7px; font-size: 12px;
+  font-weight: 600; cursor: pointer; color: var(--sub); background: transparent;
+  border: none; font-family: var(--ui);
+}
+.tm-segbtn.active { background: var(--card); color: var(--text); box-shadow: 0 1px 3px rgba(10,14,24,0.16); }
+.tm-sidemeta { padding: 12px 10px 0; font-size: 11px; color: var(--faint); }
+
+/* ---------- main ---------- */
+.tm-main { flex: 1; min-width: 0; display: flex; flex-direction: column; overflow: hidden; }
+.tm-header {
+  flex: none; display: flex; align-items: baseline; gap: 12px; padding: 18px 32px;
+  border-bottom: 1px solid var(--line);
+}
+.tm-header-title { font-size: 16px; font-weight: 600; letter-spacing: -0.01em; }
+.tm-header-sub { font-size: 12.5px; color: var(--faint); }
+.tm-header-live { margin-left: auto; display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--sub); white-space: nowrap; }
+.tm-header-live .tm-dot { width: 6px; height: 6px; }
+
+/* Hamburger button — hidden on desktop, shown on mobile (see media query). */
+.tm-menu-btn { display: none; background: none; border: none; cursor: pointer; padding: 4px 8px 4px 0; color: var(--text); font-size: 20px; line-height: 1; }
+.tm-nav-backdrop { display: none; }
+
+.tm-scroll { flex: 1; overflow-y: auto; }
+.tm-page { max-width: 1180px; margin: 0 auto; padding: 28px 32px 72px; display: flex; flex-direction: column; gap: 20px; }
+
+/* ---------- cards & grids ---------- */
+.tm-card { background: var(--card); border: 1px solid var(--line); border-radius: 14px; }
+.tm-card-pad { padding: 24px; }
+.tm-card-pad-lg { padding: 26px; }
+.tm-card-pad-metric { padding: 20px 22px; }
+.tm-card-hover:hover { border-color: var(--faint); cursor: pointer; }
+
+.tm-grid-metrics { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 20px; }
+.tm-grid-2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(340px, 1fr)); gap: 20px; }
+.tm-grid-2-wide { display: grid; grid-template-columns: repeat(auto-fit, minmax(360px, 1fr)); gap: 20px; }
+.tm-grid-3col { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 20px; }
+.tm-grid-half { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+
+.tm-stat-label { font-size: 12px; color: var(--sub); }
+.tm-stat-value { font-size: 22px; font-weight: 600; letter-spacing: -0.01em; margin-top: 6px; font-family: var(--mono); white-space: nowrap; }
+.tm-stat-unit { font-size: 13px; color: var(--sub); font-weight: 500; }
+.tm-stat-note { font-size: 12px; color: var(--faint); margin-top: 4px; }
+
+/* ---------- pills / badges ---------- */
+.tm-pill { display: inline-flex; align-items: center; gap: 6px; padding: 4px 10px; border-radius: 999px; font-size: 11.5px; font-weight: 600; }
+.tm-pill-good { background: color-mix(in oklab, var(--good) 12%, transparent); color: var(--good); }
+.tm-pill-warn { background: color-mix(in oklab, var(--warn) 12%, transparent); color: var(--warn); }
+.tm-pill-chip { background: var(--chip); color: var(--sub); }
+.tm-badge { display: inline-flex; padding: 3px 9px; border-radius: 999px; font-size: 10.5px; font-weight: 700; }
+.tm-badge-ac { color: var(--good); background: color-mix(in oklab, var(--good) 11%, transparent); }
+.tm-badge-dc { color: var(--accent); background: color-mix(in oklab, var(--accent) 11%, transparent); }
+.tm-chip-btn {
+  display: inline-flex; align-items: center; gap: 7px; padding: 6px 13px; border-radius: 999px;
+  border: 1px solid var(--line); background: transparent; color: var(--sub); font-size: 12.5px;
+  font-weight: 600; cursor: pointer; font-family: var(--ui);
+}
+.tm-chip-btn:hover { border-color: var(--faint); }
+.tm-chip-btn.active { background: var(--text); color: var(--bg); border-color: var(--text); }
+.tm-chip-btn .n { font-family: var(--mono); font-size: 11px; opacity: 0.65; }
+
+.tm-back-btn {
+  display: inline-flex; align-items: center; gap: 6px; padding: 6px 12px; border-radius: 999px;
+  border: 1px solid var(--line); color: var(--sub); font-size: 12.5px; font-weight: 600; cursor: pointer;
+  background: transparent; font-family: var(--ui);
+}
+.tm-back-btn:hover { border-color: var(--faint); color: var(--text); }
+
+/* ---------- battery / progress bar ---------- */
+.tm-battery-num { font-size: 54px; font-weight: 600; letter-spacing: -0.03em; line-height: 1; font-family: var(--mono); }
+.tm-battery-pct { font-size: 26px; color: var(--sub); font-weight: 500; }
+.tm-range-num { font-size: 28px; font-weight: 600; letter-spacing: -0.02em; font-family: var(--mono); }
+.tm-progress { position: relative; height: 10px; border-radius: 999px; background: var(--chip); }
+.tm-progress-fill { position: absolute; inset: 0 auto 0 0; border-radius: 999px; background: var(--accent); }
+.tm-progress-mark { position: absolute; top: -3px; bottom: -3px; width: 2px; border-radius: 2px; background: var(--faint); }
+
+.tm-readout-label { font-size: 11px; color: var(--faint); text-transform: uppercase; letter-spacing: 0.07em; font-weight: 600; }
+.tm-readout-value { font-size: 15px; font-weight: 600; margin-top: 4px; font-family: var(--mono); }
+
+/* ---------- tables ---------- */
+.tm-table-wrap { overflow-x: auto; }
+.tm-table-head, .tm-table-row {
+  display: grid; gap: 12px; padding: 14px 22px; align-items: center;
+}
+.tm-table-head {
+  padding: 12px 22px; border-bottom: 1px solid var(--line); font-size: 10.5px; font-weight: 600;
+  letter-spacing: 0.08em; text-transform: uppercase; color: var(--faint);
+}
+.tm-table-row { border-bottom: 1px solid var(--line2); cursor: pointer; }
+.tm-table-row:hover { background: color-mix(in oklab, var(--text) 3%, transparent); }
+.tm-table-row.no-click { cursor: default; }
+.tm-right { text-align: right; }
+.tm-mono { font-family: var(--mono); }
+.tm-ellipsis { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.tm-foot-note { padding: 12px 22px; font-size: 11.5px; color: var(--faint); }
+
+/* ---------- lists (activity / timeline) ---------- */
+.tm-activity-row {
+  display: flex; align-items: center; gap: 12px; padding: 11px 0; border-bottom: 1px solid var(--line2);
+}
+.tm-activity-row:last-child { border-bottom: none; }
+.tm-activity-title { font-size: 13px; font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.tm-activity-meta { font-size: 11.5px; color: var(--sub); margin-top: 1px; }
+.tm-activity-time { margin-left: auto; font-size: 11px; color: var(--faint); font-family: var(--mono); white-space: nowrap; }
+
+.tm-timeline-day-label {
+  font-size: 12px; font-weight: 600; letter-spacing: 0.06em; text-transform: uppercase;
+  color: var(--faint); margin-bottom: 10px;
+}
+.tm-timeline-row { display: flex; align-items: center; gap: 14px; padding: 13px 0; border-bottom: 1px solid var(--line2); }
+.tm-timeline-row:last-child { border-bottom: none; }
+.tm-timeline-time { font-size: 11px; color: var(--faint); font-family: var(--mono); width: 38px; flex: none; }
+.tm-timeline-title { font-size: 13.5px; font-weight: 500; }
+.tm-timeline-meta { font-size: 12px; color: var(--sub); margin-top: 1px; }
+
+/* ---------- map card ---------- */
+.tm-map-card { overflow: hidden; position: relative; min-height: 280px; }
+.tm-map-canvas { position: absolute; inset: 0; width: 100%; height: 100%; background: var(--chip); }
+.tm-map-overlay {
+  position: absolute; left: 14px; right: 14px; bottom: 14px; background: var(--card);
+  border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px;
+  display: flex; align-items: center; gap: 10px; z-index: 500;
+}
+.tm-map-overlay-title { font-size: 13px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.tm-map-overlay-meta { font-size: 11.5px; color: var(--sub); margin-top: 2px; }
+.tm-map-legend {
+  position: absolute; left: 16px; bottom: 16px; background: var(--card); border: 1px solid var(--line);
+  border-radius: 10px; padding: 10px 14px; display: flex; align-items: center; gap: 14px; z-index: 500;
+  font-size: 11.5px; color: var(--sub);
+}
+
+/* ---------- empty / loading states ---------- */
+.tm-empty {
+  display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 8px;
+  padding: 48px 20px; color: var(--sub); text-align: center; font-size: 13px;
+}
+.tm-empty-title { font-weight: 600; color: var(--text); font-size: 14px; }
+.tm-spinner {
+  width: 22px; height: 22px; border-radius: 50%; border: 2.5px solid var(--line);
+  border-top-color: var(--accent); animation: tmSpin 0.7s linear infinite;
+}
+
+/* ---------- login gate ---------- */
+.tm-gate {
+  min-height: 100vh; display: flex; align-items: center; justify-content: center;
+  background: var(--bg); color: var(--text); font-family: var(--ui);
+}
+.tm-gate-card {
+  width: 100%; max-width: 380px; background: var(--card); border: 1px solid var(--line);
+  border-radius: 16px; padding: 32px; display: flex; flex-direction: column; gap: 16px;
+}
+.tm-gate-title { font-size: 18px; font-weight: 600; }
+.tm-gate-sub { font-size: 13px; color: var(--sub); line-height: 1.5; }
+.tm-gate-input {
+  font-size: 14px; padding: 11px 13px; border-radius: 9px; border: 1px solid var(--line);
+  background: var(--bg); color: var(--text); font-family: var(--mono); width: 100%;
+}
+.tm-gate-input:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+.tm-gate-btn {
+  font-size: 14px; font-weight: 600; padding: 11px 13px; border-radius: 9px; border: none;
+  background: var(--accent); color: #fff; cursor: pointer; font-family: var(--ui);
+}
+.tm-gate-btn:hover { opacity: 0.92; }
+.tm-gate-err { font-size: 12.5px; color: var(--bad); }
+.tm-gate-field { display: flex; flex-direction: column; gap: 6px; }
+.tm-gate-field label { font-size: 12px; color: var(--sub); font-weight: 600; }
+
+/* ---------- misc ---------- */
+.tm-flex-col { display: flex; flex-direction: column; gap: 20px; }
+.tm-flex-row { display: flex; align-items: center; gap: 8px; }
+.tm-svg-block { display: block; width: 100%; height: auto; }
+
+/* ---------- mobile (<= 760px): sidebar becomes a slide-in drawer ---------- */
+@media (max-width: 760px) {
+  .tm-menu-btn { display: inline-block; }
+
+  .tm-aside {
+    position: fixed; top: 0; bottom: 0; left: 0; z-index: 1000;
+    width: 260px; max-width: 84vw;
+    background: var(--bg); border-right: 1px solid var(--line);
+    transform: translateX(-100%); transition: transform 0.22s ease;
+    box-shadow: 2px 0 20px rgba(0,0,0,0.18);
+  }
+  [data-tm-root].tm-nav-open .tm-aside { transform: translateX(0); }
+
+  .tm-nav-backdrop {
+    display: block; position: fixed; inset: 0; z-index: 900;
+    background: rgba(0,0,0,0.4); opacity: 0; pointer-events: none;
+    transition: opacity 0.22s ease;
+  }
+  [data-tm-root].tm-nav-open .tm-nav-backdrop { opacity: 1; pointer-events: auto; }
+
+  .tm-header { padding: 14px 16px; gap: 10px; align-items: center; }
+  .tm-header-sub { display: none; }
+  .tm-header-live { font-size: 11px; }
+  .tm-page { padding: 16px 16px 56px; gap: 16px; }
+
+  /* Single-column: let every multi-column grid collapse. */
+  .tm-grid-metrics, .tm-grid-2, .tm-grid-2-wide, .tm-grid-3col, .tm-grid-half {
+    grid-template-columns: 1fr;
+  }
+  .tm-card-pad, .tm-card-pad-lg { padding: 18px; }
+
+  /* Tables scroll horizontally rather than squashing (wrappers already have overflow-x). */
+  .tm-map-card, .tm-map-card .tm-map-canvas { min-height: 240px; }
+}

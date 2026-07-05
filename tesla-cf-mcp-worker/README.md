@@ -234,12 +234,15 @@ the Fleet API or wakes the car; it only processes data already pushed in.
 All of the above are exposed identically as `/data/*` REST routes (see
 Dashboards) reading the same query layer.
 
-> **Units.** Distances, ranges and derived efficiency are stored in whatever unit
-> the feed sends. Fleet **Telemetry** streams metric (km) for EU/metric vehicles;
-> the Fleet **REST** `vehicle_data` used by the poll/`allow_poll` path reports
-> **miles** on US-market cars. If you mix sources or run a US vehicle, normalize
-> to one unit before charting (a single conversion at ingest is the natural spot).
-> The worker does not guess the unit — it can't be inferred reliably per-sample.
+> **Units — normalized to metric at ingest.** Tesla's Fleet API reports
+> distance/range in **miles** and speed in **mph** on *both* the REST
+> `vehicle_data` poll path and the Telemetry stream, for **all** vehicles
+> regardless of region or GUI setting (verified against Tesla's official Fleet
+> Telemetry docs, TeslaMate, and Home Assistant). `ingest.ts` converts
+> `odometer`, `speed`, and the three range fields to km/(km/h) via ×1.609344
+> once, before storage — so every table, derived stat, and `/data` route is
+> uniformly metric. Temperatures (°C), tyre pressure (bar), energy (kWh) and
+> power (kW) are already metric and pass through untouched.
 
 ## Automations
 
@@ -363,6 +366,36 @@ Make/n8n can call any MCP tool directly: `POST /mcp` with
   history and `get_latest_state` all run off pushed data at the cheap rate.
 - Narrow reads (`get_charge_state` etc.) request only the needed
   `vehicle_data` endpoints.
+
+## Operations
+
+- **Health:** `GET /health` — liveness + KV/D1 dependency checks, returns 503
+  if either is down (so plain HTTP monitors alert without parsing the body).
+  Pass `?token=<MCP_AUTH_TOKEN>` for operational detail: whether an owner grant
+  is present and each vehicle's last-sample age. The GitHub Actions tick
+  (`.github/workflows/tesla-tick.yml`) checks it before each run.
+- **Automation tick without a Cloudflare cron slot:** if the account is at the
+  free plan's 5-cron limit, the worker's own `[triggers]` cron can't register.
+  `tesla-tick.yml` calls `run_automations_now` every 15 min via GitHub cron
+  instead (needs the `MCP_AUTH_TOKEN` repo secret). The worker's KV tick-lock
+  dedupes any overlap if a real cron slot later frees up.
+- **Retention:** set `RETENTION_DAYS` (var or secret) to prune the bulky raw
+  stores — `telemetry_events` and idle (non-drive) `positions` — older than
+  that on each tick. Derived history (drives, charge sessions + curves, the
+  state timeline, drive-route positions) is never pruned. Unset = keep forever.
+- **CORS:** `/data/*` and `/mcp` send `access-control-allow-origin: *` and
+  answer the `OPTIONS` preflight before the auth gate, so browser clients (the
+  dashboard, MCP inspectors) work cross-origin. Safe because auth is a
+  caller-held bearer token, never a cookie.
+
+## Tests
+
+`npm test` (vitest) — pinned invariants for the protocol codec (incl. the
+uint64 varint-truncation regression), the full ingest→derivation pipeline
+(drive/charge/state segmentation), imperial→metric normalization, and the auth
+layer (PKCE enforcement, access-vs-refresh token separation, single-flight
+refresh). D1 is backed by `node:sqlite` and KV by an in-memory adapter
+(`test/helpers/`), so no live bindings are needed. `npm run typecheck` for tsc.
 
 ## Command signing notes
 

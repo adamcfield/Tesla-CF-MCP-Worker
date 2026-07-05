@@ -440,7 +440,33 @@ async function runCronTickInner(env: Env): Promise<Record<string, unknown>> {
       });
     }
   }
+
+  await purgeExpiredHistory(env, summary);
   return summary;
+}
+
+/**
+ * Optional raw-history retention (RETENTION_DAYS env var; unset = keep forever).
+ * Only the bulky raw stores are pruned: the generic telemetry_events EAV table
+ * and positions NOT attached to a drive (idle samples). Derived history —
+ * drives, charge sessions + curves, state timeline — and drive-route positions
+ * are never touched: they are the long-term value (degradation trends need
+ * years) and grow far slower than raw samples.
+ */
+async function purgeExpiredHistory(env: Env, summary: Record<string, unknown>): Promise<void> {
+  const days = Number(env.RETENTION_DAYS ?? "");
+  if (!Number.isFinite(days) || days <= 0) return;
+  const cutoff = Math.floor(Date.now() / 1000) - Math.round(days * 86400);
+  try {
+    const events = await env.DB.prepare(`DELETE FROM telemetry_events WHERE ts < ?1`).bind(cutoff).run();
+    const positions = await env.DB.prepare(
+      `DELETE FROM positions WHERE ts < ?1 AND drive_id IS NULL`,
+    ).bind(cutoff).run();
+    const purged = (events.meta.changes ?? 0) + (positions.meta.changes ?? 0);
+    if (purged > 0) summary.purged_rows = purged;
+  } catch (e) {
+    summary.purge_error = e instanceof Error ? e.message : String(e);
+  }
 }
 
 async function detectWakeTransition(

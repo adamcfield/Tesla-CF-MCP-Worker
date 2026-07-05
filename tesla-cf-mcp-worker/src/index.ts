@@ -35,11 +35,12 @@ import {
   isMcpAuthorized,
   oauthProtectedResourceMetadata,
   oauthServerMetadata,
+  ownerGrantPresent,
   timingSafeEqual,
   unauthorized,
 } from "./auth";
 import { handleIngest } from "./ingest";
-import { handleMcp } from "./mcp";
+import { handleMcp, SERVER_VERSION } from "./mcp";
 import { loadCommandKey } from "./protocol";
 import { runCronTick } from "./rules";
 import { getLatest, querySeries } from "./store";
@@ -82,6 +83,52 @@ function withCors(resp: Response): Response {
   const out = new Response(resp.body, resp);
   for (const [k, v] of Object.entries(CORS_HEADERS)) out.headers.set(k, v);
   return out;
+}
+
+/**
+ * GET /health — liveness + dependency checks, for uptime monitors and the
+ * GitHub Actions tick. Unauthenticated callers get a minimal ok/version body;
+ * a valid token adds operational detail (grant presence, per-VIN data age).
+ * Returns 503 when a hard dependency (KV/D1) is down so plain HTTP monitors
+ * alert without parsing the body.
+ */
+async function handleHealth(request: Request, url: URL, env: Env): Promise<Response> {
+  const body: Record<string, unknown> = {
+    ok: true,
+    version: SERVER_VERSION,
+    ts: Math.floor(Date.now() / 1000),
+  };
+  try {
+    await env.TESLA_KV.get("health:probe");
+    body.kv = "ok";
+  } catch {
+    body.kv = "error";
+    body.ok = false;
+  }
+  try {
+    await env.DB.prepare("SELECT 1").first();
+    body.d1 = "ok";
+  } catch {
+    body.d1 = "error";
+    body.ok = false;
+  }
+
+  if (tokenAuthorized(request, url, env.MCP_AUTH_TOKEN)) {
+    body.owner_grant = (await ownerGrantPresent(env).catch(() => false)) ? "present" : "missing";
+    try {
+      const rs = await env.DB.prepare(
+        `SELECT vin, MAX(ts) AS last_ts FROM positions GROUP BY vin`,
+      ).all<{ vin: string; last_ts: number }>();
+      const now = Math.floor(Date.now() / 1000);
+      body.vehicles = (rs.results ?? []).map((r) => ({
+        vin_suffix: r.vin.slice(-6),
+        last_sample_age_s: now - r.last_ts,
+      }));
+    } catch {
+      body.vehicles = "unavailable";
+    }
+  }
+  return json(body, body.ok ? 200 : 503);
 }
 
 /** Bearer header or ?token= query param (documented tradeoff for OBS/Grafana). */
@@ -194,6 +241,7 @@ export default {
       if (path === "/oauth/token" && request.method === "POST") return handleOauthToken(request, env);
       if (path === "/auth/callback") return handleAuthCallback(request, env);
       if (path === "/auth/login") return handleAuthLogin(request, env);
+      if (path === "/health") return handleHealth(request, url, env);
 
       if (path === "/" || path === "") {
         return new Response(

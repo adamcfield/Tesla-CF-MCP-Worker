@@ -21,7 +21,15 @@ export interface LatestState {
   [field: string]: unknown; // canonical fields: soc, lat, lon, odometer, ...
 }
 
+// One-time per-isolate guard: in the Worker a single isolate serves many
+// requests against the same D1, so caching this is correct. Tests that spin up
+// multiple in-memory databases must reset it (resetSchemaCacheForTests).
 let schemaReady = false;
+
+/** Test-only: clears the ensureSchema guard so a fresh test DB re-provisions. */
+export function resetSchemaCacheForTests(): void {
+  schemaReady = false;
+}
 
 /**
  * Structured columns held on the `positions` table. querySeries/get_history

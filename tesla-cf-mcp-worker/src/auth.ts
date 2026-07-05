@@ -132,6 +132,11 @@ export async function storeOwnerTokens(env: Env, tok: TokenResponse): Promise<vo
   });
 }
 
+/** Whether an owner grant exists (KV-rotated refresh token or seed secret) — used by /health. */
+export async function ownerGrantPresent(env: Env): Promise<boolean> {
+  return Boolean((await env.TESLA_KV.get(KV_REFRESH)) ?? env.TESLA_REFRESH_TOKEN);
+}
+
 /** Client-credentials partner token, needed only for one-time endpoint registration. */
 export async function getPartnerToken(env: Env): Promise<string> {
   const resp = await fetch(`${authBase(env)}/oauth2/v3/token`, {
@@ -354,7 +359,11 @@ export async function handleOauthAuthorize(request: Request, env: Env): Promise<
   const method = q.get("code_challenge_method") ?? "S256";
 
   if (!redirectAllowed(redirectUri)) return new Response("redirect_uri not allowed", { status: 400 });
-  if (codeChallenge && method !== "S256") return new Response("only S256 PKCE supported", { status: 400 });
+  // OAuth 2.1 mandates PKCE for public ("none"-auth) clients; every real MCP
+  // client (claude.ai included) sends S256, so requiring it costs nothing and
+  // closes the code-interception window a challenge-less flow would leave.
+  if (!codeChallenge) return new Response("code_challenge required (PKCE)", { status: 400 });
+  if (method !== "S256") return new Response("only S256 PKCE supported", { status: 400 });
 
   if (request.method === "GET") {
     return new Response(AUTHORIZE_PAGE(`${url.pathname}${url.search}`), {
@@ -395,15 +404,17 @@ export async function handleOauthToken(request: Request, env: Env): Promise<Resp
     if (stored.redirectUri !== (form.get("redirect_uri") ?? "")) {
       return json({ error: "invalid_grant", error_description: "redirect_uri mismatch" }, 400);
     }
-    if (stored.codeChallenge) {
-      const verifier = form.get("code_verifier") ?? "";
-      const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(verifier));
-      const b64url = btoa(String.fromCharCode(...new Uint8Array(digest)))
-        .replace(/\+/g, "-")
-        .replace(/\//g, "_")
-        .replace(/=+$/, "");
-      if (b64url !== stored.codeChallenge) return json({ error: "invalid_grant", error_description: "PKCE failed" }, 400);
-    }
+    // codeChallenge is always present now (authorize rejects challenge-less
+    // requests), but keep the guard so codes minted by older deploys fail
+    // closed rather than skipping verification.
+    if (!stored.codeChallenge) return json({ error: "invalid_grant", error_description: "PKCE required" }, 400);
+    const verifier = form.get("code_verifier") ?? "";
+    const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(verifier));
+    const b64url = btoa(String.fromCharCode(...new Uint8Array(digest)))
+      .replace(/\+/g, "-")
+      .replace(/\//g, "_")
+      .replace(/=+$/, "");
+    if (b64url !== stored.codeChallenge) return json({ error: "invalid_grant", error_description: "PKCE failed" }, 400);
     return issueTokens(env);
   }
 

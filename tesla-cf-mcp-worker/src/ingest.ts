@@ -75,6 +75,26 @@ const META_FIELDS = new Set([
   "ac_charge_energy_added", "dc_charge_energy_added",
 ]);
 
+const MI_TO_KM = 1.609344;
+/**
+ * Canonical fields the Tesla Fleet API reports in imperial units, on BOTH the
+ * REST poll path and the telemetry stream, regardless of the car's region or
+ * GUI setting (verified against Tesla's official Fleet Telemetry "Available
+ * Data" docs + TeslaMate/Home-Assistant, 2026-07). Distances are miles, speed
+ * is mph — same 1.609344 factor. Everything else (temps °C, TPMS bar, energy
+ * kWh, power kW) is already metric and passes through untouched. Normalizing
+ * here, before mergeLatest/derivation, means every downstream table, derived
+ * stat, and `/data` route is uniformly metric.
+ */
+const MILES_FIELDS = new Set(["odometer", "speed", "est_range", "rated_range", "ideal_range"]);
+
+function toMetric(canonical: string, value: unknown): unknown {
+  if (MILES_FIELDS.has(canonical) && typeof value === "number" && Number.isFinite(value)) {
+    return value * MI_TO_KM;
+  }
+  return value;
+}
+
 /** DetailedChargeState enum strings arrive prefixed, e.g. "DetailedChargeStateCharging". */
 function normalizeChargingState(v: unknown): unknown {
   if (typeof v === "string" && v.startsWith("DetailedChargeState")) {
@@ -100,7 +120,11 @@ function coerce(v: unknown): unknown {
  * `{invalid:true}` markers carry no reading and are dropped.
  */
 function unwrapFtValue(v: unknown): unknown {
-  if (v === null || typeof v !== "object") return v;
+  // Bare primitives go through coerce too: a bridge posting the array shape
+  // with an unwrapped string value ({"key":"Odometer","value":"50000"}) must
+  // yield a NUMBER, or toMetric()'s number-only guard skips the mi->km
+  // conversion and the sample is stored as unconverted miles.
+  if (v === null || typeof v !== "object") return coerce(v);
   const o = v as Record<string, unknown>;
   if (o.invalid === true) return undefined;
   if (o.locationValue && typeof o.locationValue === "object") return o.locationValue;
@@ -153,6 +177,7 @@ export async function applyIngest(env: Env, parsed: ParsedIngest): Promise<Lates
     let value = rawValue;
     const canonical = FIELD_MAP[field] ?? field.toLowerCase();
     if (canonical === "charging_state") value = normalizeChargingState(value);
+    value = toMetric(canonical, value);
 
     if (canonical === "location" && value && typeof value === "object") {
       const loc = value as { latitude?: number; longitude?: number };

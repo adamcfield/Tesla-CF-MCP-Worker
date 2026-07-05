@@ -14,7 +14,8 @@ import * as telemetry from "./telemetry";
 import * as tracking from "./tracking";
 import { Env, TeslaError } from "./types";
 
-const SERVER_INFO = { name: "tesla-cf-mcp-worker", title: "Tesla CF MCP Worker", version: "0.1.0" };
+export const SERVER_VERSION = "1.0.0";
+const SERVER_INFO = { name: "tesla-cf-mcp-worker", title: "Tesla CF MCP Worker", version: SERVER_VERSION };
 const SUPPORTED_PROTOCOLS = ["2025-06-18", "2025-03-26", "2024-11-05"];
 
 // ---------------------------------------------------------------------------
