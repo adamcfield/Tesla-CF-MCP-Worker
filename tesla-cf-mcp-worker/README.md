@@ -369,6 +369,20 @@ Make/n8n can call any MCP tool directly: `POST /mcp` with
 
 ## Operations
 
+- **Continuous recording (TeslaMate-grade):** `GET /poll/now?vin=` runs one
+  adaptive poll — a free connectivity check, and only when the car is online,
+  one billed `vehicle_data` read folded through the ingest→derivation pipeline.
+  It returns the next interval (driving ~10s, charging ~30s, idle-online 60s)
+  and backs off once idle-online for ~12 min so the car can sleep. It never
+  wakes the car. `.github/workflows/tesla-poll.yml` drives it in a loop on a
+  `*/5` schedule (free — Actions minutes are unlimited on a public repo). This
+  is what fills Drives, the state timeline, degradation, vampire drain and
+  efficiency. Billed Tesla reads happen only while the car is online; Fleet
+  Telemetry streaming (~18× cheaper) is the option to cut that further.
+- **Backfill charge history:** `backfill_charge_history` (MCP tool) /
+  `POST /setup/backfill-charges?vin=` imports past Supercharger sessions from
+  Tesla's `dx/charging/history` (energy, cost, site, time — DC only, no SoC).
+  Idempotent (dedup by Tesla session id).
 - **Health:** `GET /health` — liveness + KV/D1 dependency checks, returns 503
   if either is down (so plain HTTP monitors alert without parsing the body).
   Pass `?token=<MCP_AUTH_TOKEN>` for operational detail: whether an owner grant
