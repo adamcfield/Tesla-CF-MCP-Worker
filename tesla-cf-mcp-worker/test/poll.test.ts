@@ -82,6 +82,35 @@ describe("pollOnce adaptive interval", () => {
     expect(r.next_interval_s).toBe(60);
   });
 
+  it("dedups billed reads across overlapping pollers (no double-bill)", async () => {
+    const env = makeEnv(kv);
+    let vehicleDataCalls = 0;
+    vi.stubGlobal("fetch", vi.fn(async (url: string) => {
+      const u = String(url);
+      if (u.includes("/oauth2/v3/token")) {
+        return new Response(JSON.stringify({ access_token: "A", refresh_token: "R", expires_in: 3600, token_type: "Bearer" }), { status: 200 });
+      }
+      if (u.includes("/vehicle_data")) {
+        vehicleDataCalls++;
+        return new Response(JSON.stringify({ response: {
+          charge_state: { battery_level: 70, charging_state: "Charging", battery_range: 200 },
+          climate_state: {}, drive_state: { shift_state: "P", speed: 0, latitude: 32.1, longitude: 34.8, power: 0 },
+          vehicle_state: { odometer: 1000, locked: true }, vehicle_config: {},
+        } }), { status: 200 });
+      }
+      return new Response(JSON.stringify({ response: { vin: VIN, state: "online" } }), { status: 200 });
+    }));
+    // First poll bills; an immediate second poll (another poller) must be
+    // throttled to the free check only — total billed reads stays 1.
+    const first = await pollOnce(env, VIN);
+    expect(first.polled).toBe(true);
+    const second = await pollOnce(env, VIN);
+    expect(second.activity).toBe("throttled");
+    expect(second.polled).toBe(false);
+    expect(second.active).toBe(true);
+    expect(vehicleDataCalls).toBe(1); // NOT 2 — the second poll didn't double-bill
+  });
+
   it("idle-online → watch at the idle cadence while recently active, then suspend so it can sleep", async () => {
     const env = makeEnv(kv);
     // Fresh idle: last_active defaults to now → watch cadence, still active.
@@ -93,7 +122,11 @@ describe("pollOnce adaptive interval", () => {
 
     // Simulate 15 min of idle by ageing the stored marker (now in D1
     // app_state — the KV copy is only a migration fallback), then poll again.
-    await putAppState(env, `poll_state:${VIN}`, JSON.stringify({ last_active_ts: Math.floor(Date.now() / 1000) - 15 * 60 }));
+    // Also age the billed-read stamp so the cross-poller dedup doesn't throttle
+    // this (in reality these two polls are 15 min apart, not back-to-back).
+    const ago = Math.floor(Date.now() / 1000) - 15 * 60;
+    await putAppState(env, `poll_state:${VIN}`, JSON.stringify({ last_active_ts: ago }));
+    await putAppState(env, `billed_ts:${VIN}`, String(ago));
     const later = await pollOnce(env, VIN);
     expect(later.activity).toBe("idle");
     expect(later.active).toBe(false); // suspended → loop stops, car allowed to sleep

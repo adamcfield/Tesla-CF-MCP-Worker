@@ -59,10 +59,19 @@ const IDLE_SUSPEND_MIN = 12;
 const PROBE_INTERVAL_S = 15 * 60;
 /** Re-fetch the (immutable) vehicle_config endpoint at most this often. */
 const VCFG_REFRESH_S = 30 * 86400;
+/**
+ * Minimum seconds between BILLED reads across ALL pollers. Multiple pollers now
+ * run (the DO alarm, the GitHub loop, an optional cron) — without this they'd
+ * each bill during the same 10s driving window and burn 2-3× the budget. A
+ * poller landing inside this window does only the free connectivity check. 8s
+ * still permits the intended ~10s driving cadence.
+ */
+const MIN_BILLED_GAP_S = 8;
 
 const POLL_STATE = (vin: string) => `poll_state:${vin}`;
 const POLL_OK = (vin: string) => `poll_ok_ts:${vin}`;
 const VCFG_TS = (vin: string) => `vcfg_ts:${vin}`;
+const BILLED_TS = (vin: string) => `billed_ts:${vin}`;
 
 interface PollState {
   last_active_ts?: number;
@@ -148,6 +157,19 @@ export async function pollOnce(env: Env, vin: string): Promise<PollResult> {
     }
   }
 
+  // 3b. Cross-poller dedup: if any poller did a billed read in the last few
+  //     seconds, skip the billed read here (free check already ran) so
+  //     overlapping pollers can't double-bill. Return active with a short
+  //     interval so the caller retries just after the window clears.
+  const lastBilled = Number((await getAppState(env, BILLED_TS(vin)).catch(() => "0")) ?? "0");
+  if (now - lastBilled < MIN_BILLED_GAP_S) {
+    await recordConnectivityState(env, vin, "online").catch(() => {});
+    return {
+      vin, state, activity: "throttled", polled: false, active: true,
+      next_interval_s: MIN_BILLED_GAP_S, budget_spent_usd: budget.spent_usd,
+    };
+  }
+
   // 4. One billed vehicle_data read, folded through ingest → derivation.
   //    vehicle_config is static trim data — refresh it monthly, not per-poll.
   //    (The car can drop offline between the check and here — treat as asleep.)
@@ -167,6 +189,8 @@ export async function pollOnce(env: Env, vin: string): Promise<PollResult> {
     await recordConnectivityState(env, vin, "asleep").catch(() => {});
     return { vin, state: "asleep", activity: "asleep", polled: false, active: false, next_interval_s: INTERVAL_SLEEP };
   }
+  // Stamp the billed read immediately so a concurrent poller dedups against it.
+  await putAppState(env, BILLED_TS(vin), String(now)).catch(() => {});
   if (refreshVcfg) await putAppState(env, VCFG_TS(vin), String(now)).catch(() => {});
 
   const current = await applyVehicleData(env, vin, vd);

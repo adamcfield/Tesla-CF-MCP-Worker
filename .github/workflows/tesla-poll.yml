@@ -48,6 +48,15 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 58
     steps:
+      - name: Keep the Durable Object poll scheduler armed
+        # The DO alarm is the primary poller (fires reliably, self-rearms). This
+        # re-arms it in the rare case its alarm chain ever broke, so the system
+        # self-heals hourly. The loop below is a redundant backup poller — the
+        # server-side billed-read dedup means running both never double-bills.
+        run: |
+          curl -sS --max-time 20 \
+            -H "Authorization: Bearer ${{ secrets.MCP_AUTH_TOKEN }}" \
+            "$WORKER/scheduler/start" || true
       - name: Adaptive poll loop
         run: |
           set -uo pipefail
