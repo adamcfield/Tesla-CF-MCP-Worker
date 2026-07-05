@@ -478,7 +478,7 @@ async function renderOverview() {
           <div class="tm-grid-metrics" style="grid-template-columns:repeat(auto-fit,minmax(90px,1fr));gap:14px;">
             <div><div class="tm-readout-label">Inside</div><div class="tm-readout-value">${inside != null ? fmt1(inside) + " °C" : "—"}</div></div>
             <div><div class="tm-readout-label">Outside</div><div class="tm-readout-value">${outside != null ? fmt1(outside) + " °C" : "—"}</div></div>
-            <div><div class="tm-readout-label">Tyres</div><div class="tm-readout-value">${tyres != null ? fmt2(tyres) + " bar" : "—"}</div></div>
+            <div><div class="tm-readout-label">Tyres</div><div class="tm-readout-value">${tyres != null ? fmt1(tyres * 14.5038) + " PSI" : "—"}</div></div>
             <div><div class="tm-readout-label">Security</div><div class="tm-readout-value">${locked == null ? "—" : locked ? "Locked" : "Unlocked"}</div></div>
           </div>
         ` : `
