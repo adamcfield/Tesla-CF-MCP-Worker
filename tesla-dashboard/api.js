@@ -12,7 +12,7 @@
 const DEFAULT_ORIGIN = "https://tesla-cf-mcp-worker.adamcfield.workers.dev";
 
 /** Allows ?origin=https://your-worker.example.com for pointing at a different deployment. */
-function workerOrigin() {
+export function workerOrigin() {
   const override = new URLSearchParams(location.search).get("origin");
   return (override || localStorage.getItem("tm_origin") || DEFAULT_ORIGIN).replace(/\/+$/, "");
 }

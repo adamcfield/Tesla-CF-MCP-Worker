@@ -40,6 +40,7 @@ import {
   unauthorized,
 } from "./auth";
 import { getBudgetStatus } from "./budget";
+import { handleGeocode, handleGovTile } from "./govmap";
 import { handleIngest } from "./ingest";
 import { handleMcp, SERVER_VERSION } from "./mcp";
 import { pollOnce } from "./poll";
@@ -251,6 +252,19 @@ export default {
       if (path === "/auth/callback") return handleAuthCallback(request, env);
       if (path === "/auth/login") return handleAuthLogin(request, env);
       if (path === "/health") return handleHealth(request, url, env);
+
+      // --- GovMap basemap tile proxy (public: Leaflet can't send a bearer, and
+      // these are public map tiles behind a Referer gate the worker satisfies).
+      if (path.startsWith("/govtiles/")) {
+        return handleGovTile(path.split("/").filter(Boolean));
+      }
+      // --- Forward geocode (address → coords), GovMap with Nominatim fallback.
+      if (path === "/geocode") {
+        const q = url.searchParams.get("q")?.trim();
+        if (!q) return json({ error: "q query param required" }, 400);
+        const results = await handleGeocode(q, url.searchParams.get("lang") ?? "he");
+        return json({ query: q, results });
+      }
 
       if (path === "/" || path === "") {
         return new Response(

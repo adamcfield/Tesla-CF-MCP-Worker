@@ -1,8 +1,16 @@
 /**
- * Thin Leaflet wrapper (free OSM tiles, no API key) replacing the design
- * mockup's "map tiles here" / "route map tiles here" placeholders with real
- * maps. Leaflet itself is loaded once from a CDN in index.html.
+ * Thin Leaflet wrapper replacing the design mockup's "map tiles here"
+ * placeholders with real maps. Leaflet itself is loaded once from a CDN in
+ * index.html.
+ *
+ * Basemap: GovMap (Israeli national map, מפ"י) proxied through the worker's
+ * /govtiles route — the tile CDN enforces a Referer allow-list the browser
+ * can't satisfy, so the worker fetches server-side. GovMap basemaps are
+ * standard EPSG:3857 XYZ, so no custom CRS/Proj4Leaflet is needed. OSM is kept
+ * as a selectable fallback (and covers anything outside Israel's tile extent).
  */
+
+import { workerOrigin } from "./api.js";
 
 let activeMaps = [];
 
@@ -18,8 +26,28 @@ function track(map) {
   return map;
 }
 
-const TILE_URL = "https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png";
-const TILE_ATTR = "&copy; OpenStreetMap contributors";
+const GOVMAP_ATTR = '&copy; <a href="https://www.govmap.gov.il/">מפ"י / GovMap</a>';
+const OSM_ATTR = "&copy; OpenStreetMap contributors";
+
+/** GovMap basemap layers, proxied through the worker's Referer-satisfying route. */
+function govmapLayers() {
+  const base = workerOrigin();
+  const streets = L.tileLayer(`${base}/govtiles/streets/{z}/{x}/{y}.png`, {
+    attribution: GOVMAP_ATTR, maxNativeZoom: 19, maxZoom: 20, tileSize: 256,
+  });
+  // Aerial "hybrid": orthophoto with the street/label overlay on top.
+  const ortho = L.tileLayer(`${base}/govtiles/ortho/{z}/{x}/{y}.jpg`, {
+    attribution: GOVMAP_ATTR, maxNativeZoom: 20, maxZoom: 21, tileSize: 256,
+  });
+  const labels = L.tileLayer(`${base}/govtiles/labels/{z}/{x}/{y}.png`, {
+    maxNativeZoom: 19, maxZoom: 21, tileSize: 256,
+  });
+  const aerial = L.layerGroup([ortho, labels]);
+  const osm = L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+    attribution: OSM_ATTR, maxZoom: 19,
+  });
+  return { streets, aerial, osm };
+}
 
 function baseMap(el, opts = {}) {
   const map = L.map(el, {
@@ -28,7 +56,15 @@ function baseMap(el, opts = {}) {
     scrollWheelZoom: false,
     ...opts,
   });
-  L.tileLayer(TILE_URL, { attribution: TILE_ATTR, maxZoom: 19 }).addTo(map);
+  const { streets, aerial, osm } = govmapLayers();
+  streets.addTo(map); // GovMap streets is the default basemap
+  L.control
+    .layers(
+      { 'GovMap מפ"י': streets, "GovMap Aerial": aerial, OpenStreetMap: osm },
+      {},
+      { position: "topright", collapsed: true },
+    )
+    .addTo(map);
   L.control.zoom({ position: "bottomright" }).addTo(map);
   return track(map);
 }

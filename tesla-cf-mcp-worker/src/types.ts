@@ -46,6 +46,8 @@ export interface Env {
   TESLA_API_BASE?: string;
   /** Optional OAuth base override to match TESLA_API_BASE (e.g. the proxy's auth host). */
   TESLA_AUTH_BASE?: string;
+  /** GovMap (Israeli national map) API key — enables GovMap geocoding/tiles over OSM fallback. */
+  GOVMAP_API_KEY?: string;
 }
 
 /** Regional Fleet API bases — https://developer.tesla.com/docs/fleet-api */
