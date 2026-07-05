@@ -16,11 +16,6 @@ name = "tesla-cf-mcp-worker"
 main = "src/index.ts"
 compatibility_date = "2025-05-05"
 
-# Automation engine tick (price/solar charging, scheduled preconditioning,
-# wake alerts). Only free connectivity checks by default — billed vehicle_data
-# polls happen solely for rules with "allow_poll": true.
-[triggers]
-crons = ["*/2 * * * *"]
 
 [[kv_namespaces]]
 binding = "TESLA_KV"

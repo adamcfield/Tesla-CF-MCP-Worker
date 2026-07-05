@@ -184,6 +184,32 @@ describe("odometer-jump drive recovery (missed by poll gaps)", () => {
     expect(synthCount!.n).toBe(0); // real drive captured, no synthetic duplicate
   });
 
+  it("does NOT synthesize an absurd mega-drive from a multi-day offline gap", async () => {
+    const t = 1_750_500_000;
+    // Parked, then 6 days later parked with the odometer +800 km — an offline
+    // gap (many real drives), not one recoverable trip.
+    const p1: LatestState = { vin: VIN, updated_at: t, odometer: 1000, lat: 32.08, lon: 34.79, soc: 90, gear: "P", speed: 0 };
+    const p2: LatestState = { vin: VIN, updated_at: t + 6 * 86400, odometer: 1800, lat: 33.0, lon: 35.1, soc: 40, gear: "P", speed: 0 };
+    await applyDerivation(env, VIN, t, null, p1);
+    await applyDerivation(env, VIN, t + 6 * 86400, p1, p2);
+    const synth = await env.DB.prepare(`SELECT COUNT(*) n FROM drives WHERE vin = ?1 AND synthetic = 1`).bind(VIN).first<{ n: number }>();
+    expect(synth!.n).toBe(0); // 800 km over 6 days is capped out, not one drive
+  });
+
+  it("caps a synthetic drive's duration to a plausible floor speed (not a multi-day crawl)", async () => {
+    const t = 1_750_600_000;
+    // 10 km jump but the previous sample is 12h stale (polling was down). The
+    // true drive took minutes; duration must be capped so avg_speed isn't ~0.
+    const p1: LatestState = { vin: VIN, updated_at: t, odometer: 2000, lat: 32.0, lon: 34.8, soc: 80, gear: "P", speed: 0 };
+    const p2: LatestState = { vin: VIN, updated_at: t + 12 * 3600, odometer: 2010, lat: 32.05, lon: 34.85, soc: 76, gear: "P", speed: 0 };
+    await applyDerivation(env, VIN, t, null, p1);
+    await applyDerivation(env, VIN, t + 12 * 3600, p1, p2);
+    const d = await env.DB.prepare(`SELECT duration_min, avg_speed FROM drives WHERE vin = ?1 AND synthetic = 1`).bind(VIN).first<{ duration_min: number; avg_speed: number }>();
+    expect(d).toBeTruthy();
+    expect(d!.duration_min).toBeLessThanOrEqual(30); // 10km @ 20km/h floor = 30 min, not 12h
+    expect(d!.avg_speed).toBeGreaterThanOrEqual(20);
+  });
+
   it("backfillSyntheticDrives recovers a jump from the positions history, idempotently", async () => {
     const t = 1_750_200_000;
     // Two parked position samples (drive_id NULL) with a 9 km odometer jump.

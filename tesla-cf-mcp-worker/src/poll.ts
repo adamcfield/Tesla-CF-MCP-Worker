@@ -182,6 +182,13 @@ export async function pollOnce(env: Env, vin: string): Promise<PollResult> {
   }
   if (refreshVcfg) endpoints.push("vehicle_config");
 
+  // Claim the billed-read slot BEFORE the network call (which takes seconds) —
+  // otherwise a concurrent poller reads the stale stamp during that window and
+  // double-bills (TOCTOU). recordSpend inside getVehicleData is likewise
+  // counted before the call, so the timings match. A subsequent failed read
+  // just throttles the next poll for 8s (harmless).
+  await putAppState(env, BILLED_TS(vin), String(now)).catch(() => {});
+
   let vd: Record<string, unknown>;
   try {
     vd = await getVehicleData(env, vin, endpoints);
@@ -189,8 +196,6 @@ export async function pollOnce(env: Env, vin: string): Promise<PollResult> {
     await recordConnectivityState(env, vin, "asleep").catch(() => {});
     return { vin, state: "asleep", activity: "asleep", polled: false, active: false, next_interval_s: INTERVAL_SLEEP };
   }
-  // Stamp the billed read immediately so a concurrent poller dedups against it.
-  await putAppState(env, BILLED_TS(vin), String(now)).catch(() => {});
   if (refreshVcfg) await putAppState(env, VCFG_TS(vin), String(now)).catch(() => {});
 
   const current = await applyVehicleData(env, vin, vd);

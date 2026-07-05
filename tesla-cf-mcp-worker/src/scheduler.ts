@@ -43,18 +43,25 @@ export class PollScheduler {
   /** Fires on schedule: poll each configured VIN, then re-arm at the pace the
    *  poller asks for (fast while driving, slow while parked/asleep). */
   async alarm(): Promise<void> {
-    const vins = (this.env.POLL_VINS ?? "").split(/[,\s]+/).map((v) => v.trim()).filter(Boolean);
     let nextS = DEFAULT_INTERVAL_S;
-    for (const vin of vins) {
-      try {
-        const r = await pollOnce(this.env, vin);
-        if (typeof r.next_interval_s === "number") nextS = Math.min(nextS, r.next_interval_s);
-      } catch (e) {
-        console.error("DO poll failed:", e instanceof Error ? e.message : e);
+    try {
+      const vins = (this.env.POLL_VINS ?? "").split(/[,\s]+/).map((v) => v.trim()).filter(Boolean);
+      for (const vin of vins) {
+        try {
+          const r = await pollOnce(this.env, vin);
+          if (typeof r.next_interval_s === "number") nextS = Math.min(nextS, r.next_interval_s);
+        } catch (e) {
+          console.error("DO poll failed:", e instanceof Error ? e.message : e);
+        }
       }
+    } finally {
+      // Re-arm is the LAST thing that runs, always — a try/finally guarantees it
+      // even if code above throws. A failed setAlarm is re-thrown so the runtime
+      // retries alarm() (rather than silently leaving the DO with no next alarm);
+      // the /scheduler/start + GH re-arm paths are the outer safety net.
+      const clamped = Math.max(MIN_INTERVAL_S, Math.min(MAX_INTERVAL_S, nextS));
+      await this.state.storage.setAlarm(Date.now() + clamped * 1000);
     }
-    const clamped = Math.max(MIN_INTERVAL_S, Math.min(MAX_INTERVAL_S, nextS));
-    await this.state.storage.setAlarm(Date.now() + clamped * 1000);
   }
 }
 

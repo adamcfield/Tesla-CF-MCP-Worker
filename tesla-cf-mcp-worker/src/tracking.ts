@@ -38,6 +38,17 @@ const MIN_DRIVE_KM = 0.05;
 const MIN_DRIVE_SECONDS = 60;
 /** Odometer jump (km) between two parked polls that we treat as a missed drive. */
 const MIN_DRIVE_KM_SYNTH = 0.5;
+/**
+ * Above this jump, or spanning a longer gap, the odometer delta is an OFFLINE
+ * GAP (dead 12V, long parking, a loaner, a multi-day outage) that almost
+ * certainly contains many real drives — synthesizing one "drive" over it would
+ * be a bogus mega-drive, so we leave it unrecovered instead.
+ */
+const MAX_DRIVE_KM_SYNTH = 500;
+const MAX_GAP_S_SYNTH = 24 * 3600;
+/** Floor speed for a synthetic drive's inferred duration (the poll gap is only
+ *  an upper bound on WHEN it happened, not how long it took). */
+const SYNTH_FLOOR_KMH = 20;
 
 // ---------------------------------------------------------------------------
 // Canonical-field helpers
@@ -147,7 +158,11 @@ export async function applyDerivation(
     const curOdo = num(current.odometer);
     const jumpKm = prevOdo !== null && curOdo !== null ? curOdo - prevOdo : 0;
     const openNow = await getOpenDrive(env, vin);
-    if (!openNow && jumpKm >= MIN_DRIVE_KM_SYNTH && ts > previous.updated_at) {
+    if (
+      !openNow &&
+      jumpKm >= MIN_DRIVE_KM_SYNTH && jumpKm <= MAX_DRIVE_KM_SYNTH &&
+      ts > previous.updated_at && ts - previous.updated_at <= MAX_GAP_S_SYNTH
+    ) {
       await synthesizeDrive(env, vin, previous, current, ts, jumpKm).catch(() => {});
     }
   }
@@ -333,7 +348,11 @@ async function synthesizeDrive(
   const endLon = num(current.lon);
   const startOdo = num(previous.odometer);
   const endOdo = num(current.odometer);
-  const durationMin = Math.max(1, (ts - startTs) / 60);
+  // The poll gap is an upper bound on WHEN the drive happened, not its length.
+  // Cap the inferred duration to a plausible floor speed so a short jump after
+  // a long poll gap isn't stored as a multi-day crawl at ~0 km/h.
+  const maxSynthMin = (distanceKm / SYNTH_FLOOR_KMH) * 60;
+  const durationMin = Math.min(Math.max(1, (ts - startTs) / 60), Math.max(1, maxSynthMin));
 
   // Energy: prefer EnergyRemaining delta, else SoC delta × pack.
   let energyUsed: number | null = null;
@@ -788,7 +807,8 @@ export async function backfillSyntheticDrives(env: Env, vin: string, limit = 100
     const b = rows[i]!;
     if (a.drive_id != null || b.drive_id != null) continue; // part of a real drive
     const jump = b.odometer - a.odometer;
-    if (jump < MIN_DRIVE_KM_SYNTH) continue;
+    if (jump < MIN_DRIVE_KM_SYNTH || jump > MAX_DRIVE_KM_SYNTH) continue;
+    if (b.ts - a.ts > MAX_GAP_S_SYNTH) continue; // offline gap, not one drive
     examined++;
     // Skip if a drive (real or already-synthesized) covers this span.
     const covered = await env.DB.prepare(
@@ -845,10 +865,14 @@ export async function getDriverScores(env: Env, vin: string): Promise<unknown> {
   const rs = await env.DB.prepare(
     `SELECT COALESCE(driver, 'Unassigned') AS driver,
             COUNT(*) AS drives,
+            SUM(CASE WHEN synthetic = 1 THEN 1 ELSE 0 END) AS synthetic_drives,
             COALESCE(SUM(distance_km), 0) AS km,
-            COALESCE(SUM(duration_min), 0) AS minutes,
+            -- Synthetic (odometer-recovered) drives have a fabricated poll-gap
+            -- duration and no real speed, so exclude them from the time/speed
+            -- aggregates; their distance still counts.
+            COALESCE(SUM(CASE WHEN synthetic = 1 THEN 0 ELSE duration_min END), 0) AS minutes,
             MAX(max_speed) AS max_speed,
-            AVG(avg_speed) AS avg_speed,
+            AVG(CASE WHEN synthetic = 1 THEN NULL ELSE avg_speed END) AS avg_speed,
             MAX(max_decel_ms2) AS max_decel_ms2,
             COALESCE(SUM(harsh_brake_count), 0) AS harsh_brakes,
             COALESCE(SUM(harsh_accel_count), 0) AS harsh_accels,
@@ -880,6 +904,7 @@ export async function getDriverScores(env: Env, vin: string): Promise<unknown> {
     return {
       driver: r.driver,
       drives: r.drives,
+      synthetic_drives: r.synthetic_drives || 0, // recovered from odometer gaps (no route/speed)
       distance_km: round(km, 1),
       duration_min: round(r.minutes || 0, 0),
       avg_speed_kmh: r.avg_speed != null ? round(r.avg_speed, 0) : null,

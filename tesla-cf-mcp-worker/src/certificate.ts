@@ -59,9 +59,12 @@ export async function signDriveCertificate(
   issuedTs: number,
 ): Promise<DriveCertificate> {
   const canonical: Record<string, unknown> = {
-    v: 1,
+    v: 2,
     vin_suffix: String(drive.vin ?? "").slice(-6),
     drive_id: Number(drive.id),
+    // Provenance: 1 = reconstructed from an odometer jump (no GPS route,
+    // duration inferred) — signed so it can't be presented as a real drive.
+    synthetic: drive.synthetic ? 1 : 0,
     start_ts: drive.start_ts ?? null,
     end_ts: drive.end_ts ?? null,
     distance_km: drive.distance_km ?? null,
