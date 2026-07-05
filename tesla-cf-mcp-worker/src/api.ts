@@ -8,8 +8,23 @@
  */
 
 import { getOwnerToken } from "./auth";
-import { getBudgetStatus, recordSpend } from "./budget";
+import { forceBudgetCeiling, getBudgetStatus, recordSpend } from "./budget";
 import { Env, TeslaError, VehicleSummary, fleetBase } from "./types";
+
+/**
+ * Defense-in-depth for the $0 guarantee: if Tesla itself says the account
+ * exceeded its credit (our ledger under-counted somehow), pin the local
+ * ledger at the ceiling so every budget gate closes until the 1st. MUST be
+ * awaited before the caller returns/throws — in Workers, detached I/O still
+ * pending when the response is sent can be cancelled, which would leave the
+ * gate open while the app is actually hard-disabled. forceBudgetCeiling never
+ * rejects, so awaiting it on this already-fatal path is free.
+ */
+async function detectExceededLimit(env: Env, status: number, body: string): Promise<void> {
+  if (status === 403 && /EXCEEDED_?LIMIT|billing.*limit|usage.*limit/i.test(body)) {
+    await forceBudgetCeiling(env);
+  }
+}
 
 async function fleetGet<T>(env: Env, path: string): Promise<T> {
   const token = await getOwnerToken(env);
@@ -18,6 +33,7 @@ async function fleetGet<T>(env: Env, path: string): Promise<T> {
   });
   if (!resp.ok) {
     const body = await resp.text();
+    await detectExceededLimit(env, resp.status, body);
     if (resp.status === 408) {
       throw new TeslaError(
         "Vehicle is unavailable (asleep or offline). Call wake_vehicle explicitly if you need live data — this server never wakes a vehicle automatically.",
@@ -38,7 +54,9 @@ async function fleetPost<T>(env: Env, path: string, body?: unknown): Promise<T> 
     body: body === undefined ? undefined : JSON.stringify(body),
   });
   if (!resp.ok) {
-    throw new TeslaError(`Fleet API POST ${path} failed (${resp.status})`, resp.status, await resp.text());
+    const text = await resp.text();
+    detectExceededLimit(env, resp.status, text);
+    throw new TeslaError(`Fleet API POST ${path} failed (${resp.status})`, resp.status, text);
   }
   return ((await resp.json()) as { response: T }).response;
 }

@@ -1,0 +1,18 @@
+{
+  "name": "fleet-telemetry-forwarder",
+  "version": "1.0.0",
+  "description": "Forwards fleet-telemetry MQTT output to the Tesla CF MCP Worker /ingest/telemetry endpoint",
+  "type": "module",
+  "private": true,
+  "main": "index.js",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "node index.js",
+    "dry-run": "node index.js --dry-run"
+  },
+  "dependencies": {
+    "mqtt": "^5.10.1"
+  }
+}

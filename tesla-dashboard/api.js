@@ -11,10 +11,16 @@
 
 const DEFAULT_ORIGIN = "https://tesla-cf-mcp-worker.adamcfield.workers.dev";
 
-/** Allows ?origin=https://your-worker.example.com for pointing at a different deployment. */
+/**
+ * Worker origin for all requests. A different deployment is selected by
+ * `?origin=` ONCE, at boot, through consumeUrlCredentials() (app.js) — which
+ * persists it to tm_origin AND drops any stored token so it can't be shipped
+ * to an attacker-supplied origin. This function deliberately does NOT read the
+ * live query param: honoring a bare ?origin= here would re-open that
+ * token-exfiltration hole on every fetch, bypassing the boot-time guard.
+ */
 export function workerOrigin() {
-  const override = new URLSearchParams(location.search).get("origin");
-  return (override || localStorage.getItem("tm_origin") || DEFAULT_ORIGIN).replace(/\/+$/, "");
+  return (localStorage.getItem("tm_origin") || DEFAULT_ORIGIN).replace(/\/+$/, "");
 }
 
 const TOKEN_KEY = "tm_token";
@@ -51,15 +57,24 @@ class ApiError extends Error {
 }
 
 async function getJson(path, params = {}) {
+  const resp = await fetch(exportUrl(path, params));
+  if (resp.status === 401) throw new ApiError("Unauthorized — check your access token", 401);
+  if (!resp.ok) throw new ApiError(`Request failed (${resp.status})`, resp.status);
+  return resp.json();
+}
+
+/**
+ * Token-included worker URL, for plain <a> download links (CSV/GPX exports)
+ * as well as getJson above. The token rides as ?token= — same documented
+ * tradeoff as the OBS/Grafana query-param auth the worker already allows.
+ */
+export function exportUrl(path, params = {}) {
   const url = new URL(workerOrigin() + path);
   for (const [k, v] of Object.entries(params)) {
     if (v !== undefined && v !== null && v !== "") url.searchParams.set(k, v);
   }
   url.searchParams.set("token", auth.token);
-  const resp = await fetch(url.toString());
-  if (resp.status === 401) throw new ApiError("Unauthorized — check your access token", 401);
-  if (!resp.ok) throw new ApiError(`Request failed (${resp.status})`, resp.status);
-  return resp.json();
+  return url.toString();
 }
 
 /** Hard allowlist — this dashboard is read-only and must never call a command tool. */
@@ -137,6 +152,10 @@ export const data = {
   locations: () => getJson("/data/locations"),
   locationStats: (id) => getJson("/data/location-stats", { id }),
   driverScores: (vin) => getJson("/data/driver-scores", { vin }),
+  efficiencyByTemp: (vin) => getJson("/data/efficiency-by-temp", { vin }),
+  tires: (vin, days) => getJson("/data/tires", { vin, days }),
+  monthly: (vin, months) => getJson("/data/monthly", { vin, months }),
+  suggestedLocations: (vin) => getJson("/data/suggested-locations", { vin }),
   /** Benign metadata write (token-gated POST) — assign/clear a drive's driver. */
   assignDriver: (id, driver) =>
     fetch(workerOrigin() + "/data/assign-driver?" + new URLSearchParams({ id, driver: driver || "", token: auth.token }), { method: "POST" })

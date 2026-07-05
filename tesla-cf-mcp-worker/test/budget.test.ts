@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { recordSpend, getBudgetStatus } from "../src/budget";
+import { recordSpend, getBudgetStatus, forceBudgetCeiling } from "../src/budget";
 import { pollOnce, inQuietHours } from "../src/poll";
 import { resetSchemaCacheForTests } from "../src/store";
 import { FakeD1 } from "./helpers/d1";
@@ -57,6 +57,61 @@ describe("spend accounting", () => {
     const s = await getBudgetStatus(env);
     expect(s.poll_budget_usd).toBe(2);
     expect(s.poll_allowed).toBe(false);
+  });
+
+  it("folds a legacy KV counter into the D1 ledger once (mid-month deploy)", async () => {
+    const kv = new FakeKV();
+    const month = `${new Date().getUTCFullYear()}-${String(new Date().getUTCMonth() + 1).padStart(2, "0")}`;
+    await kv.put(`api_spend:${month}`, "5000000"); // $5 counted by the old deployment
+    const env = makeEnv(kv);
+    const s = await getBudgetStatus(env);
+    expect(s.spent_usd).toBeCloseTo(5, 2);
+    // New spend accumulates ON TOP of the migrated figure, not from zero.
+    await recordSpend(env, "vehicle_data", 500); // +$1
+    const s2 = await getBudgetStatus(env);
+    expect(s2.spent_usd).toBeCloseTo(6, 2);
+  });
+
+  it("forceBudgetCeiling (Tesla 403 EXCEEDED_LIMIT) closes every gate immediately", async () => {
+    const env = makeEnv();
+    await forceBudgetCeiling(env);
+    const s = await getBudgetStatus(env);
+    expect(s.poll_allowed).toBe(false);
+    expect(s.commands_allowed).toBe(false);
+  });
+
+  it("records telemetry signal spend at the ingest boundary (not per-field double-count on poll)", async () => {
+    const env = makeEnv();
+    await recordSpend(env, "signal", 100_000); // 100k × 7µ$ = $0.70
+    const s = await getBudgetStatus(env);
+    expect(s.spent_micro).toBe(700_000);
+    expect(s.spent_usd).toBeCloseTo(0.7, 2);
+  });
+});
+
+describe("budget fails CLOSED on ledger read failure", () => {
+  it("a thrown D1 read pins gates shut, never billing blind", async () => {
+    // DB whose SELECT path throws — simulates a D1 outage.
+    const brokenDb = {
+      prepare() {
+        return {
+          bind() { return this; },
+          run: async () => ({ meta: {} }),
+          first: async () => { throw new Error("D1 down"); },
+          all: async () => { throw new Error("D1 down"); },
+        };
+      },
+    };
+    const env = {
+      TESLA_KV: new FakeKV() as unknown as KVNamespace,
+      DB: brokenDb as unknown as D1Database,
+      TESLA_REGION: "eu", PUBLIC_ORIGIN: "https://t.example.com",
+      TESLA_CLIENT_ID: "c", TESLA_CLIENT_SECRET: "s", TESLA_PRIVATE_KEY: "k",
+      MCP_AUTH_TOKEN: "tok",
+    } as Env;
+    const s = await getBudgetStatus(env);
+    expect(s.poll_allowed).toBe(false);
+    expect(s.commands_allowed).toBe(false);
   });
 });
 

@@ -40,3 +40,5 @@ BUDGET_POLL_USD = "9"
 # Pause billed idle probes overnight (UTC hours). 21-3 = 00:00–06:00 Israel time.
 # Active driving/charging is still recorded; only the every-15-min idle probe pauses.
 QUIET_HOURS_UTC = "21-3"
+# IANA zone for night-scoring, monthly buckets, DST-aware schedules.
+DEFAULT_TZ = "Asia/Jerusalem"

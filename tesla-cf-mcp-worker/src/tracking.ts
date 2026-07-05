@@ -26,6 +26,7 @@ import {
   LatestState,
   num,
   PositionSample,
+  tzOffsetMinutes,
 } from "./store";
 import { Env } from "./types";
 
@@ -252,7 +253,7 @@ async function closeDrive(env: Env, drive: DriveRow, s: LatestState, ts: number)
        outside_temp_avg = ?18, sample_count = ?19,
        max_accel_ms2 = ?20, max_decel_ms2 = ?21, harsh_accel_count = ?22, harsh_brake_count = ?23,
        harsh_turn_count = ?24, over_limit_frac = ?25, night_frac = ?26, behavior_score = ?27,
-       start_address = ?28, end_address = ?29
+       start_address = ?28, end_address = ?29, max_jerk_ms3 = ?30
      WHERE id = ?1`,
   )
     .bind(
@@ -261,15 +262,25 @@ async function closeDrive(env: Env, drive: DriveRow, s: LatestState, ts: number)
       num(agg?.avg_power), num(agg?.max_power), num(agg?.outside_temp_avg), agg?.n ?? 0,
       behavior.max_accel_ms2, behavior.max_decel_ms2, behavior.harsh_accel_count, behavior.harsh_brake_count,
       behavior.harsh_turn_count, behavior.over_limit_frac, behavior.night_frac, behavior.behavior_score,
-      startAddr, endAddr,
+      startAddr, endAddr, behavior.max_jerk_ms3,
     )
     .run();
+
+  // Auto-suggest a driver from historically-tagged drives with the same start
+  // context (geofence/grid + hour-of-week bucket). Best-effort; never blocks.
+  await suggestDriverForDrive(env, drive.id, drive.vin).catch(() => {});
 }
 
-/** Per-vehicle timezone offset (minutes) for night-driving calc, if a rule set one. */
+/**
+ * Per-vehicle timezone offset (minutes) for night-driving calc. Priority:
+ * an explicit KV override (`tz_offset:VIN`), else the DST-aware offset of the
+ * DEFAULT_TZ IANA zone (default Asia/Jerusalem — this fixed night_frac being
+ * silently computed against UTC, mislabeling Israeli evening driving).
+ */
 async function getVehicleTz(env: Env, vin: string): Promise<number | null> {
-  const v = await env.TESLA_KV.get(`tz_offset:${vin}`);
-  return v != null ? Number(v) : null;
+  const v = await env.TESLA_KV.get(`tz_offset:${vin}`).catch(() => null);
+  if (v != null && Number.isFinite(Number(v))) return Number(v);
+  return tzOffsetMinutes(env.DEFAULT_TZ || "Asia/Jerusalem");
 }
 
 /**
@@ -477,6 +488,23 @@ async function closeChargeSession(
   if (energyAdded !== null && energyAdded > 0 && session.start_soc !== null && endSoc !== null) {
     const dSoc = endSoc - session.start_soc;
     if (dSoc >= 10) await setPackKwh(env, s.vin, (energyAdded / dSoc) * 100);
+  }
+
+  // Self-calibrate rated Wh/km: at end-of-charge we know rated range at a known
+  // SoC, so full range = range/soc·100 and rated_wh_km = pack·1000/full_range.
+  // Replaces the blind 150 Wh/km fallback used by drive-energy estimation.
+  const endRange = num(s.rated_range);
+  if (endSoc !== null && endSoc >= 40 && endRange !== null && endRange > 0) {
+    const pack = await getPackKwh(env, s.vin);
+    if (pack !== null) {
+      const fullRangeKm = (endRange / endSoc) * 100;
+      const ratedWhKm = (pack * 1000) / fullRangeKm;
+      if (Number.isFinite(ratedWhKm) && ratedWhKm > 80 && ratedWhKm < 350) {
+        const prev = Number((await env.TESLA_KV.get(`rated_wh_km:${s.vin}`).catch(() => null)) ?? "");
+        const next = Number.isFinite(prev) && prev > 0 ? prev * 0.7 + ratedWhKm * 0.3 : ratedWhKm;
+        await env.TESLA_KV.put(`rated_wh_km:${s.vin}`, String(Math.round(next * 10) / 10)).catch(() => {});
+      }
+    }
   }
 }
 
@@ -775,29 +803,43 @@ export async function getStateTimeline(env: Env, vin: string, hours = 168): Prom
  * Battery degradation from completed charge sessions: at the end of each charge
  * we know rated range at a known SoC, so projected range at 100% =
  * end_rated_range / end_soc * 100. Capacity is scaled by the self-calibrated
- * usable pack kWh. Reported as a time series plus first/latest deltas.
+ * usable pack kWh.
+ *
+ * Quality: DC fast-charge endings (hot pack) and extreme-ambient sessions
+ * inject several % of scatter, so the TREND is fitted only over "clean"
+ * points — AC (or unknown-type legacy) sessions ending ≥60% SoC at mild
+ * ambient — via least-squares, reported as %/year with an r² confidence
+ * hint. The full series is still returned for plotting (flagged per point),
+ * and naive first-vs-last is kept for continuity.
  */
 export async function getBatteryDegradation(env: Env, vin: string): Promise<unknown> {
   await ensureSchema(env);
   const rs = await env.DB.prepare(
-    `SELECT end_ts AS ts, end_soc, end_rated_range, end_ideal_range
+    `SELECT end_ts AS ts, end_soc, end_rated_range, charge_type, outside_temp_avg
      FROM charge_sessions
      WHERE vin = ?1 AND status = 'complete' AND end_soc IS NOT NULL AND end_soc > 50
        AND end_rated_range IS NOT NULL AND end_rated_range > 0
      ORDER BY end_ts ASC`,
   )
     .bind(vin)
-    .all<{ ts: number; end_soc: number; end_rated_range: number; end_ideal_range: number | null }>();
+    .all<{ ts: number; end_soc: number; end_rated_range: number; charge_type: string | null; outside_temp_avg: number | null }>();
 
   const pack = await getPackKwh(env, vin);
   // Per point, projected range at 100% is the real degradation signal (it moves
   // as the pack ages). Capacity is reported once at the top level — it would be
   // flat and misleading per-point since pack kWh is a single current estimate.
-  const series = (rs.results ?? []).map((r) => ({
-    ts: r.ts,
-    projected_range_100_km: round((r.end_rated_range / r.end_soc) * 100, 1),
-    at_soc: r.end_soc,
-  }));
+  const series = (rs.results ?? []).map((r) => {
+    const clean =
+      (r.charge_type === "AC" || r.charge_type == null) &&
+      r.end_soc >= 60 &&
+      (r.outside_temp_avg == null || (r.outside_temp_avg >= 5 && r.outside_temp_avg <= 38));
+    return {
+      ts: r.ts,
+      projected_range_100_km: round((r.end_rated_range / r.end_soc) * 100, 1),
+      at_soc: r.end_soc,
+      clean,
+    };
+  });
 
   if (series.length < 2) {
     return { series, note: "Need at least two charges above 50% to estimate degradation.", pack_kwh: pack };
@@ -805,11 +847,42 @@ export async function getBatteryDegradation(env: Env, vin: string): Promise<unkn
   const first = series[0]!;
   const last = series[series.length - 1]!;
   const lossPct = round((1 - last.projected_range_100_km / first.projected_range_100_km) * 100, 2);
+
+  // Least-squares trend over clean points (falls back to all if too few).
+  const cleanPts = series.filter((p) => p.clean);
+  const usedCleanOnly = cleanPts.length >= 3;
+  const fitPts = (usedCleanOnly ? cleanPts : series).map((p) => ({ x: p.ts, y: p.projected_range_100_km }));
+  let trend: Record<string, unknown> | null = null;
+  if (fitPts.length >= 3) {
+    const n = fitPts.length;
+    const mx = fitPts.reduce((s, p) => s + p.x, 0) / n;
+    const my = fitPts.reduce((s, p) => s + p.y, 0) / n;
+    let sxx = 0, sxy = 0, syy = 0;
+    for (const p of fitPts) {
+      sxx += (p.x - mx) ** 2;
+      sxy += (p.x - mx) * (p.y - my);
+      syy += (p.y - my) ** 2;
+    }
+    if (sxx > 0 && syy > 0) {
+      const slope = sxy / sxx; // km per second
+      const r2 = (sxy * sxy) / (sxx * syy);
+      const kmPerYear = slope * 365.25 * 86400;
+      trend = {
+        pct_per_year: round((-kmPerYear / my) * 100, 2), // positive = losing range
+        r2: round(r2, 3),
+        points_used: n,
+        clean_only: usedCleanOnly,
+        note: "Fitted on AC/mild-ambient session endings; low r² means the signal is still mostly noise.",
+      };
+    }
+  }
+
   return {
     series,
     first_projected_range_100_km: first.projected_range_100_km,
     latest_projected_range_100_km: last.projected_range_100_km,
     degradation_pct: lossPct,
+    trend,
     pack_kwh: pack != null ? round(pack, 2) : null,
     samples: series.length,
   };
@@ -823,6 +896,11 @@ export async function getBatteryDegradation(env: Env, vin: string): Promise<unkn
  * Idle/vampire drain: SoC lost between consecutive samples where the car was
  * neither driving nor charging and enough time passed (covers both awake-idle
  * and sleep, since telemetry pauses while asleep and resumes on wake).
+ *
+ * Each span is additionally classified ASLEEP vs AWAKE-IDLE by overlap with
+ * the vehicle_states timeline — the actionable split: sleeping loses well
+ * under 1%/day, while Sentry/awake-idle can burn an order of magnitude more.
+ * A blended number hides exactly that.
  */
 export async function getVampireDrain(env: Env, vin: string, days = 30): Promise<unknown> {
   await ensureSchema(env);
@@ -834,12 +912,28 @@ export async function getVampireDrain(env: Env, vin: string, days = 30): Promise
     .bind(vin, since)
     .all<{ ts: number; soc: number; activity: string | null; charging_state: string | null }>();
 
+  // Asleep spans in the window, for span classification by overlap.
+  const sleepRs = await env.DB.prepare(
+    `SELECT start_ts, COALESCE(end_ts, strftime('%s','now')) AS end_ts FROM vehicle_states
+     WHERE vin = ?1 AND state = 'asleep' AND COALESCE(end_ts, strftime('%s','now')) >= ?2`,
+  )
+    .bind(vin, since)
+    .all<{ start_ts: number; end_ts: number }>();
+  const sleeps = sleepRs.results ?? [];
+  const asleepOverlap = (a: number, b: number): number => {
+    let s = 0;
+    for (const sp of sleeps) s += Math.max(0, Math.min(b, sp.end_ts) - Math.max(a, sp.start_ts));
+    return s;
+  };
+
   const rows = rs.results ?? [];
   const MIN_GAP_S = 30 * 60; // 30 min
   const MAX_GAP_S = 3 * 86400; // ignore multi-day telemetry outages
-  const spans: { start_ts: number; end_ts: number; hours: number; soc_lost: number; pct_per_day: number }[] = [];
+  interface Span { start_ts: number; end_ts: number; hours: number; soc_lost: number; pct_per_day: number; kind: "sleep" | "awake" }
+  const spans: Span[] = [];
   let totalLoss = 0;
   let totalHours = 0;
+  const bucket = { sleep: { hours: 0, soc_lost: 0 }, awake: { hours: 0, soc_lost: 0 } };
 
   for (let i = 1; i < rows.length; i++) {
     const a = rows[i - 1]!;
@@ -853,17 +947,24 @@ export async function getVampireDrain(env: Env, vin: string, days = 30): Promise
     const loss = a.soc - b.soc;
     if (loss <= 0) continue; // charging/regen or noise
     const hours = dt / 3600;
+    const kind: Span["kind"] = asleepOverlap(a.ts, b.ts) / dt >= 0.5 ? "sleep" : "awake";
     totalLoss += loss;
     totalHours += hours;
-    spans.push({ start_ts: a.ts, end_ts: b.ts, hours: round(hours, 2), soc_lost: round(loss, 2), pct_per_day: round((loss / hours) * 24, 3) });
+    bucket[kind].hours += hours;
+    bucket[kind].soc_lost += loss;
+    spans.push({ start_ts: a.ts, end_ts: b.ts, hours: round(hours, 2), soc_lost: round(loss, 2), pct_per_day: round((loss / hours) * 24, 3), kind });
   }
 
+  const rate = (x: { hours: number; soc_lost: number }) =>
+    x.hours > 0 ? round((x.soc_lost / x.hours) * 24, 3) : null;
   return {
     days,
     idle_spans: spans.length,
     total_soc_lost_pct: round(totalLoss, 2),
     total_idle_hours: round(totalHours, 1),
     avg_pct_per_day: totalHours > 0 ? round((totalLoss / totalHours) * 24, 3) : null,
+    sleep: { hours: round(bucket.sleep.hours, 1), soc_lost: round(bucket.sleep.soc_lost, 2), pct_per_day: rate(bucket.sleep) },
+    awake: { hours: round(bucket.awake.hours, 1), soc_lost: round(bucket.awake.soc_lost, 2), pct_per_day: rate(bucket.awake) },
     spans: spans.slice(-50),
   };
 }
@@ -905,6 +1006,342 @@ export async function getTrackingSummary(env: Env, vin: string): Promise<unknown
     pack_kwh: await getPackKwh(env, vin),
     api_budget: await getBudgetStatus(env).catch(() => null),
   };
+}
+
+// ---------------------------------------------------------------------------
+// Derived: efficiency vs ambient temperature
+// ---------------------------------------------------------------------------
+
+/**
+ * Wh/km bucketed by 5 °C bins of each drive's average outside temperature —
+ * the classic cold-weather range-penalty curve, distance-weighted so short
+ * hops don't dominate. Uses only completed drives ≥2 km with a real
+ * efficiency figure. $0: aggregates data already logged.
+ */
+export async function getEfficiencyByTemp(env: Env, vin: string): Promise<unknown> {
+  await ensureSchema(env);
+  const rs = await env.DB.prepare(
+    `SELECT CAST(FLOOR(outside_temp_avg / 5) * 5 AS INTEGER) AS t_min,
+            COUNT(*) AS drives,
+            SUM(distance_km) AS distance_km,
+            SUM(efficiency_wh_km * distance_km) / SUM(distance_km) AS avg_wh_km
+     FROM drives
+     WHERE vin = ?1 AND status = 'complete' AND distance_km >= 2
+       AND efficiency_wh_km IS NOT NULL AND outside_temp_avg IS NOT NULL
+     GROUP BY t_min ORDER BY t_min ASC`,
+  )
+    .bind(vin)
+    .all<{ t_min: number; drives: number; distance_km: number; avg_wh_km: number }>();
+  return {
+    vin,
+    bins: (rs.results ?? []).map((r) => ({
+      t_min: r.t_min,
+      t_max: r.t_min + 5,
+      avg_wh_km: round(r.avg_wh_km, 0),
+      drives: r.drives,
+      distance_km: round(r.distance_km, 1),
+    })),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Derived: tire pressures (TPMS)
+// ---------------------------------------------------------------------------
+
+const WHEELS = ["fl", "fr", "rl", "rr"] as const;
+
+/**
+ * Per-wheel TPMS history + latest reading + a linear-regression trend
+ * (bar/week) that catches a slow leak weeks before the car complains.
+ * TPMS lands in the EAV store (tpms_fl…rr, bar); series are downsampled
+ * to ≤200 points per wheel for payload sanity.
+ */
+export async function getTirePressures(env: Env, vin: string, days = 30): Promise<unknown> {
+  await ensureSchema(env);
+  const since = Math.floor(Date.now() / 1000) - Math.round(days * 86400);
+  const series: Record<string, [number, number][]> = {};
+  const latest: Record<string, number> = {};
+  let latestTs = 0;
+  const trend: Record<string, number> = {};
+
+  for (const w of WHEELS) {
+    const rs = await env.DB.prepare(
+      `SELECT ts, value_num FROM telemetry_events
+       WHERE vin = ?1 AND field = ?2 AND ts >= ?3 AND value_num IS NOT NULL
+       ORDER BY ts ASC`,
+    )
+      .bind(vin, `tpms_${w}`, since)
+      .all<{ ts: number; value_num: number }>();
+    const pts = (rs.results ?? []).map((r) => [r.ts, round(r.value_num, 2)] as [number, number]);
+    // Downsample evenly to ≤200 points.
+    const step = Math.max(1, Math.ceil(pts.length / 200));
+    series[w] = pts.filter((_, i) => i % step === 0 || i === pts.length - 1);
+    const lastPt = pts[pts.length - 1];
+    if (lastPt) {
+      latest[w] = lastPt[1];
+      latestTs = Math.max(latestTs, lastPt[0]);
+    }
+    // Least-squares slope in bar/week (needs ≥5 points across ≥2 days).
+    if (pts.length >= 5 && pts[pts.length - 1]![0] - pts[0]![0] >= 2 * 86400) {
+      const n = pts.length;
+      const mx = pts.reduce((s, p) => s + p[0], 0) / n;
+      const my = pts.reduce((s, p) => s + p[1], 0) / n;
+      let sxx = 0, sxy = 0;
+      for (const p of pts) {
+        sxx += (p[0] - mx) ** 2;
+        sxy += (p[0] - mx) * (p[1] - my);
+      }
+      if (sxx > 0) trend[w] = round((sxy / sxx) * 7 * 86400, 3);
+    }
+  }
+
+  const haveLatest = WHEELS.every((w) => latest[w] !== undefined);
+  return {
+    vin,
+    unit: "bar",
+    latest: haveLatest ? { fl: latest.fl, fr: latest.fr, rl: latest.rl, rr: latest.rr, ts: latestTs } : null,
+    series,
+    trend_bar_per_week: Object.keys(trend).length === 4
+      ? { fl: trend.fl, fr: trend.fr, rl: trend.rl, rr: trend.rr }
+      : null,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Derived: monthly report
+// ---------------------------------------------------------------------------
+
+/**
+ * Server-side monthly roll-up: driving (count/distance/energy/efficiency) +
+ * charging (sessions/kWh/AC-DC split/cost) + cost per 100 km. Timestamps are
+ * bucketed in the vehicle's local zone (DEFAULT_TZ) so a 23:30 drive doesn't
+ * land in the wrong month. Also exposed as the get_monthly_report MCP tool so
+ * Claude can answer "summarize my June" in one call.
+ */
+export async function getMonthlyReport(env: Env, vin: string, months = 12): Promise<unknown> {
+  await ensureSchema(env);
+  const tzMin = (await getVehicleTz(env, vin)) ?? 0;
+  const shift = tzMin * 60; // seconds to add before bucketing
+  const monthExpr = (col: string) => `strftime('%Y-%m', ${col} + ${shift}, 'unixepoch')`;
+
+  const drives = await env.DB.prepare(
+    `SELECT ${monthExpr("start_ts")} AS month,
+            COUNT(*) AS drives, SUM(distance_km) AS distance_km,
+            SUM(energy_used_kwh) AS energy_kwh,
+            SUM(efficiency_wh_km * distance_km) / NULLIF(SUM(CASE WHEN efficiency_wh_km IS NOT NULL THEN distance_km END), 0) AS avg_wh_km
+     FROM drives WHERE vin = ?1 AND status = 'complete'
+     GROUP BY month ORDER BY month DESC LIMIT ?2`,
+  )
+    .bind(vin, months)
+    .all<{ month: string; drives: number; distance_km: number | null; energy_kwh: number | null; avg_wh_km: number | null }>();
+
+  const charges = await env.DB.prepare(
+    `SELECT ${monthExpr("start_ts")} AS month,
+            COUNT(*) AS sessions, SUM(energy_added_kwh) AS kwh,
+            SUM(CASE WHEN charge_type = 'AC' THEN energy_added_kwh ELSE 0 END) AS ac_kwh,
+            SUM(CASE WHEN charge_type = 'DC' THEN energy_added_kwh ELSE 0 END) AS dc_kwh,
+            SUM(cost) AS cost, MAX(currency) AS currency
+     FROM charge_sessions WHERE vin = ?1 AND status = 'complete'
+     GROUP BY month ORDER BY month DESC LIMIT ?2`,
+  )
+    .bind(vin, months)
+    .all<{ month: string; sessions: number; kwh: number | null; ac_kwh: number | null; dc_kwh: number | null; cost: number | null; currency: string | null }>();
+
+  const byMonth = new Map<string, Record<string, unknown>>();
+  for (const d of drives.results ?? []) {
+    byMonth.set(d.month, {
+      month: d.month,
+      drives: d.drives,
+      distance_km: round(d.distance_km ?? 0, 1),
+      drive_energy_kwh: round(d.energy_kwh ?? 0, 1),
+      avg_wh_km: d.avg_wh_km != null ? round(d.avg_wh_km, 0) : null,
+      charge_sessions: 0, charge_kwh: 0, ac_kwh: 0, dc_kwh: 0, charge_cost: 0, currency: null,
+      cost_per_100km: null,
+    });
+  }
+  for (const c of charges.results ?? []) {
+    const row = byMonth.get(c.month) ?? {
+      month: c.month, drives: 0, distance_km: 0, drive_energy_kwh: 0, avg_wh_km: null,
+      charge_sessions: 0, charge_kwh: 0, ac_kwh: 0, dc_kwh: 0, charge_cost: 0, currency: null, cost_per_100km: null,
+    };
+    row.charge_sessions = c.sessions;
+    row.charge_kwh = round(c.kwh ?? 0, 1);
+    row.ac_kwh = round(c.ac_kwh ?? 0, 1);
+    row.dc_kwh = round(c.dc_kwh ?? 0, 1);
+    row.charge_cost = round(c.cost ?? 0, 2);
+    row.currency = c.currency;
+    const dist = Number(row.distance_km);
+    row.cost_per_100km = dist > 10 && c.cost != null ? round((c.cost / dist) * 100, 2) : null;
+    byMonth.set(c.month, row);
+  }
+
+  const out = [...byMonth.values()].sort((a, b) => String(b.month).localeCompare(String(a.month))).slice(0, months);
+  return { vin, months: out };
+}
+
+// ---------------------------------------------------------------------------
+// Derived: suggested locations (repeat-visited unnamed spots)
+// ---------------------------------------------------------------------------
+
+/**
+ * Clusters drive endpoints on a ~110 m grid, keeps clusters with ≥3 visits
+ * that are NOT inside an existing named location, and labels them from the
+ * geocode cache. Surfaces the "you park here all the time — name it?" list
+ * that makes per-location stats useful without manual setup.
+ */
+export async function getSuggestedLocations(env: Env, vin: string): Promise<unknown> {
+  await ensureSchema(env);
+  const rs = await env.DB.prepare(
+    `SELECT ROUND(lat, 3) AS lat_r, ROUND(lon, 3) AS lon_r, COUNT(*) AS visits
+     FROM (
+       SELECT start_lat AS lat, start_lon AS lon FROM drives WHERE vin = ?1 AND status = 'complete' AND start_lat IS NOT NULL
+       UNION ALL
+       SELECT end_lat, end_lon FROM drives WHERE vin = ?1 AND status = 'complete' AND end_lat IS NOT NULL
+     )
+     GROUP BY lat_r, lon_r HAVING visits >= 3 ORDER BY visits DESC LIMIT 25`,
+  )
+    .bind(vin)
+    .all<{ lat_r: number; lon_r: number; visits: number }>();
+
+  const locations = await env.DB.prepare(`SELECT lat, lon, radius_m FROM locations`).all<{
+    lat: number; lon: number; radius_m: number;
+  }>();
+
+  const suggestions: { lat: number; lon: number; visits: number; label: string | null }[] = [];
+  for (const c of rs.results ?? []) {
+    const insideNamed = (locations.results ?? []).some(
+      (l) => haversineMeters(c.lat_r, c.lon_r, l.lat, l.lon) <= l.radius_m,
+    );
+    if (insideNamed) continue;
+    const cached = await env.DB.prepare(
+      `SELECT label FROM geocode_cache WHERE lat_r = ?1 AND lon_r = ?2 AND label != ''`,
+    )
+      .bind(c.lat_r, c.lon_r)
+      .first<{ label: string }>();
+    suggestions.push({ lat: c.lat_r, lon: c.lon_r, visits: c.visits, label: cached?.label ?? null });
+    if (suggestions.length >= 10) break;
+  }
+  return { vin, suggestions };
+}
+
+// ---------------------------------------------------------------------------
+// Driver auto-suggestion
+// ---------------------------------------------------------------------------
+
+/**
+ * Suggests a driver for a just-closed drive from tagged history: drives that
+ * started in the same geofence (or ~1 km grid cell) in the same hour-of-week
+ * bucket (weekday/weekend × 3-hour block). The most frequent tagged driver
+ * with ≥2 supporting drives wins. Stored in suggested_driver — the UI shows
+ * it as a one-tap confirmation, never silently promotes it to `driver`.
+ */
+export async function suggestDriverForDrive(env: Env, driveId: number, vin: string): Promise<void> {
+  const d = await env.DB.prepare(
+    `SELECT start_ts, start_lat, start_lon, start_location_id, driver FROM drives WHERE id = ?1`,
+  )
+    .bind(driveId)
+    .first<{ start_ts: number; start_lat: number | null; start_lon: number | null; start_location_id: number | null; driver: string | null }>();
+  if (!d || d.driver) return; // already tagged — nothing to suggest
+
+  const tzMin = (await getVehicleTz(env, vin)) ?? 0;
+  const bucketOf = (ts: number): string => {
+    const local = new Date((ts + tzMin * 60) * 1000);
+    const dow = local.getUTCDay();
+    const weekend = dow === 5 || dow === 6; // Israeli weekend (Fri/Sat)
+    return `${weekend ? "we" : "wd"}:${Math.floor(local.getUTCHours() / 3)}`;
+  };
+  const targetBucket = bucketOf(d.start_ts);
+
+  const candidates = await env.DB.prepare(
+    `SELECT driver, start_ts, start_lat, start_lon, start_location_id FROM drives
+     WHERE vin = ?1 AND status = 'complete' AND driver IS NOT NULL AND id != ?2
+     ORDER BY start_ts DESC LIMIT 500`,
+  )
+    .bind(vin, driveId)
+    .all<{ driver: string; start_ts: number; start_lat: number | null; start_lon: number | null; start_location_id: number | null }>();
+
+  const votes = new Map<string, number>();
+  for (const c of candidates.results ?? []) {
+    const samePlace =
+      (d.start_location_id != null && c.start_location_id === d.start_location_id) ||
+      (d.start_lat != null && d.start_lon != null && c.start_lat != null && c.start_lon != null &&
+        haversineMeters(d.start_lat, d.start_lon, c.start_lat, c.start_lon) <= 1000);
+    if (!samePlace) continue;
+    if (bucketOf(c.start_ts) !== targetBucket) continue;
+    votes.set(c.driver, (votes.get(c.driver) ?? 0) + 1);
+  }
+  let best: { driver: string; n: number } | null = null;
+  for (const [driver, n] of votes) if (!best || n > best.n) best = { driver, n };
+  if (best && best.n >= 2) {
+    await env.DB.prepare(`UPDATE drives SET suggested_driver = ?2 WHERE id = ?1`).bind(driveId, best.driver).run();
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Stale-session auto-close (cron)
+// ---------------------------------------------------------------------------
+
+/**
+ * Closes drives/charges left open by a mid-session signal loss (tunnel,
+ * poller outage, car offline). Without this, the next unrelated sample days
+ * later becomes the "end", producing a bogus multi-day drive that poisons
+ * every aggregate. Runs from the cron tick; closes any open session whose
+ * newest attached sample is older than the cutoff, ending it AT that sample.
+ */
+export async function closeStaleSessions(env: Env, maxAgeS = 6 * 3600): Promise<Record<string, number>> {
+  await ensureSchema(env);
+  const cutoff = Math.floor(Date.now() / 1000) - maxAgeS;
+  let closedDrives = 0;
+  let closedCharges = 0;
+
+  const staleDrives = await env.DB.prepare(
+    `SELECT d.id, d.vin, d.start_ts, d.start_odometer,
+            (SELECT MAX(ts) FROM positions p WHERE p.drive_id = d.id) AS last_ts
+     FROM drives d WHERE d.status = 'active'`,
+  ).all<{ id: number; vin: string; start_ts: number; start_odometer: number | null; last_ts: number | null }>();
+  for (const d of staleDrives.results ?? []) {
+    const lastTs = d.last_ts ?? d.start_ts;
+    if (lastTs >= cutoff) continue;
+    const lastPos = await env.DB.prepare(
+      `SELECT * FROM positions WHERE drive_id = ?1 ORDER BY ts DESC LIMIT 1`,
+    ).bind(d.id).first<Record<string, unknown>>();
+    // Synthesize an end-state from the last known sample and close normally.
+    const pseudo: LatestState = {
+      vin: d.vin, updated_at: lastTs,
+      lat: lastPos?.lat, lon: lastPos?.lon, odometer: lastPos?.odometer,
+      soc: lastPos?.soc, rated_range: lastPos?.rated_range, ideal_range: lastPos?.ideal_range,
+      energy_remaining: lastPos?.energy_remaining,
+    };
+    await closeDrive(env, { id: d.id, vin: d.vin, start_ts: d.start_ts, start_odometer: d.start_odometer }, pseudo, lastTs);
+    closedDrives++;
+  }
+
+  const staleCharges = await env.DB.prepare(
+    `SELECT cs.id, cs.vin, cs.price_cents_kwh, cs.location_id, cs.max_charger_power, cs.start_soc,
+            (SELECT MAX(ts) FROM charges c WHERE c.session_id = cs.id) AS last_ts, cs.start_ts
+     FROM charge_sessions cs WHERE cs.end_ts IS NULL AND cs.status = 'active'`,
+  ).all<{ id: number; vin: string; price_cents_kwh: number | null; location_id: number | null; max_charger_power: number | null; start_soc: number | null; last_ts: number | null; start_ts: number }>();
+  for (const c of staleCharges.results ?? []) {
+    const lastTs = c.last_ts ?? c.start_ts;
+    if (lastTs >= cutoff) continue;
+    const lastCurve = await env.DB.prepare(
+      `SELECT * FROM charges WHERE session_id = ?1 ORDER BY ts DESC LIMIT 1`,
+    ).bind(c.id).first<Record<string, unknown>>();
+    const pseudo: LatestState = {
+      vin: c.vin, updated_at: lastTs,
+      soc: lastCurve?.soc, rated_range: lastCurve?.rated_range,
+      charge_energy_added: lastCurve?.charge_energy_added,
+    };
+    await closeChargeSession(
+      env,
+      { id: c.id, price_cents_kwh: c.price_cents_kwh, location_id: c.location_id, max_charger_power: c.max_charger_power, start_soc: c.start_soc },
+      pseudo,
+      lastTs,
+    );
+    closedCharges++;
+  }
+
+  return { closed_drives: closedDrives, closed_charges: closedCharges };
 }
 
 // ---------------------------------------------------------------------------

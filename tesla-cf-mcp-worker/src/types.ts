@@ -24,14 +24,21 @@ export interface Env {
   /**
    * Optional raw-history retention in days (wrangler.toml [vars] or secret).
    * Prunes telemetry_events and non-drive positions older than this on each
-   * automation tick. Unset/invalid = keep everything forever.
+   * automation tick. Default 400 days; set "0" to keep everything forever.
    */
   RETENTION_DAYS?: string;
   /**
-   * Optional soft cap (USD) for AUTOMATED polling spend per month, default 8.
-   * Clamped under the $9.50 hard ceiling that protects Tesla's $10 disable line.
+   * Optional soft cap (USD) for AUTOMATED polling spend per month, default 9.
+   * Clamped under the $9.70 hard ceiling that protects Tesla's $10 disable line.
    */
   BUDGET_POLL_USD?: string;
+  /**
+   * Optional IANA timezone for the vehicle/owner (default "Asia/Jerusalem").
+   * Drives night-fraction scoring, monthly-report bucketing, and DST-aware
+   * automation schedules — a fixed minute offset would drift on every clock
+   * change.
+   */
+  DEFAULT_TZ?: string;
   /**
    * Optional quiet window for idle probes, UTC hours "start-end" (e.g. "21-3"
    * = 00:00–06:00 Israel time). Free connectivity checks continue; billed

@@ -1,9 +1,19 @@
-import { auth, data, mcp, verifyToken, ApiError } from "./api.js";
+import { auth, data, mcp, verifyToken, exportUrl, ApiError } from "./api.js";
 import { svgLineChart, svgBarChart, svgDonut, svgSplitBar } from "./charts.js";
-import { destroyMaps, renderPointMap, renderRouteMap, renderLifetimeMap } from "./map.js";
+import { destroyMaps, renderPointMap, renderRouteMap, renderLifetimeMap, attachReplay } from "./map.js";
 
 const root = document.getElementById("app");
 let shellBound = false; // guards one-time attach of the root click handler + sync timer
+
+// PWA: cache-first app shell via sw.js. Progressive enhancement only — the
+// try/catch (plus register()'s own rejection handler) means an environment
+// without service workers, or plain localhost dev with a strict browser
+// profile, never breaks the app.
+try {
+  if ("serviceWorker" in navigator) {
+    navigator.serviceWorker.register("./sw.js").catch(() => { /* e.g. file://, private mode */ });
+  }
+} catch { /* service workers unavailable — fine */ }
 
 // ---------------------------------------------------------------------------
 // Formatting helpers
@@ -12,7 +22,7 @@ let shellBound = false; // guards one-time attach of the root click handler + sy
 const fmt0 = (n) => (n == null || Number.isNaN(n) ? "—" : Math.round(n).toLocaleString());
 const fmt1 = (n) => (n == null || Number.isNaN(n) ? "—" : (Math.round(n * 10) / 10).toLocaleString());
 const fmt2 = (n) => (n == null || Number.isNaN(n) ? "—" : (Math.round(n * 100) / 100).toFixed(2));
-const esc = (s) => String(s ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;");
+const esc = (s) => String(s ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/"/g, "&quot;");
 
 const CURRENCY_SYMBOL = { ILS: "₪", USD: "$", EUR: "€", GBP: "£", AUD: "A$", CAD: "C$" };
 function money(amount, currency, decimals = 2) {
@@ -107,15 +117,19 @@ const state = {
   vehicle: null, // { vin, display_name, state }
   vehicleData: null, // last on-demand get_vehicle_data snapshot
   driveFilter: 1, // 0=7d, 1=30d, 2=all
+  driverFilter: "__all", // "__all" | "__none" (unassigned) | driver name
   openDriveId: null,
   openChargeId: null,
+  openPlaceId: null,
+  renderedScreen: null, // last screen whose content actually painted (skeleton vs refresh-in-place)
+  syncing: false,
   lastSync: null,
   cache: {}, // per-screen fetched payloads, cleared on manual refresh
 };
 
 const NAV = [
   { label: "", items: [["ov", "Overview"], ["tl", "Timeline"], ["st", "Statistics"]] },
-  { label: "Driving", items: [["dr", "Drives"], ["dv", "Drivers"], ["map", "Lifetime map"]] },
+  { label: "Driving", items: [["dr", "Drives"], ["dv", "Drivers"], ["pl", "Places"], ["map", "Lifetime map"]] },
   { label: "Charging", items: [["ch", "Charges"], ["cs", "Charging stats"]] },
   { label: "Battery", items: [["bh", "Battery health"], ["vd", "Vampire drain"]] },
 ];
@@ -126,6 +140,7 @@ const TITLES = {
   st: ["Statistics", "last 12 months"],
   dr: ["Drives", ""],
   dv: ["Drivers", "behaviour & risk scoring"],
+  pl: ["Places", "saved locations & suggestions"],
   map: ["Lifetime map", ""],
   ch: ["Charges", ""],
   cs: ["Charging stats", "lifetime"],
@@ -144,8 +159,16 @@ const EVENT_COLOR = { drive: "var(--accent)", charge: "var(--good)", sleep: "var
  * dashboard to a phone home screen. Credentials are copied into localStorage
  * and then stripped from the URL via replaceState, so the token doesn't linger
  * in the address bar, browser history, or any bookmark the URL gets saved into.
- * The token is read-only (the worker only exposes read /data/* + read MCP tools
- * to it), but it's still a bearer secret — treat the link as private.
+ * Use a per-device READ token (mint via the worker's /auth/device-token) — a
+ * bearer secret; treat the link as private.
+ *
+ * SECURITY — token exfiltration guard: a crafted link that supplies ONLY an
+ * `origin` (no token of its own) must never cause an already-stored token to
+ * be shipped to that attacker origin (every fetch appends ?token=). So when an
+ * origin arrives WITHOUT an accompanying token and it differs from the current
+ * one, we clear the stored token and force re-login at the gate for the new
+ * origin. A legitimate setup link always carries its own token, so it's
+ * unaffected; a bare ?origin= link just drops you at the login screen.
  */
 function consumeUrlCredentials() {
   // Accept params from the query string or the hash (hash keeps them out of
@@ -157,9 +180,15 @@ function consumeUrlCredentials() {
   const vinParam = pick("vin");
   const origin = pick("origin");
   if (!token && !vinParam && !origin) return;
+  if (origin) {
+    const norm = origin.replace(/\/+$/, "");
+    if (!token && norm !== (localStorage.getItem("tm_origin") || "")) {
+      auth.token = ""; // never send an existing token to a URL-supplied new origin
+    }
+    localStorage.setItem("tm_origin", norm);
+  }
   if (token) auth.token = token.trim();
   if (vinParam) auth.vin = vinParam.trim().toUpperCase();
-  if (origin) localStorage.setItem("tm_origin", origin.replace(/\/+$/, ""));
   // Scrub the credentials out of the visible URL + history entry.
   try {
     history.replaceState(null, "", location.pathname);
@@ -300,8 +329,15 @@ function renderShell() {
 }
 
 function tickSyncLabel() {
+  if (state.syncing) return; // "syncing…" holds until the load settles
   const el = document.getElementById("tm-sync-text");
   if (el && state.lastSync) el.textContent = `synced ${agoLabel(state.lastSync)}`;
+}
+
+function setSyncing(on) {
+  state.syncing = on;
+  const el = document.getElementById("tm-sync-text");
+  if (el && on) el.textContent = "syncing…";
 }
 
 function setNavOpen(open) {
@@ -323,6 +359,7 @@ function onRootClick(e) {
     state.screen = t.dataset.screen;
     state.openDriveId = null;
     state.openChargeId = null;
+    state.openPlaceId = null;
     renderShell();
     showScreen();
   } else if (action === "theme") {
@@ -330,6 +367,7 @@ function onRootClick(e) {
     localStorage.setItem("tm_theme", state.theme);
     document.querySelector("[data-tm-root]")?.setAttribute("data-theme", state.theme);
     document.querySelectorAll(".tm-segbtn").forEach((b) => b.classList.toggle("active", b.dataset.theme === state.theme));
+    showScreen(); // maps must rebuild on the theme-matched basemap (data is cached, so this is instant)
   } else if (action === "refresh") {
     state.cache = {};
     showScreen();
@@ -341,6 +379,17 @@ function onRootClick(e) {
   } else if (action === "drive-filter") {
     state.driveFilter = Number(t.dataset.filter);
     renderDrives();
+  } else if (action === "driver-filter") {
+    state.driverFilter = t.dataset.driver;
+    renderDrives();
+  } else if (action === "edit-driver") {
+    if (!t.querySelector(".tm-driver-edit")) beginDriverEdit(t, Number(t.dataset.id));
+  } else if (action === "open-place") {
+    state.openPlaceId = Number(t.dataset.id);
+    renderPlaceDetail();
+  } else if (action === "back-places") {
+    state.openPlaceId = null;
+    renderPlaces();
   } else if (action === "open-drive") {
     state.openDriveId = Number(t.dataset.id);
     renderDriveDetail();
@@ -372,6 +421,9 @@ function onRootClick(e) {
 }
 
 function setContent(html) {
+  // Any repaint replaces DOM that may hold live Leaflet instances (and replay
+  // animation frames) — tear those down first so nothing leaks between renders.
+  destroyMaps();
   const el = document.getElementById("tm-content");
   if (el) el.innerHTML = html;
 }
@@ -385,8 +437,60 @@ function errorHtml(message) {
   return `<div class="tm-card"><div class="tm-empty"><div class="tm-empty-title" style="color:var(--bad);">Couldn't load this</div><div>${esc(message)}</div></div></div>`;
 }
 
+// ---------------------------------------------------------------------------
+// Skeletons — first paint of a screen shows a shimmer approximating its layout;
+// refreshes of an already-painted screen keep the old content visible until the
+// fresh render replaces it (no blank flash).
+// ---------------------------------------------------------------------------
+
+function skel(style) {
+  return `<div class="tm-skeleton" style="${style}"></div>`;
+}
+function skeletonHtml(screen) {
+  const metric = `<div class="tm-card tm-card-pad-metric">${skel("height:12px;width:55%;")}${skel("height:22px;width:75%;margin-top:10px;")}</div>`;
+  const metrics = `<div class="tm-grid-metrics">${metric.repeat(4)}</div>`;
+  const chart = `<div class="tm-card tm-card-pad">${skel("height:12px;width:150px;margin-bottom:16px;")}${skel("height:180px;")}</div>`;
+  const tableRows = (n) => Array.from({ length: n }, () =>
+    `<div style="padding:15px 22px;border-bottom:1px solid var(--line2);">${skel("height:13px;")}</div>`).join("");
+  const table = (n) => `<div class="tm-card">${tableRows(n)}</div>`;
+  const mapCard = (h) => `<div class="tm-card tm-map-card" style="min-height:${h}px;">${skel("position:absolute;inset:0;border-radius:0;")}</div>`;
+  const cards3 = `<div class="tm-grid-3col">${(`<div class="tm-card tm-card-pad">${skel("height:15px;width:45%;")}${skel("height:11px;width:65%;margin-top:10px;")}${skel("height:80px;margin-top:16px;")}</div>`).repeat(3)}</div>`;
+
+  switch (screen) {
+    case "ov":
+      return `<div class="tm-grid-2-wide"><div class="tm-card tm-card-pad-lg">${skel("height:20px;width:80px;")}${skel("height:54px;width:45%;margin-top:22px;")}${skel("height:10px;margin-top:22px;border-radius:999px;")}${skel("height:40px;margin-top:20px;")}</div>${mapCard(280)}</div>${metrics}<div class="tm-grid-2">${chart}${chart}</div>`;
+    case "tl":
+      return `<div style="max-width:760px;">${skel("height:12px;width:120px;margin-bottom:12px;")}${table(6)}</div>`;
+    case "st":
+      return `${metrics}${chart}${chart}${table(6)}`;
+    case "dr":
+    case "ch":
+      return `<div class="tm-flex-row" style="gap:8px;">${skel("height:30px;width:86px;border-radius:999px;").repeat(3)}</div>${table(9)}`;
+    case "dv":
+    case "pl":
+      return cards3;
+    case "map":
+      return `<div class="tm-flex-row" style="gap:8px;">${skel("height:24px;width:120px;border-radius:999px;").repeat(3)}</div>${mapCard(560)}`;
+    case "bh":
+      return `<div class="tm-grid-3col"><div class="tm-card tm-card-pad-lg" style="display:flex;align-items:center;justify-content:center;">${skel("height:132px;width:132px;border-radius:50%;")}</div>${metric.repeat(2)}</div>${chart}`;
+    case "cs":
+      return `${metrics}<div class="tm-grid-2">${chart}${chart}</div>`;
+    case "vd":
+      return `${metrics}${table(6)}`;
+    default:
+      return loadingHtml();
+  }
+}
+
 async function showScreen() {
-  setContent(loadingHtml());
+  // First visit to a screen paints a skeleton; re-running the same screen
+  // (manual refresh, theme flip, driver save) keeps what's there until the
+  // new markup lands.
+  const contentEl = document.getElementById("tm-content");
+  if (!contentEl || contentEl.childElementCount === 0 || state.renderedScreen !== state.screen) {
+    setContent(skeletonHtml(state.screen));
+  }
+  setSyncing(true);
   try {
     switch (state.screen) {
       case "ov": await renderOverview(); break;
@@ -394,16 +498,20 @@ async function showScreen() {
       case "st": await renderStatistics(); break;
       case "dr": await renderDrives(); break;
       case "dv": await renderDrivers(); break;
+      case "pl": await renderPlaces(); break;
       case "map": await renderLifetimeMapScreen(); break;
       case "ch": await renderCharges(); break;
       case "cs": await renderChargingStats(); break;
       case "bh": await renderBatteryHealth(); break;
       case "vd": await renderVampireDrain(); break;
     }
+    state.renderedScreen = state.screen;
     state.lastSync = Date.now();
-    tickSyncLabel();
   } catch (e) {
     setContent(errorHtml(e.message));
+  } finally {
+    setSyncing(false);
+    tickSyncLabel();
   }
 }
 
@@ -484,13 +592,54 @@ function readTyres(src) {
   return vals.reduce((a, b) => a + b, 0) / vals.length;
 }
 
+const WHEELS = [["fl", "FL"], ["fr", "FR"], ["rl", "RL"], ["rr", "RR"]];
+
+/**
+ * TPMS card: 4-corner pressure grid in bar. A wheel highlights amber when it
+ * deviates >0.3 bar from the 4-wheel median, or is trending down faster than
+ * 0.15 bar/week (slow puncture signature).
+ */
+function tpmsCard(t) {
+  const latest = t?.latest ?? null;
+  const trend = t?.trend_bar_per_week ?? null;
+  const vals = latest ? WHEELS.map(([w]) => latest[w]).filter((v) => typeof v === "number") : [];
+  let median = null;
+  if (vals.length === 4) {
+    const s = vals.slice().sort((a, b) => a - b);
+    median = (s[1] + s[2]) / 2;
+  }
+  const flag = (w) => {
+    const v = latest?.[w];
+    if (typeof v !== "number") return false;
+    if (median != null && Math.abs(v - median) > 0.3) return true;
+    const tr = trend?.[w];
+    return typeof tr === "number" && tr < -0.15;
+  };
+  const anyWarn = WHEELS.some(([w]) => flag(w));
+  return `
+    <div class="tm-card tm-card-pad-metric">
+      <div class="tm-stat-label" style="display:flex;align-items:baseline;">Tyre pressure
+        ${anyWarn ? `<span class="tm-pill tm-pill-warn" style="margin-left:auto;">check</span>` : `<span style="margin-left:auto;font-size:11px;color:var(--faint);">bar</span>`}
+      </div>
+      <div class="tm-tpms-grid">
+        ${WHEELS.map(([w, label]) => `
+          <div class="tm-tpms-cell ${flag(w) ? "warn" : ""}">
+            <div class="tm-tpms-pos">${label}</div>
+            <div class="tm-tpms-val">${typeof latest?.[w] === "number" ? fmt1(latest[w]) : "—"}</div>
+          </div>`).join("")}
+      </div>
+      <div class="tm-stat-note">${latest?.ts != null ? `as of ${fmtDateTime(latest.ts)}` : "no TPMS samples yet"}</div>
+    </div>`;
+}
+
 async function renderOverview() {
   if (!vin()) return setContent(emptyHtml("No vehicle connected", "Disconnect and reconnect with a VIN."));
 
-  const [summary, latest, locations] = await Promise.all([
+  const [summary, latest, locations, tires] = await Promise.all([
     safe(cached("summary", () => data.summary(vin())), null),
     safe(cached("latest", () => data.latest(vin())), null),
     safe(cached("locations", () => data.locations()), []),
+    safe(cached("tires", () => data.tires(vin(), 30)), null),
   ]);
 
   const vd = state.vehicleData;
@@ -605,6 +754,7 @@ async function renderOverview() {
         <div class="tm-stat-label">Avg efficiency</div>
         <div class="tm-stat-value">${summary?.avg_efficiency_wh_km != null ? fmt0(summary.avg_efficiency_wh_km) : "—"} <span class="tm-stat-unit">Wh/km</span></div>
       </div>
+      ${tpmsCard(tires)}
       ${budgetCard(summary?.api_budget)}
     </div>
 
@@ -764,11 +914,64 @@ async function renderTimeline() {
 // Statistics
 // ---------------------------------------------------------------------------
 
+/** Scatter/line of avg Wh/km per 5 °C outside-temp bin, from /data/efficiency-by-temp. */
+function efficiencyByTempCard(et) {
+  const bins = (et?.bins || []).filter((b) => b.avg_wh_km != null);
+  const totalDrives = bins.reduce((s, b) => s + (b.drives || 0), 0);
+  const pts = bins.map((b) => [(b.t_min + b.t_max) / 2, b.avg_wh_km]);
+  return `
+    <div class="tm-card tm-card-pad">
+      <div class="tm-flex-row" style="align-items:baseline;margin-bottom:18px;">
+        <div style="font-size:14px;font-weight:600;">Efficiency vs temperature</div>
+        <div style="font-size:12px;color:var(--faint);">avg Wh/km per 5 °C bin${totalDrives ? ` · ${totalDrives} drives` : ""}</div>
+      </div>
+      ${pts.length >= 2 ? svgLineChart({
+        series: [{
+          points: pts,
+          markers: true,
+          titles: bins.map((b) => `${fmt1(b.t_min)}–${fmt1(b.t_max)} °C · ${fmt0(b.avg_wh_km)} Wh/km · ${b.drives ?? "?"} drives · ${fmt0(b.distance_km)} km`),
+        }],
+        yTicks: autoTicks(pts.map((p) => p[1]), 4),
+        xTicks: pts.map((p) => ({ value: p[0], label: `${fmt0(p[0])}°` })),
+      }) : `<div class="tm-empty">Not enough temperature-tagged drives yet — this fills in as drives with outside-temperature samples accumulate.</div>`}
+    </div>`;
+}
+
+/** Monthly report table from /data/monthly (most recent first). */
+function monthlyReportTable(rows) {
+  const cur = rows.find((m) => m.currency)?.currency || null;
+  return `
+    <div class="tm-card tm-table-wrap">
+      <div style="min-width:900px;">
+        <div style="padding:18px 22px 4px;font-size:14px;font-weight:600;">Monthly report</div>
+        <div class="tm-table-head" style="grid-template-columns:92px 1fr 96px 88px 84px 104px 96px 88px 96px;">
+          <div>Month</div><div class="tm-right">Drives</div><div class="tm-right">Distance</div><div class="tm-right">Energy</div><div class="tm-right">Wh/km</div><div class="tm-right">Charged</div><div class="tm-right">AC / DC</div><div class="tm-right">Cost</div><div class="tm-right">Cost/100km</div>
+        </div>
+        ${rows.map((m) => `
+          <div class="tm-table-row no-click" style="grid-template-columns:92px 1fr 96px 88px 84px 104px 96px 88px 96px;">
+            <div style="font-size:13px;font-weight:500;">${esc(m.month ?? "—")}</div>
+            <div class="tm-right tm-mono" style="color:var(--sub);">${m.drives ?? "—"}</div>
+            <div class="tm-right tm-mono">${fmt0(m.distance_km)} km</div>
+            <div class="tm-right tm-mono" style="color:var(--sub);">${fmt0(m.drive_energy_kwh)} kWh</div>
+            <div class="tm-right tm-mono" style="color:var(--sub);">${fmt0(m.avg_wh_km)}</div>
+            <div class="tm-right tm-mono">${fmt0(m.charge_kwh)} kWh</div>
+            <div class="tm-right tm-mono" style="color:var(--sub);">${fmt0(m.ac_kwh)} / ${fmt0(m.dc_kwh)}</div>
+            <div class="tm-right tm-mono">${money(m.charge_cost, m.currency ?? cur, 0)}</div>
+            <div class="tm-right tm-mono" style="color:var(--sub);">${money(m.cost_per_100km, m.currency ?? cur)}</div>
+          </div>`).join("")}
+        <div class="tm-foot-note">${rows.length} month${rows.length === 1 ? "" : "s"} · ${rows.reduce((s, m) => s + (m.charge_sessions || 0), 0)} charge sessions.</div>
+      </div>
+    </div>`;
+}
+
 async function renderStatistics() {
-  const [drives, charges] = await Promise.all([
+  const [drives, charges, effTemp, monthlyRes] = await Promise.all([
     safe(cached("all_drives", () => data.drives(vin(), 2000)), []),
     safe(cached("all_charges", () => data.chargeSessions(vin(), 2000)), []),
+    safe(cached("eff_temp", () => data.efficiencyByTemp(vin())), null),
+    safe(cached("monthly", () => data.monthly(vin(), 12)), null),
   ]);
+  const monthlyRows = monthlyRes?.months || []; // most recent first (server contract)
 
   const sinceTs = Math.floor(Date.now() / 1000) - 365 * 86400;
   const recentDrives = drives.filter((d) => d.start_ts >= sinceTs);
@@ -813,8 +1016,12 @@ async function renderStatistics() {
         <div style="font-size:14px;font-weight:600;">Distance driven</div>
         <div style="font-size:12px;color:var(--faint);">km per month</div>
       </div>
-      ${months.length ? svgBarChart({ bars: months.map((m) => ({ label: m.m, value: m.km })) }) : `<div class="tm-empty">No monthly data yet</div>`}
+      ${monthlyRows.length ? svgBarChart({ bars: monthlyRows.slice().reverse().map((m) => ({ label: monthShort(m.month), value: m.distance_km || 0 })) })
+        : months.length ? svgBarChart({ bars: months.map((m) => ({ label: m.m, value: m.km })) })
+        : `<div class="tm-empty">No monthly data yet</div>`}
     </div>
+    ${efficiencyByTempCard(effTemp)}
+    ${monthlyRows.length ? monthlyReportTable(monthlyRows) : `
     <div class="tm-card tm-table-wrap">
       <div style="min-width:700px;">
         <div class="tm-table-head" style="grid-template-columns:100px 1fr 96px 100px 108px 88px;">
@@ -830,48 +1037,124 @@ async function renderStatistics() {
             <div class="tm-right tm-mono">${money(m.cost, cur, 0)}</div>
           </div>`).join("")}
       </div>
-    </div>
+    </div>`}
   `);
+}
+
+/** "2026-06" → "Jun 26" for chart axis labels. */
+function monthShort(ym) {
+  const m = /^(\d{4})-(\d{2})$/.exec(ym || "");
+  if (!m) return ym || "—";
+  return new Date(Number(m[1]), Number(m[2]) - 1, 1).toLocaleDateString(undefined, { month: "short", year: "2-digit" });
 }
 
 // ---------------------------------------------------------------------------
 // Drives
 // ---------------------------------------------------------------------------
 
+/** Distinct assigned driver names across the loaded drives (for chips + datalist). */
+function knownDrivers(drives) {
+  return [...new Set(drives.map((d) => d.driver).filter(Boolean))].sort((a, b) => a.localeCompare(b));
+}
+
+/** Driver cell body: assigned name, or the classifier's guess (muted, "?"-suffixed), or —. */
+function driverCellHtml(d) {
+  if (d.driver) return esc(d.driver);
+  if (d.suggested_driver) return `<span class="tm-driver-suggested">${esc(d.suggested_driver)}?</span>`;
+  return `<span style="color:var(--faint);">—</span>`;
+}
+
+/** Swap a driver cell for an inline input (datalist of known names); saves on Enter/blur. */
+function beginDriverEdit(cell, id) {
+  const drives = state.cache.all_drives || [];
+  const row = drives.find((d) => d.id === id);
+  const current = row?.driver || "";
+  cell.innerHTML = `<input class="tm-driver-edit" list="tm-driver-names" value="${esc(current)}" placeholder="${esc(row?.suggested_driver ? row.suggested_driver + "?" : "driver…")}" autocomplete="off">`;
+  const input = cell.querySelector("input");
+  let done = false;
+  const finish = (save) => {
+    if (done) return;
+    done = true;
+    const name = input.value.trim();
+    if (!save || name === current) {
+      cell.innerHTML = row ? driverCellHtml(row) : "—";
+      return;
+    }
+    cell.innerHTML = `<span style="color:var(--faint);">saving…</span>`;
+    data.assignDriver(id, name).then(() => {
+      if (row) row.driver = name || null;
+      renderDrives(); // refresh chips + cells against the updated cache
+    }).catch(() => {
+      cell.innerHTML = `<span style="color:var(--bad);">failed</span>`;
+    });
+  };
+  input.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") finish(true);
+    else if (e.key === "Escape") finish(false);
+  });
+  input.addEventListener("blur", () => finish(true));
+  input.focus();
+  input.select();
+}
+
 async function renderDrives() {
   if (state.openDriveId != null) return renderDriveDetail();
   const all = await cached("all_drives", () => data.drives(vin(), 2000));
   const locations = await safe(cached("locations", () => data.locations()), []);
-  const locName = (id) => (id == null ? "Unknown" : locations.find((l) => l.id === id)?.name || "Unknown");
 
   const now = Math.floor(Date.now() / 1000);
   const windows = [now - 7 * 86400, now - 30 * 86400, 0];
   const counts = windows.map((since) => all.filter((d) => d.start_ts >= since).length);
-  const filtered = all.filter((d) => d.start_ts >= windows[state.driveFilter]);
+  const inWindow = all.filter((d) => d.start_ts >= windows[state.driveFilter]);
+
+  const drivers = knownDrivers(all);
+  if (state.driverFilter !== "__all" && state.driverFilter !== "__none" && !drivers.includes(state.driverFilter)) {
+    state.driverFilter = "__all"; // stale filter (driver renamed away)
+  }
+  const matchesDriver = (d) =>
+    state.driverFilter === "__all" ? true :
+    state.driverFilter === "__none" ? !d.driver :
+    d.driver === state.driverFilter;
+  const filtered = inWindow.filter(matchesDriver);
+  const driverChips = [
+    ["__all", "All", inWindow.length],
+    ...drivers.map((name) => [name, name, inWindow.filter((d) => d.driver === name).length]),
+    ["__none", "Unassigned", inWindow.filter((d) => !d.driver).length],
+  ];
+  const cols = "150px minmax(180px,1fr) 110px 84px 84px 92px 108px 96px";
 
   setContent(`
-    <div class="tm-flex-row" style="gap:8px;">
+    <div class="tm-flex-row" style="gap:8px;flex-wrap:wrap;">
       ${["7 days", "30 days", "All"].map((label, i) => `
         <button class="tm-chip-btn ${state.driveFilter === i ? "active" : ""}" data-action="drive-filter" data-filter="${i}">${label}<span class="n">${counts[i]}</span></button>
       `).join("")}
+      <a class="tm-chip-btn" style="margin-left:auto;" href="${esc(exportUrl("/data/export/drives.csv", { vin: vin() }))}" target="_blank" rel="noopener" download>&#11015; CSV</a>
     </div>
+    ${drivers.length || inWindow.some((d) => !d.driver) ? `
+    <div class="tm-flex-row" style="gap:8px;flex-wrap:wrap;">
+      ${driverChips.map(([key, label, n]) => `
+        <button class="tm-chip-btn ${state.driverFilter === key ? "active" : ""}" data-action="driver-filter" data-driver="${esc(key)}">${esc(label)}<span class="n">${n}</span></button>
+      `).join("")}
+    </div>` : ""}
+    <datalist id="tm-driver-names">${drivers.map((n) => `<option value="${esc(n)}"></option>`).join("")}</datalist>
     ${filtered.length ? `
     <div class="tm-card tm-table-wrap">
-      <div style="min-width:840px;">
-        <div class="tm-table-head" style="grid-template-columns:150px 1fr 84px 84px 92px 108px 96px;">
-          <div>When</div><div>Route</div><div class="tm-right">Distance</div><div class="tm-right">Duration</div><div class="tm-right">Avg speed</div><div class="tm-right">Consumption</div><div class="tm-right">Battery</div>
+      <div style="min-width:960px;">
+        <div class="tm-table-head" style="grid-template-columns:${cols};">
+          <div>When</div><div>Route</div><div>Driver</div><div class="tm-right">Distance</div><div class="tm-right">Duration</div><div class="tm-right">Avg speed</div><div class="tm-right">Consumption</div><div class="tm-right">Battery</div>
         </div>
         ${filtered.map((d) => `
-          <div class="tm-table-row" data-action="open-drive" data-id="${d.id}" style="grid-template-columns:150px 1fr 84px 84px 92px 108px 96px;">
+          <div class="tm-table-row" data-action="open-drive" data-id="${d.id}" style="grid-template-columns:${cols};">
             <div style="font-size:12.5px;color:var(--sub);">${fmtDateTime(d.start_ts)}</div>
             <div class="tm-ellipsis" style="font-size:13.5px;font-weight:500;">${esc(driveEndpoint(d, "start", locations))} <span style="color:var(--faint);">→</span> ${esc(driveEndpoint(d, "end", locations))}</div>
+            <div class="tm-ellipsis" data-action="edit-driver" data-id="${d.id}" title="Click to assign driver" style="font-size:12.5px;">${driverCellHtml(d)}</div>
             <div class="tm-right tm-mono">${d.distance_km != null ? fmt1(d.distance_km) : "—"} km</div>
             <div class="tm-right tm-mono" style="color:var(--sub);">${fmtDurationMin(d.duration_min)}</div>
             <div class="tm-right tm-mono" style="color:var(--sub);">${d.avg_speed != null ? fmt0(d.avg_speed) : "—"} km/h</div>
             <div class="tm-right tm-mono">${d.efficiency_wh_km != null ? fmt0(d.efficiency_wh_km) : "—"} Wh/km</div>
             <div class="tm-right tm-mono" style="color:var(--sub);">${d.start_soc != null && d.end_soc != null ? `${d.start_soc} → ${d.end_soc}` : "—"} %</div>
           </div>`).join("")}
-        <div class="tm-foot-note">${filtered.length} drive${filtered.length === 1 ? "" : "s"} in range.</div>
+        <div class="tm-foot-note">${filtered.length} drive${filtered.length === 1 ? "" : "s"} in range. Click a driver cell to assign; <span class="tm-driver-suggested">italic?</span> names are unconfirmed suggestions.</div>
       </div>
     </div>` : emptyHtml("No drives in this range", "Try a wider filter, or check back once more trips are logged.")}
   `);
@@ -893,21 +1176,25 @@ async function renderDriveDetail() {
       <div style="font-size:15px;font-weight:600;">${esc(driveEndpoint(d, "start", locations))} <span style="color:var(--faint);">→</span> ${esc(driveEndpoint(d, "end", locations))}</div>
       <div style="font-size:12.5px;color:var(--faint);">${fmtDateTime(d.start_ts)}</div>
       <div class="tm-flex-row" style="margin-left:auto;gap:6px;">
+        <a class="tm-chip-btn" style="padding:5px 12px;" href="${esc(exportUrl("/data/export/drive.gpx", { id: d.id }))}" target="_blank" rel="noopener" download>&#11015; GPX</a>
         <span style="font-size:12px;color:var(--sub);">Driver:</span>
-        <input id="tm-driver-input" class="tm-gate-input" style="width:140px;padding:5px 9px;font-family:var(--ui);" placeholder="unassigned" value="${esc(d.driver || "")}">
+        <input id="tm-driver-input" class="tm-gate-input" style="width:140px;padding:5px 9px;font-family:var(--ui);" placeholder="${esc(d.suggested_driver ? `${d.suggested_driver}?` : "unassigned")}" value="${esc(d.driver || "")}">
         <button class="tm-chip-btn" style="padding:5px 12px;" data-action="save-driver" data-id="${d.id}">Save</button>
       </div>
     </div>
+    ${!d.driver && d.suggested_driver ? `<div style="font-size:12px;color:var(--faint);">Looks like <span class="tm-driver-suggested">${esc(d.suggested_driver)}</span> drove this — type a name and Save to confirm.</div>` : ""}
     ${d.behavior_score != null || d.max_decel_ms2 != null ? `
     <div class="tm-grid-metrics">
       <div class="tm-card tm-card-pad-metric"><div class="tm-stat-label">Safety score</div><div class="tm-stat-value" style="color:${scoreColor(d.behavior_score)};">${d.behavior_score != null ? d.behavior_score : "—"}</div></div>
       <div class="tm-card tm-card-pad-metric"><div class="tm-stat-label">Peak braking</div><div class="tm-stat-value">${d.max_decel_ms2 != null ? fmt2(d.max_decel_ms2 / 9.81) : "—"} <span class="tm-stat-unit">g</span></div></div>
       <div class="tm-card tm-card-pad-metric"><div class="tm-stat-label">Harsh brakes · accels</div><div class="tm-stat-value">${d.harsh_brake_count ?? 0} · ${d.harsh_accel_count ?? 0}</div></div>
       <div class="tm-card tm-card-pad-metric"><div class="tm-stat-label">Speeding · night</div><div class="tm-stat-value">${d.over_limit_frac != null ? fmt0(d.over_limit_frac * 100) : "—"} · ${d.night_frac != null ? fmt0(d.night_frac * 100) : "—"} <span class="tm-stat-unit">%</span></div></div>
+      ${d.max_jerk_ms3 != null ? `<div class="tm-card tm-card-pad-metric"><div class="tm-stat-label">Peak jerk</div><div class="tm-stat-value">${fmt1(d.max_jerk_ms3)} <span class="tm-stat-unit">m/s³</span></div></div>` : ""}
     </div>` : ""}
     <div class="tm-grid-2-wide">
       <div class="tm-card tm-map-card" style="min-height:300px;">
         <div id="tm-drive-map" class="tm-map-canvas"></div>
+        ${path.length >= 2 ? `<button class="tm-replay-btn" id="tm-replay-btn" title="Replay drive">&#9654;</button>` : ""}
         ${path.length < 2 ? `<div class="tm-empty" style="height:100%;">No GPS path recorded for this drive</div>` : ""}
       </div>
       <div class="tm-grid-half" style="align-content:start;">
@@ -938,7 +1225,10 @@ async function renderDriveDetail() {
   `);
 
   if (path.length >= 2) {
-    requestAnimationFrame(() => renderRouteMap(document.getElementById("tm-drive-map"), path));
+    requestAnimationFrame(() => {
+      const map = renderRouteMap(document.getElementById("tm-drive-map"), path);
+      attachReplay(map, path, document.getElementById("tm-replay-btn"));
+    });
   }
 }
 
@@ -1009,6 +1299,95 @@ function driverStat(label, value, unit) {
 }
 
 // ---------------------------------------------------------------------------
+// Places — saved geofence locations + visit-based suggestions
+// ---------------------------------------------------------------------------
+
+async function renderPlaces() {
+  if (state.openPlaceId != null) return renderPlaceDetail();
+  const [locations, suggestedRes] = await Promise.all([
+    safe(cached("locations", () => data.locations()), []),
+    safe(cached("suggested_locations", () => data.suggestedLocations(vin())), null),
+  ]);
+  const suggestions = suggestedRes?.suggestions || [];
+
+  setContent(`
+    ${suggestions.length ? `
+    <div class="tm-card tm-card-pad">
+      <div class="tm-flex-row" style="align-items:baseline;margin-bottom:6px;">
+        <div style="font-size:14px;font-weight:600;">Suggested places</div>
+        <div style="font-size:12px;color:var(--faint);">frequent stops that aren't saved yet</div>
+      </div>
+      <div style="font-size:12px;color:var(--faint);margin-bottom:8px;">
+        Locations are managed with the worker's <code>set_location</code> MCP tool — this dashboard is read-only, so ask
+        Claude to save one (name + coordinates below) and it'll appear in the list.
+      </div>
+      ${suggestions.map((s) => `
+        <div class="tm-activity-row">
+          <span class="tm-dot" style="background:var(--warn);"></span>
+          <div style="min-width:0;">
+            <div class="tm-activity-title">${esc(s.label || "Unnamed spot")}</div>
+            <div class="tm-activity-meta">${s.lat != null && s.lon != null ? `${fmt1(s.lat)}, ${fmt1(s.lon)}` : ""}</div>
+          </div>
+          <span class="tm-activity-time">${s.visits != null ? `${s.visits} visit${s.visits === 1 ? "" : "s"}` : ""}</span>
+        </div>`).join("")}
+    </div>` : ""}
+    ${locations.length ? `
+    <div class="tm-card tm-table-wrap">
+      <div style="min-width:520px;">
+        <div class="tm-table-head" style="grid-template-columns:1fr 150px 96px;">
+          <div>Name</div><div class="tm-right">Coordinates</div><div class="tm-right">Radius</div>
+        </div>
+        ${locations.map((l) => `
+          <div class="tm-table-row" data-action="open-place" data-id="${l.id}" style="grid-template-columns:1fr 150px 96px;">
+            <div class="tm-ellipsis" style="font-size:13.5px;font-weight:500;">${esc(l.name)}</div>
+            <div class="tm-right tm-mono" style="color:var(--sub);font-size:12px;">${fmt1(l.lat)}, ${fmt1(l.lon)}</div>
+            <div class="tm-right tm-mono" style="color:var(--sub);">${l.radius_m != null ? fmt0(l.radius_m) + " m" : "—"}</div>
+          </div>`).join("")}
+        <div class="tm-foot-note">${locations.length} saved place${locations.length === 1 ? "" : "s"} · click one for its stats.</div>
+      </div>
+    </div>` : emptyHtml("No saved places yet", "Save geofence locations (home, work, …) with the set_location MCP tool and drives/charges will auto-label against them.")}
+  `);
+}
+
+async function renderPlaceDetail() {
+  const stats = await safe(data.locationStats(state.openPlaceId), null);
+  if (!stats || stats.error || !stats.location) {
+    return setContent(`
+      <div class="tm-flex-row"><button class="tm-back-btn" data-action="back-places">← Places</button></div>
+      ${errorHtml(stats?.error || "Couldn't load this location")}`);
+  }
+  const l = stats.location;
+  // Location stats carry no currency of their own — borrow the dominant one
+  // from any already-loaded charge sessions (falls back to € in money()).
+  const cur = dominantCurrency(state.cache.all_charges || []);
+
+  setContent(`
+    <div class="tm-flex-row" style="gap:14px;flex-wrap:wrap;">
+      <button class="tm-back-btn" data-action="back-places">← Places</button>
+      <div style="font-size:15px;font-weight:600;">${esc(l.name)}</div>
+      <div style="font-size:12.5px;color:var(--faint);">${fmt1(l.lat)}, ${fmt1(l.lon)} · ${l.radius_m != null ? fmt0(l.radius_m) + " m radius" : ""}</div>
+    </div>
+    <div class="tm-grid-2-wide">
+      <div class="tm-card tm-map-card" style="min-height:280px;">
+        <div id="tm-place-map" class="tm-map-canvas"></div>
+      </div>
+      <div class="tm-grid-half" style="align-content:start;">
+        <div class="tm-card" style="padding:18px 20px;"><div class="tm-stat-label">Drives from here</div><div class="tm-stat-value">${fmt0(stats.drives_from)}</div></div>
+        <div class="tm-card" style="padding:18px 20px;"><div class="tm-stat-label">Drives to here</div><div class="tm-stat-value">${fmt0(stats.drives_to)}</div></div>
+        <div class="tm-card" style="padding:18px 20px;"><div class="tm-stat-label">Charge sessions</div><div class="tm-stat-value">${fmt0(stats.charge_sessions)}</div></div>
+        <div class="tm-card" style="padding:18px 20px;"><div class="tm-stat-label">Energy charged</div><div class="tm-stat-value">${fmt1(stats.total_energy_added_kwh)} <span class="tm-stat-unit">kWh</span></div></div>
+        <div class="tm-card" style="padding:18px 20px;"><div class="tm-stat-label">Charging cost</div><div class="tm-stat-value">${money(stats.total_cost, cur)}</div></div>
+        ${l.cost_per_kwh != null ? `<div class="tm-card" style="padding:18px 20px;"><div class="tm-stat-label">Tariff</div><div class="tm-stat-value">${money(l.cost_per_kwh, cur)} <span class="tm-stat-unit">/kWh</span></div></div>` : ""}
+      </div>
+    </div>
+  `);
+
+  if (l.lat != null && l.lon != null) {
+    requestAnimationFrame(() => renderPointMap(document.getElementById("tm-place-map"), l.lat, l.lon, esc(l.name)));
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Lifetime map
 // ---------------------------------------------------------------------------
 
@@ -1053,6 +1432,10 @@ async function renderCharges() {
   if (!charges.length) return setContent(emptyHtml("No charge sessions recorded yet", "Charging history will appear here once sessions have been logged."));
 
   setContent(`
+    <div class="tm-flex-row" style="gap:8px;">
+      <span class="tm-pill tm-pill-chip">${charges.length} session${charges.length === 1 ? "" : "s"}</span>
+      <a class="tm-chip-btn" style="margin-left:auto;" href="${esc(exportUrl("/data/export/charges.csv", { vin: vin() }))}" target="_blank" rel="noopener" download>&#11015; CSV</a>
+    </div>
     <div class="tm-card tm-table-wrap">
       <div style="min-width:840px;">
         <div class="tm-table-head" style="grid-template-columns:140px 1fr 56px 92px 96px 96px 88px 80px;">
@@ -1269,13 +1652,30 @@ async function renderVampireDrain() {
     ? (v.total_soc_lost_pct / 100) * state.cache.summary.pack_kwh
     : null;
 
+  // Optional asleep-vs-awake split (newer worker builds) shown alongside the
+  // blended number. The worker returns `sleep`/`awake` as top-level keys; only
+  // treat it as present when a bucket actually has idle time (avoids an
+  // all-zero split card on old data).
+  const bd = (v.sleep?.hours || v.awake?.hours) ? { sleep: v.sleep, awake: v.awake } : (v.breakdown || null);
+  const splitCard = (label, part, hint) => part ? `
+    <div class="tm-card tm-card-pad-metric">
+      <div class="tm-stat-label">${esc(label)}</div>
+      <div class="tm-stat-value">${part.pct_per_day != null ? fmt2(part.pct_per_day) : "—"} <span class="tm-stat-unit">%/day</span></div>
+      <div class="tm-stat-note">${part.hours != null ? fmt0(part.hours) + " h" : "—"}${part.soc_lost != null ? ` · −${fmt2(part.soc_lost)}% SOC` : ""} · ${esc(hint)}</div>
+    </div>` : "";
+
   setContent(`
     <div class="tm-grid-metrics">
-      <div class="tm-card tm-card-pad-metric"><div class="tm-stat-label">Avg drain · idle</div><div class="tm-stat-value">${v.avg_pct_per_day != null ? fmt2(v.avg_pct_per_day) : "—"} <span class="tm-stat-unit">%/day</span></div></div>
+      <div class="tm-card tm-card-pad-metric"><div class="tm-stat-label">Avg drain · idle</div><div class="tm-stat-value">${v.avg_pct_per_day != null ? fmt2(v.avg_pct_per_day) : "—"} <span class="tm-stat-unit">%/day</span></div>${bd ? `<div class="tm-stat-note">blended asleep + awake</div>` : ""}</div>
       <div class="tm-card tm-card-pad-metric"><div class="tm-stat-label">Idle spans</div><div class="tm-stat-value">${v.idle_spans}</div></div>
       <div class="tm-card tm-card-pad-metric"><div class="tm-stat-label">Lost · ${v.days} days</div><div class="tm-stat-value">${fmt1(v.total_soc_lost_pct)} <span class="tm-stat-unit">% SOC</span></div>${totalKwh != null ? `<div class="tm-stat-note">≈ ${fmt1(totalKwh)} kWh</div>` : ""}</div>
       <div class="tm-card tm-card-pad-metric"><div class="tm-stat-label">Total idle time</div><div class="tm-stat-value">${fmt0(v.total_idle_hours)} <span class="tm-stat-unit">h</span></div></div>
     </div>
+    ${bd && (bd.sleep || bd.awake) ? `
+    <div class="tm-grid-half">
+      ${splitCard("Asleep", bd.sleep, "deep sleep — this is the floor")}
+      ${splitCard("Awake idle", bd.awake, "sentry, cabin protection, app pings")}
+    </div>` : ""}
     <div class="tm-card tm-table-wrap">
       <div style="min-width:800px;">
         <div class="tm-table-head" style="grid-template-columns:140px 96px 84px 96px;">

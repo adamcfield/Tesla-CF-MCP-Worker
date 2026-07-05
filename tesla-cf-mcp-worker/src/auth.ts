@@ -247,20 +247,93 @@ export async function handlePartnerPublicKey(env: Env): Promise<Response> {
 }
 
 // ---------------------------------------------------------------------------
-// MCP access control
+// MCP access control — two scopes, enforced SERVER-SIDE
+//
+//   full — MCP_AUTH_TOKEN or a claude.ai OAuth-shim token (minted by logging
+//          in with the master token). Commands, setup, everything.
+//   read — a per-device token minted via /auth/device-token. Authorizes all
+//          /data routes and only the read-only MCP tools (mcp.ts READ_TOOLS).
+//          Revocable individually: "phone stolen" = deleting one KV key, not
+//          rotating the master secret every consumer shares.
+//
+// Device tokens are stored HASHED (SHA-256) so a KV leak doesn't leak
+// bearers; the id shown in listings is the hash prefix.
 // ---------------------------------------------------------------------------
 
-/** True when the request carries a valid bearer (static token or shim-issued OAuth token). */
-export async function isMcpAuthorized(request: Request, env: Env): Promise<boolean> {
-  const header = request.headers.get("authorization") ?? "";
-  const m = header.match(/^Bearer\s+(.+)$/i);
-  if (!m || !m[1]) return false;
-  const token = m[1].trim();
-  if (timingSafeEqual(token, env.MCP_AUTH_TOKEN)) return true;
+export type AuthScope = "full" | "read";
+
+const KV_DEVICE_TOKEN = (hashHex: string) => `dtok:${hashHex}`;
+
+async function sha256Hex(s: string): Promise<string> {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(s));
+  return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+/** Scope carried by a bearer token string, or null if it authorizes nothing. */
+export async function tokenScope(env: Env, token: string): Promise<AuthScope | null> {
+  if (!token) return null;
+  if (timingSafeEqual(token, env.MCP_AUTH_TOKEN)) return "full";
   // Shim-issued refresh tokens live under the same KV prefix as access
   // tokens but must never authorize /mcp themselves — only a token stored
   // with value "access" may.
-  return (await env.TESLA_KV.get(KV_MCP_TOKEN(token))) === "access";
+  if ((await env.TESLA_KV.get(KV_MCP_TOKEN(token))) === "access") return "full";
+  if (await env.TESLA_KV.get(KV_DEVICE_TOKEN(await sha256Hex(token)))) return "read";
+  return null;
+}
+
+/** Scope of the request's bearer header (or ?token= param), or null. */
+export async function requestScope(request: Request, url: URL, env: Env): Promise<AuthScope | null> {
+  const header = request.headers.get("authorization")?.match(/^Bearer\s+(.+)$/i)?.[1]?.trim();
+  const candidate = header ?? url.searchParams.get("token") ?? "";
+  return tokenScope(env, candidate);
+}
+
+interface DeviceTokenMeta {
+  label: string;
+  created_ts: number;
+}
+
+/** Mints a per-device READ token; returns it once (only the hash is stored). */
+export async function mintDeviceToken(
+  env: Env,
+  label: string,
+): Promise<{ id: string; token: string; label: string }> {
+  const token = randomHex(32);
+  const hash = await sha256Hex(token);
+  const meta: DeviceTokenMeta = { label: label.slice(0, 64) || "device", created_ts: Math.floor(Date.now() / 1000) };
+  await env.TESLA_KV.put(KV_DEVICE_TOKEN(hash), JSON.stringify(meta));
+  return { id: hash.slice(0, 12), token, label: meta.label };
+}
+
+export async function listDeviceTokens(env: Env): Promise<{ id: string; label: string; created_ts: number }[]> {
+  const out: { id: string; label: string; created_ts: number }[] = [];
+  const listed = await env.TESLA_KV.list({ prefix: "dtok:" });
+  for (const key of listed.keys) {
+    const meta = await env.TESLA_KV.get<DeviceTokenMeta>(key.name, "json");
+    out.push({
+      id: key.name.slice("dtok:".length, "dtok:".length + 12),
+      label: meta?.label ?? "device",
+      created_ts: meta?.created_ts ?? 0,
+    });
+  }
+  return out.sort((a, b) => b.created_ts - a.created_ts);
+}
+
+/** Revokes by id (hash prefix). Returns how many tokens were deleted. */
+export async function revokeDeviceToken(env: Env, id: string): Promise<number> {
+  if (!/^[0-9a-f]{6,64}$/.test(id)) return 0;
+  const listed = await env.TESLA_KV.list({ prefix: `dtok:${id}` });
+  let n = 0;
+  for (const key of listed.keys) {
+    await env.TESLA_KV.delete(key.name);
+    n++;
+  }
+  return n;
+}
+
+/** Back-compat helper: any valid scope may talk to /mcp (tool-level gating applies). */
+export async function isMcpAuthorized(request: Request, env: Env): Promise<boolean> {
+  return (await requestScope(request, new URL(request.url), env)) !== null;
 }
 
 export function timingSafeEqual(a: string, b: string): boolean {

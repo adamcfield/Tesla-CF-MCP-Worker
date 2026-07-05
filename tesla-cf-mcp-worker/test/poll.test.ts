@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import { pacedChargingIntervalS, pacedDrivingIntervalS } from "../src/budget";
 import { pollOnce } from "../src/poll";
-import { resetSchemaCacheForTests } from "../src/store";
+import { putAppState, resetSchemaCacheForTests } from "../src/store";
 import { FakeD1 } from "./helpers/d1";
 import { FakeKV } from "./helpers/kv";
 import type { Env } from "../src/types";
@@ -63,21 +64,22 @@ describe("pollOnce adaptive interval", () => {
     expect(r.next_interval_s).toBeGreaterThanOrEqual(120);
   });
 
-  it("driving → fast interval, active", async () => {
+  it("driving with a fresh budget → burst cadence (10s), active", async () => {
     stubTesla({ state: "online", shift: "D", speed: 45 });
     const r = await pollOnce(makeEnv(kv), VIN);
     expect(r.activity).toBe("driving");
     expect(r.active).toBe(true);
-    expect(r.next_interval_s).toBe(60); // logging-tuned driving cadence
+    // Zero spend → always at/ahead of monthly pace → maximum-fidelity burst.
+    expect(r.next_interval_s).toBe(10);
     expect(r.polled).toBe(true);
   });
 
-  it("charging → medium interval, active", async () => {
+  it("charging with a fresh budget → 60s curve cadence, active", async () => {
     stubTesla({ state: "online", charging_state: "Charging", shift: "P" });
     const r = await pollOnce(makeEnv(kv), VIN);
     expect(r.activity).toBe("charging");
     expect(r.active).toBe(true);
-    expect(r.next_interval_s).toBe(150);
+    expect(r.next_interval_s).toBe(60);
   });
 
   it("idle-online → watch at the idle cadence while recently active, then suspend so it can sleep", async () => {
@@ -89,10 +91,36 @@ describe("pollOnce adaptive interval", () => {
     expect(first.active).toBe(true);
     expect(first.next_interval_s).toBe(90);
 
-    // Simulate 15 min of idle by ageing the stored marker, then poll again.
-    await kv.put(`poll_state:${VIN}`, JSON.stringify({ last_active_ts: Math.floor(Date.now() / 1000) - 15 * 60 }));
+    // Simulate 15 min of idle by ageing the stored marker (now in D1
+    // app_state — the KV copy is only a migration fallback), then poll again.
+    await putAppState(env, `poll_state:${VIN}`, JSON.stringify({ last_active_ts: Math.floor(Date.now() / 1000) - 15 * 60 }));
     const later = await pollOnce(env, VIN);
     expect(later.activity).toBe("idle");
     expect(later.active).toBe(false); // suspended → loop stops, car allowed to sleep
+  });
+});
+
+describe("budget pacing", () => {
+  const mid = new Date(Date.UTC(2026, 6, 16)); // July 16 — ~48% through the month
+
+  it("bursts at 10s when at/ahead of pace and decays as budget falls behind", () => {
+    // July 16: elapsed ≈ 48.4% of the month → remainingFrac ≈ 0.516.
+    // ratio = remainingBudgetFrac / remainingFrac, tiers 1 / 0.75 / 0.5.
+    const budget = 9_000_000;
+    expect(pacedDrivingIntervalS(0, budget, mid)).toBe(10); // untouched budget
+    expect(pacedDrivingIntervalS(Math.round(budget * 0.45), budget, mid)).toBe(10); // on pace (ratio ≈ 1.07)
+    expect(pacedDrivingIntervalS(Math.round(budget * 0.55), budget, mid)).toBe(15); // slightly behind (≈ 0.87)
+    expect(pacedDrivingIntervalS(Math.round(budget * 0.7), budget, mid)).toBe(30); // behind (≈ 0.58)
+    expect(pacedDrivingIntervalS(Math.round(budget * 0.9), budget, mid)).toBe(60); // nearly spent (≈ 0.19)
+  });
+
+  it("end-of-month leftover budget re-opens the burst", () => {
+    const endOfMonth = new Date(Date.UTC(2026, 6, 30, 12));
+    expect(pacedDrivingIntervalS(4_000_000, 9_000_000, endOfMonth)).toBe(10);
+  });
+
+  it("charging cadence follows the same pace signal", () => {
+    expect(pacedChargingIntervalS(0, 9_000_000, mid)).toBe(60);
+    expect(pacedChargingIntervalS(8_500_000, 9_000_000, mid)).toBe(150);
   });
 });

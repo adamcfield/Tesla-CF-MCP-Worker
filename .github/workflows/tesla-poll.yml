@@ -6,15 +6,25 @@
 # this does the same, using free GitHub Actions compute (this repo is public,
 # so Actions minutes are unlimited). Each run loops for ~4.5 minutes calling
 # the worker's /poll/now, which does ONE billed vehicle_data read when the car
-# is online and returns how long to wait before the next poll:
-#   driving  -> ~10s   charging -> ~30s   idle-online -> ~60s
-#   asleep/offline/suspended -> the loop exits (no billed reads; never wakes
-#   the car), and the next scheduled run picks back up.
+# is online and returns how long to wait before the next poll. The cadence is
+# BUDGET-PACED by the worker (see budget.ts pacedDrivingIntervalS):
+#   driving  -> 10s when at/ahead of the monthly budget pace, decaying
+#               15s -> 30s -> 60s as the month's budget tightens
+#   charging -> 60s when ahead of pace, else 150s
+#   idle-online -> ~90s; asleep/offline/suspended -> the loop exits (no billed
+#   reads; never wakes the car), and the next scheduled run picks back up.
 #
-# Cost: billed Tesla reads happen ONLY while the car is online. An hour of
-# driving is a few hundred reads (~$0.12-equivalent); parked/asleep is free.
-# For lower cost at full fidelity, switch to Fleet Telemetry streaming later
-# (~18x cheaper) — the worker's /ingest path already supports it.
+# Cost: billed Tesla reads happen ONLY while the car is online. The worker's
+# spend governor stops automated polling at $9/month, under Tesla's $10
+# free-credit hard-stop — with no payment method on file, exceeding the credit
+# disables the app, it can never bill. So the pacing spends the free credit
+# for maximum fidelity while the $0 guarantee stays structural.
+#
+# FAIL-LOUD: a persistently broken worker (401/500/DNS) makes this run exit
+# non-zero after 3 consecutive failed calls, so GitHub emails the owner
+# instead of green runs silently recording nothing. The worker-side watchdog
+# (rules.ts pollWatchdog) covers the complementary failure: this workflow not
+# running at all.
 #
 # Requires the MCP_AUTH_TOKEN repo secret (already set) and the VIN below.
 
@@ -45,10 +55,35 @@ jobs:
           # concurrency group prevents two loops overlapping.
           DEADLINE=$(( $(date +%s) + 270 ))
           idle_polls=0
+          consecutive_errors=0
           while [ "$(date +%s)" -lt "$DEADLINE" ]; do
             RESP=$(curl -sS --max-time 30 \
               -H "Authorization: Bearer ${{ secrets.MCP_AUTH_TOKEN }}" \
-              "$WORKER/poll/now?vin=$VIN" || echo '{}')
+              "$WORKER/poll/now?vin=$VIN" || echo '')
+
+            # Fail-loud accounting: an empty body, unparsable JSON, or an
+            # {"error": ...} body counts as a failed call. Three in a row and
+            # the run exits red — a dead worker must not look like a sleeping car.
+            if OK=$(echo "$RESP" | python3 -c "
+          import sys, json
+          try:
+              body = json.load(sys.stdin)
+          except Exception:
+              sys.exit(1)
+          sys.exit(1 if (not body or body.get('error')) else 0)
+          " 2>/dev/null); then
+              consecutive_errors=0
+            else
+              consecutive_errors=$((consecutive_errors + 1))
+              echo "::warning::poll call failed ($consecutive_errors consecutive): ${RESP:0:200}"
+              if [ "$consecutive_errors" -ge 3 ]; then
+                echo "::error::3 consecutive /poll/now failures — worker or token is broken"
+                exit 1
+              fi
+              sleep 20
+              continue
+            fi
+
             STATE=$(echo "$RESP"  | python3 -c "import sys,json;print(json.load(sys.stdin).get('state','?'))" 2>/dev/null || echo '?')
             ACT=$(echo "$RESP"    | python3 -c "import sys,json;print(json.load(sys.stdin).get('activity','?'))" 2>/dev/null || echo '?')
             ACTIVE=$(echo "$RESP" | python3 -c "import sys,json;print(json.load(sys.stdin).get('active',False))" 2>/dev/null || echo 'False')
@@ -64,10 +99,11 @@ jobs:
               idle_polls=0
             fi
 
-            # Don't oversleep past the deadline.
+            # Don't oversleep past the deadline; keep bursts honest at 10s.
             NOW=$(date +%s)
             REMAIN=$(( DEADLINE - NOW ))
             [ "$REMAIN" -le 0 ] && break
+            [ "$IVAL" -lt 5 ] && IVAL=5
             [ "$IVAL" -gt "$REMAIN" ] && IVAL=$REMAIN
             sleep "$IVAL"
           done

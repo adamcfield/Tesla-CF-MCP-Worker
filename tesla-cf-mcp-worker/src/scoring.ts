@@ -22,6 +22,12 @@ export interface BehaviorSample {
 export interface BehaviorMetrics {
   max_accel_ms2: number | null;
   max_decel_ms2: number | null; // positive magnitude
+  /**
+   * Peak |Δaccel/Δt| (m/s³) across consecutive sample pairs — a smoothness
+   * signal that carries information even at coarse cadence where discrete
+   * harsh-event counts are floored (jerk integrates style across the window).
+   */
+  max_jerk_ms3: number | null;
   harsh_accel_count: number;
   harsh_brake_count: number;
   harsh_turn_count: number;
@@ -58,7 +64,7 @@ export function scoreDrive(
   opts: { distanceKm?: number | null; tzOffsetMin?: number } = {},
 ): BehaviorMetrics {
   const empty: BehaviorMetrics = {
-    max_accel_ms2: null, max_decel_ms2: null,
+    max_accel_ms2: null, max_decel_ms2: null, max_jerk_ms3: null,
     harsh_accel_count: 0, harsh_brake_count: 0, harsh_turn_count: 0,
     over_limit_frac: null, night_frac: null, behavior_score: null,
     samples_per_km: null, usable_pairs: 0,
@@ -66,8 +72,10 @@ export function scoreDrive(
   const pts = samples.filter((s) => typeof s.speed === "number").sort((a, b) => a.ts - b.ts);
   if (pts.length < 2) return empty;
 
-  let maxAccel = 0, maxDecel = 0, harshAccel = 0, harshBrake = 0, harshTurn = 0;
+  let maxAccel = 0, maxDecel = 0, maxJerk = 0, harshAccel = 0, harshBrake = 0, harshTurn = 0;
   let overCount = 0, speedCount = 0, usable = 0;
+  let prevAccel: number | null = null;
+  let prevPairEndTs: number | null = null;
   const tz = opts.tzOffsetMin ?? 0;
 
   for (const p of pts) {
@@ -78,9 +86,19 @@ export function scoreDrive(
   for (let i = 1; i < pts.length; i++) {
     const a = pts[i - 1]!, b = pts[i]!;
     const dt = b.ts - a.ts;
-    if (dt <= 0 || dt > MAX_GAP_S) continue;
+    if (dt <= 0 || dt > MAX_GAP_S) {
+      prevAccel = null; // don't compute jerk across a gap
+      continue;
+    }
     usable++;
     const accel = ((b.speed as number) - (a.speed as number)) * KMH_TO_MS / dt; // m/s²
+    // Jerk (third difference): rate of accel change between consecutive pairs.
+    if (prevAccel !== null && prevPairEndTs === a.ts) {
+      const jerk = Math.abs(accel - prevAccel) / dt;
+      if (jerk > maxJerk) maxJerk = jerk;
+    }
+    prevAccel = accel;
+    prevPairEndTs = b.ts;
     if (accel > 0) {
       if (accel > maxAccel) maxAccel = accel;
       if (accel >= HARSH_ACCEL) harshAccel++;
@@ -120,6 +138,7 @@ export function scoreDrive(
   return {
     max_accel_ms2: round(maxAccel, 2),
     max_decel_ms2: round(maxDecel, 2),
+    max_jerk_ms3: maxJerk > 0 ? round(maxJerk, 3) : null,
     harsh_accel_count: harshAccel,
     harsh_brake_count: harshBrake,
     harsh_turn_count: harshTurn,

@@ -1,11 +1,19 @@
-# Automation-engine tick for tesla-cf-mcp-worker.
+# Automation-engine tick + pipeline watchdog for tesla-cf-mcp-worker.
 #
 # The Cloudflare account is at the free plan's 5-cron-trigger limit (all slots
 # held by other workers), so the worker's own `*/15 * * * *` schedule cannot
 # register. This workflow provides the tick instead: it calls the
 # run_automations_now MCP tool, which executes the identical runCronTick()
-# code path. The worker's KV tick-lock dedupes any overlap with a real cron
+# code path. The worker's tick-lock dedupes any overlap with a real cron
 # if a slot ever frees up, so both can safely coexist.
+#
+# WATCHDOG: the final step reads /health and fails the run RED if the poll
+# pipeline looks dead — poll_age_s > 2h on any vehicle (pollOnce stamps
+# poll_ok_ts on EVERY cycle, even free connectivity-only ones, so a stale
+# stamp means the tesla-poll loop itself stopped: disabled workflow, revoked
+# token, outage — independent of whether the car is asleep). GitHub emails
+# the owner on scheduled-workflow failures, closing the "polling silently
+# died for days" gap that has already happened once.
 #
 # GitHub cron is best-effort (runs can lag by a few minutes under load) —
 # acceptable for 15-minute automation granularity.
@@ -54,4 +62,36 @@ jobs:
           body = json.load(sys.stdin)
           if body.get("error") or body.get("result", {}).get("isError"):
               sys.exit(1)
+          '
+      - name: Poll-pipeline watchdog (dead-man's switch)
+        run: |
+          set -uo pipefail
+          # --max-time only; a curl failure yields an empty body which the
+          # parser tolerates (exit 0) rather than crying wolf with a red run.
+          HEALTH=$(curl -sS --max-time 60 \
+            -H "Authorization: Bearer ${{ secrets.MCP_AUTH_TOKEN }}" \
+            "https://tesla-cf-mcp-worker.adamcfield.workers.dev/health" || echo '')
+          echo "$HEALTH" | python3 -c '
+          import json, sys
+          raw = sys.stdin.read().strip()
+          if not raw:
+              print("empty /health response (transient) — skipping watchdog")
+              sys.exit(0)
+          try:
+              body = json.loads(raw)
+          except Exception:
+              print("unparseable /health response (transient) — skipping watchdog")
+              sys.exit(0)
+          vehicles = body.get("vehicles")
+          if not isinstance(vehicles, list) or not vehicles:
+              print("no vehicle liveness data yet — skipping watchdog")
+              sys.exit(0)
+          STALE_S = 2 * 3600
+          dead = [v for v in vehicles
+                  if isinstance(v.get("poll_age_s"), (int, float)) and v["poll_age_s"] > STALE_S]
+          for v in dead:
+              suf = v.get("vin_suffix")
+              mins = v["poll_age_s"] / 60
+              print(f"::error::polling DEAD for …{suf}: last /poll/now {mins:.0f} min ago")
+          sys.exit(1 if dead else 0)
           '

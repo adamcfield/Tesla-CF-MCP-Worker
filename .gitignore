@@ -1,0 +1,11 @@
+# Local tooling / build artifacts — never committed
+.claude/
+.playwright-mcp/
+.wrangler/
+**/.wrangler/
+node_modules/
+**/node_modules/
+*.log
+tsc*.log
+# Design source (large binary, kept locally only)
+TeslaMate UI redesign.zip

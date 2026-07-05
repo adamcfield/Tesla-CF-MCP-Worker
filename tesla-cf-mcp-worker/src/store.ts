@@ -182,8 +182,10 @@ export async function ensureSchema(env: Env): Promise<void> {
     start_address: "TEXT", // reverse-geocoded place label (geofence name wins if matched)
     end_address: "TEXT",
     driver: "TEXT", // assigned driver label (manual/assisted tagging)
+    suggested_driver: "TEXT", // auto-suggested from geofence + time-of-day history
     max_accel_ms2: "REAL", // peak longitudinal acceleration, m/s^2
     max_decel_ms2: "REAL", // peak deceleration (braking), m/s^2 (positive magnitude)
+    max_jerk_ms3: "REAL", // peak |Δaccel/Δt| — smoothness signal usable even at coarse cadence
     harsh_accel_count: "INTEGER",
     harsh_brake_count: "INTEGER",
     harsh_turn_count: "INTEGER", // heading-change spikes at speed
@@ -192,7 +194,47 @@ export async function ensureSchema(env: Env): Promise<void> {
     behavior_score: "REAL", // 0-100 composite (100 = safest)
   });
 
+  // Small key/value app state in D1 (latest-state doc, poll state, stamps).
+  // Lives here rather than KV because these are HOT-PATH writes (every poll):
+  // Cloudflare's free tier caps KV at 1,000 writes/day but D1 at 100k/day —
+  // burst polling at 10s would blow the KV cap in a single driving hour.
+  await env.DB.prepare(
+    `CREATE TABLE IF NOT EXISTS app_state (
+       key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at INTEGER NOT NULL
+     )`,
+  ).run();
+
+  // Forward-geocode cache (GovMap/Nominatim search results by normalized query).
+  await env.DB.prepare(
+    `CREATE TABLE IF NOT EXISTS fwd_geocode_cache (
+       q_norm TEXT NOT NULL, lang TEXT NOT NULL, results TEXT NOT NULL,
+       created_ts INTEGER NOT NULL, PRIMARY KEY (q_norm, lang)
+     )`,
+  ).run();
+
   schemaReady = true;
+}
+
+// ---------------------------------------------------------------------------
+// app_state (D1 key/value) — hot-path state that must not burn KV writes
+// ---------------------------------------------------------------------------
+
+export async function getAppState(env: Env, key: string): Promise<string | null> {
+  await ensureSchema(env);
+  const row = await env.DB.prepare(`SELECT value FROM app_state WHERE key = ?1`)
+    .bind(key)
+    .first<{ value: string }>();
+  return row?.value ?? null;
+}
+
+export async function putAppState(env: Env, key: string, value: string): Promise<void> {
+  await ensureSchema(env);
+  await env.DB.prepare(
+    `INSERT INTO app_state (key, value, updated_at) VALUES (?1, ?2, ?3)
+     ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`,
+  )
+    .bind(key, value, Math.floor(Date.now() / 1000))
+    .run();
 }
 
 /** Adds any of `columns` not already present on `table` (nullable, no default). */
@@ -221,12 +263,25 @@ async function addMissingColumns(
 }
 
 // ---------------------------------------------------------------------------
-// Latest state (KV)
+// Latest state (D1 app_state, was KV)
+//
+// Moved out of KV because the doc is rewritten on EVERY ingest — at burst
+// cadence that alone would exhaust the KV free tier's 1,000 writes/day. A
+// one-time KV fallback read migrates the existing doc transparently.
 // ---------------------------------------------------------------------------
 
 const latestKey = (vin: string) => `latest:${vin}`;
 
 export async function getLatest(env: Env, vin: string): Promise<LatestState | null> {
+  const d1 = await getAppState(env, latestKey(vin));
+  if (d1) {
+    try {
+      return JSON.parse(d1) as LatestState;
+    } catch {
+      /* fall through to KV */
+    }
+  }
+  // Migration path: docs written by pre-D1 deployments still live in KV.
   return env.TESLA_KV.get<LatestState>(latestKey(vin), "json");
 }
 
@@ -238,7 +293,7 @@ export async function mergeLatest(
 ): Promise<{ previous: LatestState | null; current: LatestState }> {
   const previous = await getLatest(env, vin);
   const current: LatestState = { ...(previous ?? {}), ...patch, vin, updated_at: ts };
-  await env.TESLA_KV.put(latestKey(vin), JSON.stringify(current));
+  await putAppState(env, latestKey(vin), JSON.stringify(current));
   return { previous, current };
 }
 
@@ -438,6 +493,26 @@ export async function listAlerts(env: Env, vin: string | undefined, limit = 50):
 
 export function num(v: unknown): number | null {
   return typeof v === "number" && Number.isFinite(v) ? v : null;
+}
+
+/**
+ * UTC offset in minutes for an IANA zone at a given instant — DST-aware, no
+ * dependency (Workers ship full ICU). Returns null for an invalid zone.
+ * E.g. tzOffsetMinutes("Asia/Jerusalem", ...) → 120 in winter, 180 in summer.
+ */
+export function tzOffsetMinutes(ianaZone: string, epochMs = Date.now()): number | null {
+  try {
+    const fmt = new Intl.DateTimeFormat("en-US", { timeZone: ianaZone, timeZoneName: "shortOffset" });
+    const part = fmt.formatToParts(epochMs).find((p) => p.type === "timeZoneName")?.value ?? "";
+    // "GMT+3", "GMT-4:30", or plain "GMT" (UTC).
+    const m = /^GMT(?:([+-])(\d{1,2})(?::(\d{2}))?)?$/.exec(part);
+    if (!m) return null;
+    if (!m[1]) return 0;
+    const sign = m[1] === "-" ? -1 : 1;
+    return sign * (Number(m[2]) * 60 + Number(m[3] ?? 0));
+  } catch {
+    return null;
+  }
 }
 
 /** Great-circle distance in metres between two lat/lon points. */

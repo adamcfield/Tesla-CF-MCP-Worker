@@ -11,15 +11,21 @@
  * Gated by INGEST_TOKEN (falls back to MCP_AUTH_TOKEN):
  *   POST /ingest/telemetry        — telemetry sink (fleet-telemetry bridge, webhooks)
  *
- * Gated by MCP_AUTH_TOKEN (Authorization header, or ?token= for the /data
- * endpoints so header-less consumers like OBS browser sources work):
- *   POST /mcp                     — MCP streamable HTTP endpoint
- *   GET  /data/latest?vin=        — latest state JSON (Grafana/HA/OBS)
- *   GET  /data/series?vin=&field=&hours=
- *   GET  /data/charge-sessions?vin=
+ * Token-gated, TWO SCOPES resolved server-side (auth.ts requestScope):
+ *   read  — per-device tokens minted at /auth/device-token: all /data/*
+ *           routes + exports + /geocode + read-only MCP tools ONLY.
+ *   full  — MCP_AUTH_TOKEN / OAuth-shim tokens: everything (commands,
+ *           /poll/now, /setup/*, device-token management).
+ * Bearer header, or ?token= for header-less consumers (OBS/Grafana/links).
+ *
+ *   POST /mcp                     — MCP streamable HTTP endpoint (scope-aware)
+ *   GET  /data/*                  — read APIs (see handleData)
+ *   GET  /data/export/{drives.csv,charges.csv,drive.gpx}
+ *   GET  /geocode?q=              — GovMap→Nominatim forward geocode
+ *   POST /auth/device-token?label=&vin=   (full) — mint revocable read token
+ *   GET  /auth/device-token / POST /auth/revoke-device-token?id=  (full)
  *   GET  /auth/login?key=…        — start Tesla owner OAuth grant
- *   POST /setup/register-partner  — one-time partner endpoint registration
- *   GET  /setup/partner-public-key
+ *   POST /setup/*                 (full) — partner registration, backfills
  *
  * Cron (wrangler.toml [triggers]): automation engine tick — see rules.ts.
  */
@@ -32,21 +38,25 @@ import {
   handleOauthToken,
   handlePartnerPublicKey,
   handleRegisterPartner,
-  isMcpAuthorized,
+  listDeviceTokens,
+  mintDeviceToken,
   oauthProtectedResourceMetadata,
   oauthServerMetadata,
   ownerGrantPresent,
+  requestScope,
+  revokeDeviceToken,
   timingSafeEqual,
   unauthorized,
 } from "./auth";
 import { getBudgetStatus } from "./budget";
-import { handleGeocode, handleGovTile } from "./govmap";
+import { exportChargesCsv, exportDriveGpx, exportDrivesCsv } from "./export";
+import { handleGeocode, handleGovTile, probeGovmap } from "./govmap";
 import { handleIngest } from "./ingest";
 import { handleMcp, SERVER_VERSION } from "./mcp";
 import { pollOnce } from "./poll";
 import { loadCommandKey } from "./protocol";
 import { runCronTick } from "./rules";
-import { getLatest, querySeries } from "./store";
+import { getAppState, getLatest, querySeries } from "./store";
 import {
   backfillChargeHistory,
   backfillDriveAddresses,
@@ -56,8 +66,12 @@ import {
   getDrive,
   getDriverScores,
   getDrives,
+  getEfficiencyByTemp,
   getLocationStats,
+  getMonthlyReport,
   getStateTimeline,
+  getSuggestedLocations,
+  getTirePressures,
   getTrackingSummary,
   getVampireDrain,
   listLocations,
@@ -120,30 +134,51 @@ async function handleHealth(request: Request, url: URL, env: Env): Promise<Respo
     body.ok = false;
   }
 
-  if (tokenAuthorized(request, url, env.MCP_AUTH_TOKEN)) {
+  if ((await requestScope(request, url, env)) !== null) {
     body.owner_grant = (await ownerGrantPresent(env).catch(() => false)) ? "present" : "missing";
     body.budget = await getBudgetStatus(env).catch(() => "unavailable");
+    const now = Math.floor(Date.now() / 1000);
+    // Cheap, always-on: per-vehicle liveness (indexed MAX(ts) + one app_state
+    // read) — this is what the 15-min watchdog polls, so it must stay light.
     try {
       const rs = await env.DB.prepare(
         `SELECT vin, MAX(ts) AS last_ts FROM positions GROUP BY vin`,
       ).all<{ vin: string; last_ts: number }>();
-      const now = Math.floor(Date.now() / 1000);
-      body.vehicles = (rs.results ?? []).map((r) => ({
-        vin_suffix: r.vin.slice(-6),
-        last_sample_age_s: now - r.last_ts,
-      }));
+      body.vehicles = await Promise.all(
+        (rs.results ?? []).map(async (r) => {
+          // poll_ok_ts is stamped on EVERY pollOnce (even free cycles): its age
+          // is the pipeline-liveness signal the tick watchdog alerts on —
+          // independent of whether the car is asleep.
+          const pollOk = Number((await getAppState(env, `poll_ok_ts:${r.vin}`).catch(() => "0")) ?? "0");
+          return {
+            vin_suffix: r.vin.slice(-6),
+            last_sample_age_s: now - r.last_ts,
+            poll_age_s: pollOk > 0 ? now - pollOk : null,
+          };
+        }),
+      );
     } catch {
       body.vehicles = "unavailable";
     }
+    // Expensive diagnostics ONLY on explicit ?diag=1 — full-table COUNT(*)
+    // scans and an external GovMap probe are too costly to run on every
+    // 15-min watchdog call (COUNT(*) can't use an index; at scale it would
+    // eat the D1 free-tier daily rows-read budget).
+    if (url.searchParams.get("diag") === "1") {
+      try {
+        const counts: Record<string, number> = {};
+        for (const table of ["positions", "telemetry_events", "drives", "charge_sessions", "charges"]) {
+          const row = await env.DB.prepare(`SELECT COUNT(*) AS n FROM ${table}`).first<{ n: number }>();
+          counts[table] = row?.n ?? 0;
+        }
+        body.d1_rows = counts;
+      } catch {
+        body.d1_rows = "unavailable";
+      }
+      body.govmap = await probeGovmap().catch(() => "unavailable");
+    }
   }
   return json(body, body.ok ? 200 : 503);
-}
-
-/** Bearer header or ?token= query param (documented tradeoff for OBS/Grafana). */
-function tokenAuthorized(request: Request, url: URL, expected: string): boolean {
-  const header = request.headers.get("authorization")?.match(/^Bearer\s+(.+)$/i)?.[1]?.trim();
-  const candidate = header ?? url.searchParams.get("token") ?? "";
-  return candidate.length > 0 && timingSafeEqual(candidate, expected);
 }
 
 /**
@@ -221,6 +256,14 @@ async function handleData(url: URL, env: Env): Promise<Response> {
       return json(await getVampireDrain(env, vin, numParam("days", 30)));
     case "/data/states":
       return json(await getStateTimeline(env, vin, numParam("hours", 168)));
+    case "/data/efficiency-by-temp":
+      return json(await getEfficiencyByTemp(env, vin));
+    case "/data/tires":
+      return json(await getTirePressures(env, vin, numParam("days", 30)));
+    case "/data/monthly":
+      return json(await getMonthlyReport(env, vin, numParam("months", 12)));
+    case "/data/suggested-locations":
+      return json(await getSuggestedLocations(env, vin));
     default:
       return json({ error: "not found" }, 404);
   }
@@ -258,13 +301,6 @@ export default {
       if (path.startsWith("/govtiles/")) {
         return handleGovTile(path.split("/").filter(Boolean));
       }
-      // --- Forward geocode (address → coords), GovMap with Nominatim fallback.
-      if (path === "/geocode") {
-        const q = url.searchParams.get("q")?.trim();
-        if (!q) return json({ error: "q query param required" }, 400);
-        const results = await handleGeocode(q, url.searchParams.get("lang") ?? "he");
-        return json({ query: q, results });
-      }
 
       if (path === "/" || path === "") {
         return new Response(
@@ -276,32 +312,100 @@ export default {
 
       // --- telemetry sink (separate token so bridges don't hold MCP access)
       if (path === "/ingest/telemetry" && request.method === "POST") {
-        if (!tokenAuthorized(request, url, env.INGEST_TOKEN ?? env.MCP_AUTH_TOKEN)) {
-          return json({ error: "unauthorized" }, 401);
-        }
+        const header = request.headers.get("authorization")?.match(/^Bearer\s+(.+)$/i)?.[1]?.trim();
+        const candidate = header ?? url.searchParams.get("token") ?? "";
+        const ingestOk =
+          (env.INGEST_TOKEN && candidate.length > 0 && timingSafeEqual(candidate, env.INGEST_TOKEN)) ||
+          (await requestScope(request, url, env)) === "full";
+        if (!ingestOk) return json({ error: "unauthorized" }, 401);
         return handleIngest(request, env);
       }
 
-      // --- driver assignment (benign metadata write; token-gated for the dashboard)
+      // Everything below requires a token. Resolve its scope ONCE.
+      const scope = await requestScope(request, url, env);
+
+      // --- Forward geocode (address → coords), GovMap with Nominatim fallback.
+      // Token-gated (read suffices): an open proxy here could get the shared
+      // Nominatim UA banned — which would silently break drive place names.
+      if (path === "/geocode") {
+        if (scope === null) return json({ error: "unauthorized" }, 401);
+        const q = url.searchParams.get("q")?.trim().slice(0, 120);
+        if (!q) return json({ error: "q query param required" }, 400);
+        const results = await handleGeocode(env, q, url.searchParams.get("lang") ?? "he");
+        return json({ query: q, results });
+      }
+
+      // --- driver assignment (benign metadata write; read scope suffices —
+      // it's the dashboard's one write and can't touch the vehicle)
       if (path === "/data/assign-driver" && request.method === "POST") {
-        if (!tokenAuthorized(request, url, env.MCP_AUTH_TOKEN)) return json({ error: "unauthorized" }, 401);
+        if (scope === null) return json({ error: "unauthorized" }, 401);
         const id = Number(url.searchParams.get("id"));
         if (!Number.isFinite(id)) return json({ error: "id query param required" }, 400);
         return json(await setDriveDriver(env, id, url.searchParams.get("driver")));
       }
 
-      // --- read-only data endpoints (header or ?token=) ------------------
+      // --- data exports (CSV/GPX downloads; read scope) -------------------
+      if (path.startsWith("/data/export/")) {
+        if (scope === null) return json({ error: "unauthorized" }, 401);
+        if (path === "/data/export/drives.csv") {
+          const vin = url.searchParams.get("vin");
+          if (!vin) return json({ error: "vin query param required" }, 400);
+          return exportDrivesCsv(env, vin);
+        }
+        if (path === "/data/export/charges.csv") {
+          const vin = url.searchParams.get("vin");
+          if (!vin) return json({ error: "vin query param required" }, 400);
+          return exportChargesCsv(env, vin);
+        }
+        if (path === "/data/export/drive.gpx") {
+          const id = Number(url.searchParams.get("id"));
+          if (!Number.isFinite(id) || id <= 0) return json({ error: "id query param required" }, 400);
+          return exportDriveGpx(env, id);
+        }
+        return json({ error: "not found" }, 404);
+      }
+
+      // --- read-only data endpoints (header or ?token=; read scope) ------
       if (path.startsWith("/data/")) {
-        if (!tokenAuthorized(request, url, env.MCP_AUTH_TOKEN)) return json({ error: "unauthorized" }, 401);
+        if (scope === null) return json({ error: "unauthorized" }, 401);
         return handleData(url, env);
       }
 
-      // --- gated --------------------------------------------------------
-      if (!(await isMcpAuthorized(request, env))) {
+      // --- device-token management (FULL scope only) ----------------------
+      // POST /auth/device-token?label=phone → mints a revocable READ token +
+      // a ready-to-save dashboard link. GET lists; POST /auth/revoke-device-token?id=…
+      if (path === "/auth/device-token" && request.method === "POST") {
+        if (scope !== "full") return json({ error: "full-access token required" }, scope ? 403 : 401);
+        const minted = await mintDeviceToken(env, url.searchParams.get("label") ?? "device");
+        const vin = url.searchParams.get("vin");
+        return json({
+          ...minted,
+          scope: "read",
+          note: "Store this token now — only its hash is kept server-side. Revoke anytime with POST /auth/revoke-device-token?id=" + minted.id,
+          dashboard_link: `https://tesla-dashboard-1ps.pages.dev/?token=${minted.token}${vin ? `&vin=${vin}` : ""}`,
+        });
+      }
+      if (path === "/auth/device-token" && request.method === "GET") {
+        if (scope !== "full") return json({ error: "full-access token required" }, scope ? 403 : 401);
+        return json({ tokens: await listDeviceTokens(env) });
+      }
+      if (path === "/auth/revoke-device-token" && request.method === "POST") {
+        if (scope !== "full") return json({ error: "full-access token required" }, scope ? 403 : 401);
+        const id = url.searchParams.get("id") ?? "";
+        const revoked = await revokeDeviceToken(env, id.toLowerCase());
+        return json({ revoked });
+      }
+
+      // --- gated (MCP: read tokens see/call only read tools) --------------
+      if (scope === null) {
         return path === "/mcp" ? withCors(unauthorized(env)) : unauthorized(env);
       }
 
-      if (path === "/mcp") return withCors(await handleMcp(request, env));
+      if (path === "/mcp") return withCors(await handleMcp(request, env, scope));
+
+      // Everything past here mutates worker/Tesla state — full scope only.
+      if (scope !== "full") return json({ error: "full-access token required" }, 403);
+
       if (path === "/poll/now") {
         const pollVin = url.searchParams.get("vin");
         if (!pollVin) return json({ error: "vin query param required" }, 400);

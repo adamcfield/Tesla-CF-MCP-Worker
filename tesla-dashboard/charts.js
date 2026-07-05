@@ -54,6 +54,12 @@ export function svgLineChart({ width = 760, height = 210, series, yTicks = [], x
         out += `<polygon points="${areaPts}" style="fill:color-mix(in oklab, ${color} 9%, transparent);"></polygon>`;
       }
       out += `<polyline points="${pts}" style="fill:none; stroke:${color}; stroke-width:${s.width || 2}; stroke-linejoin:round; stroke-linecap:round;${s.dashed ? " stroke-dasharray:5 4;" : ""}"></polyline>`;
+      if (s.markers) {
+        // Point markers (scatter-over-line), with optional per-point hover titles.
+        out += s.points
+          .map((p, i) => `<circle cx="${sc.X(p[0])}" cy="${sc.Y(p[1])}" r="3.5" style="fill:${color}; stroke:var(--card); stroke-width:1.5;">${s.titles?.[i] ? `<title>${esc(s.titles[i])}</title>` : ""}</circle>`)
+          .join("");
+      }
       return out;
     })
     .join("");

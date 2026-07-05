@@ -23,30 +23,83 @@ Both use the same `MCP_AUTH_TOKEN` you already generated for the worker.
 ## Layout
 
 ```
-index.html   shell + login gate
-styles.css   design tokens + component classes (ported from the design mockup)
-api.js       fetch layer + token storage + the read-only tool allowlist
-charts.js    dependency-free SVG line/bar/donut chart builders
-map.js       Leaflet wrapper (OSM tiles, no API key) for location/route/lifetime maps
-app.js       router, per-screen data loading + rendering, all 9 screens
+index.html            shell + login gate + PWA meta
+styles.css            design tokens + component classes (ported from the design mockup)
+api.js                fetch layer + token storage + read-only tool allowlist + export-URL helper
+charts.js             dependency-free SVG line/bar/donut chart builders
+map.js                Leaflet wrapper (GovMap/OSM/CARTO basemaps) + drive replay animation
+app.js                router, per-screen data loading + rendering
+manifest.webmanifest  PWA manifest (installable, standalone display)
+sw.js                 service worker: cache-first app shell, network-only for all API data
+icons/                generated PNG app icons (192/512 maskable + apple-touch 180)
 ```
 
 ## Screens
 
 Overview, Timeline, Statistics, Drives (list + detail with route map + speed
-chart), Lifetime map, Charges (list + detail with charge curve), Charging
-stats, Battery health, Vampire drain — matching the "TeslaMate UI redesign"
-mockup's layout and color system, but reading real data instead of sample
-numbers. Screens show an honest empty state (not fabricated numbers) when the
-backing D1 tables have nothing yet — this happens today because no Fleet
-Telemetry stream or `run_automations_now`-driven poll has been wired up on
-the worker side, so `drives`/`charge_sessions`/`positions` are still empty.
+chart), Drivers, Places, Lifetime map, Charges (list + detail with charge
+curve), Charging stats, Battery health, Vampire drain — matching the
+"TeslaMate UI redesign" mockup's layout and color system, but reading real
+data instead of sample numbers. Screens show an honest empty state (not
+fabricated numbers) when the backing D1 tables have nothing yet, and degrade
+gracefully when a newer `/data/*` endpoint hasn't been deployed on the worker
+side.
+
+Feature highlights:
+
+- **Overview** — battery/range/climate, current-location map, TPMS card
+  (per-wheel bar pressure, amber when a wheel deviates >0.3 bar from the
+  median or trends down >0.15 bar/week), API-spend governor card.
+- **Drives** — time + per-driver filter chips, a Driver column with inline
+  assignment (click a cell; suggested drivers show as *muted italics?* until
+  confirmed), CSV export, and a per-drive detail with route map, **replay**
+  (▶ animates the drive along its GPS path, timestamps compressed to ~20 s)
+  and GPX export.
+- **Places** — saved geofence locations with per-location stats (drives
+  from/to, charge sessions, kWh, cost) plus visit-based "suggested places".
+  Locations are written via the worker's `set_location` MCP tool; this UI is
+  read-only.
+- **Statistics** — 12-month totals, monthly distance chart, efficiency vs
+  outside temperature (5 °C bins), and a server-computed monthly report
+  (drives, distance, energy, Wh/km, charged kWh, AC/DC, cost, cost/100 km)
+  when the worker exposes `/data/monthly`.
+- **Charges** — list + charge-curve detail, CSV export.
+- **Vampire drain** — blended standby loss plus an asleep vs awake-idle
+  split when the worker provides the breakdown.
+- **Dark mode** — the whole UI has a dark theme; maps switch to the CARTO
+  dark-matter basemap automatically (GovMap streets/aerial + OSM stay
+  available in the layer switcher).
+- **Refresh-in-place** — first visit shows a shimmer skeleton; refreshes keep
+  the current content visible until fresh data lands (no blank flash).
 
 The Overview screen's live battery/climate/lock readouts come from an
 **on-demand** `get_vehicle_data` call (a "Load live data" button) rather than
 polling automatically — this matches the worker's own cost-hygiene rule
 (never auto-poll, never auto-wake) and keeps this dashboard from silently
 racking up billed Tesla API calls.
+
+## PWA install
+
+The dashboard is an installable PWA. On iOS Safari: Share → **Add to Home
+Screen**. On Android Chrome / desktop Chrome: the install prompt in the
+address bar (or ⋮ → *Install app*). It opens standalone (no browser chrome)
+with the blue "T" icon.
+
+`sw.js` caches only the app shell (HTML/JS/CSS, manifest, icons, Leaflet)
+cache-first with a background revalidate. Anything under `/data/`, `/mcp`,
+`/geocode`, `/govtiles`, or any URL carrying a `token=` param is **never
+cached** — vehicle data and tokened responses always hit the network. Bump
+`CACHE_NAME` in `sw.js` when shipping shell changes; old caches are deleted
+on activate. Icons are generated programmatically (no binary assets checked
+in by hand — see the rounded-square "T" PNGs in `icons/`).
+
+## Exports
+
+- Drives list → `⬇ CSV` (`/data/export/drives.csv`)
+- Charges list → `⬇ CSV` (`/data/export/charges.csv`)
+- Drive detail → `⬇ GPX` (`/data/export/drive.gpx?id=`)
+
+All are plain token-gated GET links served by the worker.
 
 ## Running locally
 

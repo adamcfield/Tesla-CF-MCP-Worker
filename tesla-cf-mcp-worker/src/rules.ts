@@ -24,10 +24,11 @@
  */
 
 import { getVehicle, getVehicleData } from "./api";
+import { getBudgetStatus } from "./budget";
 import * as cmd from "./commands";
 import { applyVehicleData } from "./ingest";
-import { getLatest, LatestState, logAlert } from "./store";
-import { recordConnectivityState } from "./tracking";
+import { getAppState, getLatest, LatestState, logAlert, putAppState, tzOffsetMinutes } from "./store";
+import { closeStaleSessions, recordConnectivityState } from "./tracking";
 import { Env } from "./types";
 
 // ---------------------------------------------------------------------------
@@ -242,6 +243,24 @@ async function fire(
 const asNum = (v: unknown): number | undefined =>
   typeof v === "number" && Number.isFinite(v) ? v : undefined;
 
+/**
+ * DST-aware timezone offset (minutes) for a rule's time gates. Priority:
+ * rule.tz (IANA zone, e.g. "Asia/Jerusalem") → rule.tz_offset_minutes (legacy
+ * fixed offset — wrong for half the year in DST countries) → the deployment's
+ * DEFAULT_TZ zone → UTC. Computed per evaluation so a clock change never
+ * shifts "precondition at 07:00" by an hour.
+ */
+function ruleTzOffsetMin(env: Env, rule: AutomationRule): number {
+  const zone = typeof rule.tz === "string" && rule.tz ? rule.tz : null;
+  if (zone) {
+    const off = tzOffsetMinutes(zone);
+    if (off !== null) return off;
+  }
+  const fixed = asNum(rule.tz_offset_minutes);
+  if (fixed !== undefined) return fixed;
+  return tzOffsetMinutes(env.DEFAULT_TZ || "Asia/Jerusalem") ?? 0;
+}
+
 // ---------------------------------------------------------------------------
 // Ingest-path evaluation: geofences + transition alerts
 // ---------------------------------------------------------------------------
@@ -330,7 +349,7 @@ async function evalAlert(
     if (!(prevSoc > threshold && curSoc <= threshold)) return;
     const between = rule.between_hours as [number, number] | undefined;
     if (between) {
-      const tz = asNum(rule.tz_offset_minutes) ?? 0;
+      const tz = ruleTzOffsetMin(env, rule);
       const hour = Math.floor((((Date.now() / 60000 + tz) % 1440) + 1440) % 1440 / 60);
       const [start, end] = between;
       const inWindow = start <= end ? hour >= start && hour < end : hour >= start || hour < end;
@@ -380,15 +399,18 @@ async function evalAlert(
 
 export async function runCronTick(env: Env): Promise<Record<string, unknown>> {
   // Lock so the 15-min cron and an on-demand run_automations_now can't overlap
-  // and double-execute commands. KV is eventually consistent, so this dedupes
-  // the common (same-colo, seconds-apart) case rather than being a hard mutex.
+  // and double-execute commands. Lives in D1 app_state (timestamp-expiry, 120s)
+  // rather than KV: D1 is strongly consistent AND this avoids burning 2 KV
+  // writes per tick against the 1,000/day free cap.
   const LOCK_KEY = "tick_lock";
-  if (await env.TESLA_KV.get(LOCK_KEY)) return { skipped: "another automation tick is in progress" };
-  await env.TESLA_KV.put(LOCK_KEY, "1", { expirationTtl: 120 });
+  const now = Math.floor(Date.now() / 1000);
+  const held = Number((await getAppState(env, LOCK_KEY).catch(() => "0")) ?? "0");
+  if (held && now - held < 120) return { skipped: "another automation tick is in progress" };
+  await putAppState(env, LOCK_KEY, String(now));
   try {
     return await runCronTickInner(env);
   } finally {
-    await env.TESLA_KV.delete(LOCK_KEY);
+    await putAppState(env, LOCK_KEY, "0").catch(() => {});
   }
 }
 
@@ -441,20 +463,70 @@ async function runCronTickInner(env: Env): Promise<Record<string, unknown>> {
     }
   }
 
+  // Close sessions orphaned by a mid-drive/mid-charge signal loss — without
+  // this, the next sample days later becomes the "end" of a bogus mega-drive.
+  try {
+    const closed = await closeStaleSessions(env);
+    if (closed.closed_drives || closed.closed_charges) summary.stale_closed = closed;
+  } catch (e) {
+    summary.stale_close_error = e instanceof Error ? e.message : String(e);
+  }
+
+  await pollWatchdog(env, summary);
   await purgeExpiredHistory(env, summary);
   return summary;
 }
 
 /**
- * Optional raw-history retention (RETENTION_DAYS env var; unset = keep forever).
- * Only the bulky raw stores are pruned: the generic telemetry_events EAV table
- * and positions NOT attached to a drive (idle samples). Derived history —
- * drives, charge sessions + curves, state timeline — and drive-route positions
- * are never touched: they are the long-term value (degradation trends need
- * years) and grow far slower than raw samples.
+ * Dead-man's switch: pollOnce() stamps poll_ok_ts on EVERY cycle (even free
+ * connectivity-only ones), so a stale stamp means the GH-Actions poll loop
+ * itself is dead — disabled workflow, revoked token, outage — regardless of
+ * whether the car is asleep. Logged to the alert log (visible on the
+ * dashboard) at most once per 6h; the tick workflow independently turns the
+ * same signal into a red run + GitHub notification email via /health.
+ */
+async function pollWatchdog(env: Env, summary: Record<string, unknown>): Promise<void> {
+  const STALE_S = 2 * 3600;
+  const COOLDOWN_S = 6 * 3600;
+  try {
+    const rs = await env.DB.prepare(
+      `SELECT key, value FROM app_state WHERE key LIKE 'poll_ok_ts:%'`,
+    ).all<{ key: string; value: string }>();
+    const now = Math.floor(Date.now() / 1000);
+    const stale: string[] = [];
+    for (const r of rs.results ?? []) {
+      const age = now - Number(r.value);
+      if (Number.isFinite(age) && age > STALE_S) stale.push(`${r.key.slice("poll_ok_ts:".length).slice(-6)} (${Math.round(age / 60)}m)`);
+    }
+    if (!stale.length) return;
+    summary.poll_watchdog_stale = stale;
+    const last = Number((await getAppState(env, "watchdog_alert_ts")) ?? "0");
+    if (now - last < COOLDOWN_S) return;
+    await putAppState(env, "watchdog_alert_ts", String(now));
+    await logAlert(env, {
+      ruleId: "poll_watchdog",
+      kind: "watchdog",
+      message: `Polling appears DEAD (no /poll/now in >2h) for: ${stale.join(", ")} — check the tesla-poll GitHub Action`,
+      delivered: false,
+    });
+  } catch {
+    /* watchdog must never break the tick */
+  }
+}
+
+/**
+ * Raw-history retention (RETENTION_DAYS env var; default 400 days, set "0" to
+ * keep forever). Only the bulky raw stores are pruned: the generic
+ * telemetry_events EAV table and positions NOT attached to a drive (idle
+ * samples). Derived history — drives, charge sessions + curves, state
+ * timeline — and drive-route positions are never touched: they are the
+ * long-term value (degradation trends need years) and grow far slower than
+ * raw samples. The default keeps D1 well under its 5 GB free cap even at
+ * burst/streaming cadence.
  */
 async function purgeExpiredHistory(env: Env, summary: Record<string, unknown>): Promise<void> {
-  const days = Number(env.RETENTION_DAYS ?? "");
+  const raw = env.RETENTION_DAYS;
+  const days = raw === undefined || raw === "" ? 400 : Number(raw);
   if (!Number.isFinite(days) || days <= 0) return;
   const cutoff = Math.floor(Date.now() / 1000) - Math.round(days * 86400);
   try {
@@ -509,6 +581,12 @@ async function freshState(env: Env, rule: AutomationRule, online: boolean): Prom
   const staleAfter = rule.type === "log_snapshot" ? Math.max(interval, 60) : FRESH_SECONDS;
   if (age <= staleAfter) return { latest, fresh: true, polled: false };
   if (rule.allow_poll && online) {
+    // Automated polls stop at the POLL budget, not the command ceiling — the
+    // $0.70 band above it is reserved for user-initiated commands. (pollOnce
+    // already gates on poll_allowed; this closes the same gate on the cron
+    // path, which otherwise billed up to the ceiling via getVehicleData.)
+    const budget = await getBudgetStatus(env);
+    if (!budget.poll_allowed) return { latest, fresh: false, polled: false };
     const vd = await getVehicleData(env, rule.vin, ["charge_state", "climate_state", "drive_state", "location_data", "vehicle_state"]);
     return { latest: await applyVehicleData(env, rule.vin, vd), fresh: true, polled: true };
   }
@@ -683,7 +761,7 @@ async function evalScheduledPrecondition(
 ): Promise<boolean> {
   const time = String(rule.time ?? "07:00");
   const [hh, mm] = time.split(":").map(Number);
-  const tz = asNum(rule.tz_offset_minutes) ?? 0;
+  const tz = ruleTzOffsetMin(env, rule);
   const nowLocalMin = (((Date.now() / 60000 + tz) % 1440) + 1440) % 1440;
   const targetMin = (hh ?? 7) * 60 + (mm ?? 0);
   // Fire on the tick whose window [now, now+TICK) contains the target time.

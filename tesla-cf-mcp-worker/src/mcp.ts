@@ -555,14 +555,55 @@ const TOOLS: Tool[] = [
   {
     name: "get_vampire_drain",
     description:
-      "Idle/vampire drain: SoC lost while parked (awake-idle and sleep), with per-span detail and an avg %/day. " +
-      "Free — reads logged data.",
+      "Idle/vampire drain: SoC lost while parked, split ASLEEP vs AWAKE-IDLE (Sentry burns ~10x more than sleep), " +
+      "with per-span detail and avg %/day. Free — reads logged data.",
     inputSchema: {
       type: "object",
       properties: { ...vinProp, days: { type: "number", default: 30 } },
       required: ["vin"],
     },
     handler: (env, a) => tracking.getVampireDrain(env, a.vin, a.days ?? 30),
+  },
+  {
+    name: "get_monthly_report",
+    description:
+      "Monthly roll-up per calendar month (vehicle-local time): drives, distance, energy, avg Wh/km, charge " +
+      "sessions, kWh (AC/DC split), cost, and cost per 100 km. Ideal for 'summarize my June driving'. " +
+      "Free — reads logged data.",
+    inputSchema: {
+      type: "object",
+      properties: { ...vinProp, months: { type: "number", default: 12 } },
+      required: ["vin"],
+    },
+    handler: (env, a) => tracking.getMonthlyReport(env, a.vin, a.months ?? 12),
+  },
+  {
+    name: "get_efficiency_by_temp",
+    description:
+      "Wh/km bucketed by 5°C ambient-temperature bins (distance-weighted) — the cold-weather range-penalty curve. " +
+      "Free — reads logged data.",
+    inputSchema: vinSchema,
+    handler: (env, a) => tracking.getEfficiencyByTemp(env, a.vin),
+  },
+  {
+    name: "get_tire_pressures",
+    description:
+      "Per-wheel TPMS history (bar): latest reading, time series, and a bar/week trend that catches slow leaks " +
+      "weeks before the car warns. Free — reads logged data.",
+    inputSchema: {
+      type: "object",
+      properties: { ...vinProp, days: { type: "number", default: 30 } },
+      required: ["vin"],
+    },
+    handler: (env, a) => tracking.getTirePressures(env, a.vin, a.days ?? 30),
+  },
+  {
+    name: "get_suggested_locations",
+    description:
+      "Repeat-visited spots (≥3 drive endpoints) not yet inside a named location, with reverse-geocoded labels — " +
+      "candidates for set_location. Free — reads logged data.",
+    inputSchema: vinSchema,
+    handler: (env, a) => tracking.getSuggestedLocations(env, a.vin),
   },
   {
     name: "get_state_timeline",
@@ -678,6 +719,47 @@ const TOOLS: Tool[] = [
 ];
 
 // ---------------------------------------------------------------------------
+// Read-scope tool allowlist — enforced SERVER-SIDE at dispatch. A leaked
+// dashboard/viewer token can therefore never unlock, honk, wake, or touch the
+// car: "read-only" is a property of the server, not of whichever client
+// happens to be polite.
+//
+// It also can't SPEND: the billed live-read tools (get_vehicle_data /
+// get_charge_state / get_climate_state / get_location — all route to
+// api.getVehicleData → recordSpend) are deliberately EXCLUDED, so a leaked
+// read token can't burn the monthly Tesla budget. Read scope sees only free,
+// already-logged data (get_latest_state + the D1-backed derivations). The
+// full token retains live reads. nearby_charging_sites and get_telemetry_config
+// are free (no recordSpend) so they stay.
+// ---------------------------------------------------------------------------
+
+const READ_TOOLS = new Set([
+  "list_vehicles",
+  "nearby_charging_sites",
+  "get_telemetry_config",
+  "get_latest_state",
+  "get_history",
+  "list_history_fields",
+  "get_alert_log",
+  "get_tracking_summary",
+  "get_drives",
+  "get_drive",
+  "get_driver_scores",
+  "get_charge_sessions",
+  "get_charge_curve",
+  "get_battery_degradation",
+  "get_vampire_drain",
+  "get_state_timeline",
+  "get_monthly_report",
+  "get_efficiency_by_temp",
+  "get_tire_pressures",
+  "get_suggested_locations",
+  "list_locations",
+  "get_location_stats",
+  "list_automations",
+]);
+
+// ---------------------------------------------------------------------------
 // JSON-RPC plumbing
 // ---------------------------------------------------------------------------
 
@@ -693,7 +775,9 @@ type JsonRpcResponse = { jsonrpc: "2.0"; id: number | string | null } & (
   | { error: { code: number; message: string } }
 );
 
-async function dispatch(env: Env, msg: JsonRpcRequest): Promise<JsonRpcResponse | null> {
+export type McpScope = "full" | "read";
+
+async function dispatch(env: Env, msg: JsonRpcRequest, scope: McpScope): Promise<JsonRpcResponse | null> {
   const id = msg.id ?? null;
   const reply = (result: unknown): JsonRpcResponse => ({ jsonrpc: "2.0", id, result });
   const fail = (code: number, message: string): JsonRpcResponse => ({
@@ -716,13 +800,25 @@ async function dispatch(env: Env, msg: JsonRpcRequest): Promise<JsonRpcResponse 
     }
     case "ping":
       return reply({});
-    case "tools/list":
+    case "tools/list": {
+      const visible = scope === "read" ? TOOLS.filter((t) => READ_TOOLS.has(t.name)) : TOOLS;
       return reply({
-        tools: TOOLS.map(({ name, description, inputSchema }) => ({ name, description, inputSchema })),
+        tools: visible.map(({ name, description, inputSchema }) => ({ name, description, inputSchema })),
       });
+    }
     case "tools/call": {
       const tool = TOOLS.find((t) => t.name === msg.params?.name);
       if (!tool) return fail(-32602, `Unknown tool: ${msg.params?.name}`);
+      if (scope === "read" && !READ_TOOLS.has(tool.name)) {
+        return reply({
+          content: [{
+            type: "text",
+            text: `Error: this token is READ-ONLY — "${tool.name}" requires the full-access token. ` +
+              "Read tokens can view data but never send commands, wake the car, or change configuration.",
+          }],
+          isError: true,
+        });
+      }
       try {
         const result = await tool.handler(env, msg.params?.arguments ?? {});
         return reply({
@@ -743,7 +839,7 @@ async function dispatch(env: Env, msg: JsonRpcRequest): Promise<JsonRpcResponse 
   }
 }
 
-export async function handleMcp(request: Request, env: Env): Promise<Response> {
+export async function handleMcp(request: Request, env: Env, scope: McpScope = "full"): Promise<Response> {
   if (request.method === "GET") {
     // No server-initiated stream support; streamable-HTTP clients fall back to POST.
     return new Response(null, { status: 405, headers: { allow: "POST" } });
@@ -763,7 +859,7 @@ export async function handleMcp(request: Request, env: Env): Promise<Response> {
   }
 
   const messages = (Array.isArray(body) ? body : [body]) as JsonRpcRequest[];
-  const responses = (await Promise.all(messages.map((m) => dispatch(env, m)))).filter(
+  const responses = (await Promise.all(messages.map((m) => dispatch(env, m, scope)))).filter(
     (r): r is JsonRpcResponse => r !== null,
   );
 

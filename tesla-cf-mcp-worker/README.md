@@ -330,6 +330,16 @@ header-less consumers — note the token then appears in that consumer's logs).
 Every route reads the **same D1 query layer as the MCP tools** — no duplicate
 logic, so the dashboard and Claude always agree.
 
+**Token scopes (enforced server-side):** `MCP_AUTH_TOKEN` is FULL access.
+For anything that leaves your hands (phone links, OBS, shared dashboards),
+mint a per-device **READ** token: `POST /auth/device-token?label=phone&vin=…`
+(full token required) → returns the token once plus a ready-made dashboard
+link. Read tokens authorize every `/data/*` route, the exports, `/geocode`,
+and only the read-only MCP tools — the server refuses commands, wakes, config
+writes, `/poll/now` and `/setup/*` no matter what the client sends. Revoke one
+device without rotating anything else: `POST /auth/revoke-device-token?id=…`
+(list with `GET /auth/device-token`). Tokens are stored as SHA-256 hashes.
+
 State & series:
 - `GET /data/latest?vin=…` — Home Assistant `rest` sensor, OBS overlay, widgets.
 - `GET /data/summary?vin=…` — odometer, lifetime km/energy, avg efficiency,
@@ -340,16 +350,37 @@ State & series:
 - `GET /data/states?vin=…&hours=168` — driving/charging/online/asleep timeline.
 
 Tracking:
-- `GET /data/drives?vin=…&limit=50` — drive log (distance, energy, efficiency…).
+- `GET /data/drives?vin=…&limit=50` — drive log (distance, energy, efficiency,
+  behaviour metrics, driver + auto-suggested driver).
 - `GET /data/drive?id=…` — one drive **with its full GPS route** (map polyline).
 - `GET /data/charge-sessions?vin=…&limit=50` — charge cost/energy/type table.
 - `GET /data/charge-curve?session_id=…` — per-sample charge curve (SoC vs power).
-- `GET /data/degradation?vin=…` — projected range at 100% + % loss over time.
-- `GET /data/vampire?vin=…&days=30` — idle SoC loss, per-span + avg %/day.
+- `GET /data/degradation?vin=…` — projected range at 100% + % loss, plus a
+  least-squares trend fitted on clean (AC, mild-ambient) sessions with r².
+- `GET /data/vampire?vin=…&days=30` — idle SoC loss split **asleep vs
+  awake-idle** (Sentry burns ~10× sleep), per-span + avg %/day.
+- `GET /data/efficiency-by-temp?vin=…` — Wh/km per 5 °C ambient bin
+  (distance-weighted) — the cold-weather range-penalty curve.
+- `GET /data/tires?vin=…&days=30` — per-wheel TPMS series + latest + a
+  bar/week trend that catches slow leaks early.
+- `GET /data/monthly?vin=…&months=12` — monthly report: drives, km, kWh,
+  Wh/km, charge AC/DC split, cost, cost/100 km (also the `get_monthly_report`
+  MCP tool).
+- `GET /data/driver-scores?vin=…` — per-driver insurance-style roll-up.
+
+Exports (own your data):
+- `GET /data/export/drives.csv?vin=…` / `GET /data/export/charges.csv?vin=…`
+- `GET /data/export/drive.gpx?id=…` — one drive's route as GPX 1.1.
 
 Locations:
 - `GET /data/locations` — named geofences.
 - `GET /data/location-stats?id=…` — drives from/to, charge energy & cost here.
+- `GET /data/suggested-locations?vin=…` — repeat-visited spots worth naming.
+
+Geo:
+- `GET /geocode?q=…&lang=he|en` — forward geocode, GovMap→Nominatim fallback
+  (cached 30 d). `GET /govtiles/{streets|ortho|labels}/{z}/{x}/{y}.png` —
+  GovMap basemap proxy with automatic Esri failover (public; image-only).
 
 Make/n8n can call any MCP tool directly: `POST /mcp` with
 `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_latest_state","arguments":{"vin":"…"}}}`.
@@ -372,13 +403,16 @@ Make/n8n can call any MCP tool directly: `POST /mcp` with
 - **Continuous recording (TeslaMate-grade):** `GET /poll/now?vin=` runs one
   adaptive poll — a free connectivity check, and only when the car is online,
   one billed `vehicle_data` read folded through the ingest→derivation pipeline.
-  It returns the next interval (driving ~10s, charging ~30s, idle-online 60s)
-  and backs off once idle-online for ~12 min so the car can sleep. It never
+  The cadence is **budget-paced** (budget.ts): driving samples at 10 s while
+  the month's spend is at/ahead of pace — dense enough for real harsh-brake
+  detection — decaying 15→30→60 s as the budget tightens; charging 60/150 s;
+  idle-online 90 s with suspend after ~12 min so the car can sleep. It never
   wakes the car. `.github/workflows/tesla-poll.yml` drives it in a loop on a
-  `*/5` schedule (free — Actions minutes are unlimited on a public repo). This
-  is what fills Drives, the state timeline, degradation, vampire drain and
-  efficiency. Billed Tesla reads happen only while the car is online; Fleet
-  Telemetry streaming (~18× cheaper) is the option to cut that further.
+  `*/5` schedule (free — Actions minutes are unlimited on a public repo) and
+  exits RED after 3 consecutive failed calls; the tick workflow's watchdog
+  step goes red when `/health` shows no poll activity for >2 h. Fleet
+  Telemetry streaming (~18× cheaper; see `fleet-telemetry-bridge/`) is the
+  upgrade path for true 1 s fidelity.
 - **Backfill charge history:** `backfill_charge_history` (MCP tool) /
   `POST /setup/backfill-charges?vin=` imports past Supercharger sessions from
   Tesla's `dx/charging/history` (energy, cost, site, time — DC only, no SoC).

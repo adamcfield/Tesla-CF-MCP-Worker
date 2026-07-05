@@ -19,6 +19,7 @@
  * then rule evaluation. This path is passive and never wakes the vehicle.
  */
 
+import { recordSpend } from "./budget";
 import { evaluateOnIngest } from "./rules";
 import { LatestState, mergeLatest, POSITION_COLUMNS, recordEvents, TelemetryEvent } from "./store";
 import { applyDerivation } from "./tracking";
@@ -248,6 +249,15 @@ export async function handleIngest(request: Request, env: Env): Promise<Response
   // time, so an out-of-order batch would corrupt drive/charge/state boundaries.
   const parsed = items.map(parseOne).filter((x): x is NonNullable<typeof x> => x !== null);
   parsed.sort((a, b2) => a.ts - b2.ts);
+
+  // Fleet Telemetry billing: each transmitted field is one billed signal
+  // ($1/150k). Counted HERE (the streaming sink) — NOT in applyIngest, which
+  // the REST poll path also calls and already bills as one vehicle_data read.
+  // This lets the budget gates + pacing see streaming spend and throttle the
+  // poller accordingly, so poll + stream together can't cross Tesla's line.
+  const signals = parsed.reduce((n, p) => n + Object.keys(p.fields).length, 0);
+  if (signals > 0) await recordSpend(env, "signal", signals);
+
   for (const p of parsed) await applyIngest(env, p);
 
   return new Response(JSON.stringify({ accepted: parsed.length, rejected: items.length - parsed.length }), {

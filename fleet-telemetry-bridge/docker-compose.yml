@@ -1,0 +1,62 @@
+# Tesla Fleet Telemetry self-host bridge
+#
+#   vehicle ──mTLS WebSocket (public :443)──> fleet-telemetry ──MQTT──> mosquitto ──MQTT──> forwarder ──HTTPS POST──> Cloudflare Worker /ingest/telemetry
+#
+# Only fleet-telemetry's vehicle port (443) and loopback-only diagnostics are
+# published. Mosquitto stays on the internal network (anonymous access is safe
+# only under that condition — see config/mosquitto.conf).
+#
+# Before `docker compose up -d`:
+#   1. cp .env.example .env  (set INGEST_TOKEN)
+#   2. put fullchain.pem + privkey.pem into ./certs (see RUNBOOK.md §4)
+
+services:
+  mosquitto:
+    image: eclipse-mosquitto:2
+    restart: unless-stopped
+    volumes:
+      - ./config/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+      - mosquitto-data:/mosquitto/data
+    healthcheck:
+      # mosquitto_sub exits 0 after -E (subscribe once, then exit)
+      test: ["CMD", "mosquitto_sub", "-t", "$$SYS/#", "-C", "1", "-i", "healthcheck", "-W", "3"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  fleet-telemetry:
+    # Pin a real tag from https://hub.docker.com/r/tesla/fleet-telemetry/tags
+    # (multi-arch: amd64 + arm64 — runs on Oracle Ampere A1).
+    image: tesla/fleet-telemetry:v0.9.3
+    restart: unless-stopped
+    depends_on:
+      - mosquitto
+    # The image is distroless (no shell) and runs as non-root (uid 65532):
+    # - no exec/healthcheck inside the container; use the status port below
+    # - cert files must be readable by uid 65532 (RUNBOOK.md §4)
+    # - it binds 8443 in-container (unprivileged), published as public 443
+    command: ["/fleet-telemetry", "-config", "/etc/fleet-telemetry/config.json"]
+    ports:
+      - "443:8443"                # vehicles connect here (mTLS WebSocket)
+      - "127.0.0.1:8081:8080"     # liveness:   curl http://127.0.0.1:8081/status
+      - "127.0.0.1:9090:9090"     # prometheus: curl http://127.0.0.1:9090/metrics
+    volumes:
+      - ./config/config.json:/etc/fleet-telemetry/config.json:ro
+      - ./certs:/etc/fleet-telemetry/certs:ro
+    environment:
+      # Silence the constant internet background-scanner TLS handshake noise.
+      - SUPPRESS_TLS_HANDSHAKE_ERROR_LOGGING=true
+
+  forwarder:
+    build: ./forwarder
+    restart: unless-stopped
+    depends_on:
+      - mosquitto
+    env_file: .env
+    environment:
+      # Fixed for the compose topology; .env supplies token/tuning.
+      - MQTT_URL=mqtt://mosquitto:1883
+      - MQTT_TOPIC_BASE=telemetry
+
+volumes:
+  mosquitto-data:
