@@ -289,6 +289,12 @@ a.tm-chip-btn { text-decoration: none; }
 .tm-roster-dot { color: var(--accent); font-size: 7px; line-height: 1; }
 .tm-driver-percentile { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
 
+/* ---------- Route placeholder (synthetic / route-less drives) ---------- */
+.tm-route-placeholder { display: flex; flex-direction: column; gap: 0; }
+.tm-route-endpoint { display: flex; align-items: center; gap: 10px; font-size: 14px; font-weight: 500; min-width: 0; }
+.tm-route-dot { width: 9px; height: 9px; border-radius: 50%; flex: none; }
+.tm-route-connector { width: 2px; height: 22px; margin-left: 3.5px; background: var(--line); }
+
 /* ---------- Frontier 1: risk certificate + coach note ---------- */
 .tm-coach-note {
   margin-top: 14px; padding: 12px 14px; border-radius: 10px; font-size: 13px; line-height: 1.5;

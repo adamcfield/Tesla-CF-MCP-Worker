@@ -3,7 +3,7 @@
  * auto-close, and the jerk metric. All run against the real SQLite-backed
  * FakeD1 so the SQL itself is what's tested.
  */
-import { describe, it, expect, beforeEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { scoreDrive } from "../src/scoring";
 import { ensureSchema, resetSchemaCacheForTests } from "../src/store";
 import { applyDerivation } from "../src/tracking";
@@ -14,6 +14,13 @@ import { FakeKV } from "./helpers/kv";
 import type { Env } from "../src/types";
 
 const VIN = "TESTVINDERIVE0001";
+
+// Fail external calls (Nominatim/Overpass) fast so derivation tests stay
+// deterministic and never hit the network (a real call blows the 5s timeout).
+beforeEach(() => {
+  vi.stubGlobal("fetch", vi.fn(async () => new Response(null, { status: 503 })));
+});
+afterEach(() => vi.restoreAllMocks());
 
 function makeEnv(): Env {
   resetSchemaCacheForTests();

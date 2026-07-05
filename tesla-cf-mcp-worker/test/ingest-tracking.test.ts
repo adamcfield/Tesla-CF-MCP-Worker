@@ -1,10 +1,18 @@
-import { describe, it, expect, beforeEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { applyIngest, handleIngest } from "../src/ingest";
 import { getLatest, querySeries, resetSchemaCacheForTests } from "../src/store";
 import { getDrives, getStateTimeline, getChargeSessions } from "../src/tracking";
 import { FakeD1 } from "./helpers/d1";
 import { FakeKV } from "./helpers/kv";
 import type { Env } from "../src/types";
+
+// Derivation makes best-effort external calls (Nominatim reverse-geocode,
+// Overpass speed limits). Stub fetch to fail fast so tests stay deterministic
+// and don't hit the network (a real call blows the 5s test timeout).
+beforeEach(() => {
+  vi.stubGlobal("fetch", vi.fn(async () => new Response(null, { status: 503 })));
+});
+afterEach(() => vi.restoreAllMocks());
 
 function makeEnv(): Env {
   resetSchemaCacheForTests(); // each env gets a fresh in-memory DB — re-provision it

@@ -1117,6 +1117,18 @@ function knownDrivers(drives) {
   return [...new Set(drives.map((d) => d.driver).filter(Boolean))].sort((a, b) => a.localeCompare(b));
 }
 
+/** True when a drive was reconstructed from an odometer jump (no GPS trace). */
+function isSyntheticDrive(d) {
+  return d?.synthetic === 1 || d?.synthetic === true;
+}
+
+const SYNTHETIC_TITLE = "Reconstructed from the odometer — this drive happened between polls, so distance & endpoints are known but there's no GPS trace. Live capture needs more frequent polling or telemetry streaming.";
+
+/** Muted "recovered · no route" pill for odometer-reconstructed drives. */
+function syntheticBadgeHtml() {
+  return `<span class="tm-pill tm-pill-chip" style="font-size:10.5px;" title="${esc(SYNTHETIC_TITLE)}">recovered · no route</span>`;
+}
+
 /** Driver cell body: assigned name, or the classifier's guess (muted, "?"-suffixed), or —. */
 function driverCellHtml(d) {
   if (d.driver) return esc(d.driver);
@@ -1208,7 +1220,7 @@ async function renderDrives() {
         ${filtered.map((d) => `
           <div class="tm-table-row" data-action="open-drive" data-id="${d.id}" style="grid-template-columns:${cols};">
             <div style="font-size:12.5px;color:var(--sub);">${fmtDateTime(d.start_ts)}</div>
-            <div class="tm-ellipsis" style="font-size:13.5px;font-weight:500;">${esc(driveEndpoint(d, "start", locations))} <span style="color:var(--faint);">→</span> ${esc(driveEndpoint(d, "end", locations))}</div>
+            <div class="tm-ellipsis" style="font-size:13.5px;font-weight:500;">${esc(driveEndpoint(d, "start", locations))} <span style="color:var(--faint);">→</span> ${esc(driveEndpoint(d, "end", locations))}${isSyntheticDrive(d) ? " " + syntheticBadgeHtml() : ""}</div>
             <div class="tm-ellipsis" data-action="edit-driver" data-id="${d.id}" title="Click to assign driver" style="font-size:12.5px;">${driverCellHtml(d)}</div>
             <div class="tm-right tm-mono">${d.distance_km != null ? fmt1(d.distance_km) : "—"} km</div>
             <div class="tm-right tm-mono" style="color:var(--sub);">${fmtDurationMin(d.duration_min)}</div>
@@ -1230,6 +1242,11 @@ async function renderDriveDetail() {
   const roster = await loadDriverRoster();
   const locName = (id) => (id == null ? "Unknown" : locations.find((l) => l.id === id)?.name || "Unknown");
 
+  // Synthetic drives are reconstructed from an odometer jump between polls — they
+  // carry no GPS route, so show a placeholder card instead of an empty map.
+  const synthetic = isSyntheticDrive(d);
+  const hasRoute = !synthetic && path.length >= 2;
+
   const speedPts = path.filter((p) => p.speed != null).map((p) => [(p.ts - d.start_ts) / 60, p.speed]);
   const elevPts = path.filter((p) => p.elevation != null).map((p) => [(p.ts - d.start_ts) / 60, p.elevation]);
 
@@ -1239,6 +1256,7 @@ async function renderDriveDetail() {
       <button class="tm-back-btn" data-action="back-drives">← Drives</button>
       <div style="font-size:15px;font-weight:600;">${esc(driveEndpoint(d, "start", locations))} <span style="color:var(--faint);">→</span> ${esc(driveEndpoint(d, "end", locations))}</div>
       <div style="font-size:12.5px;color:var(--faint);">${fmtDateTime(d.start_ts)}</div>
+      ${synthetic ? syntheticBadgeHtml() : ""}
       <div class="tm-flex-row" style="margin-left:auto;gap:6px;">
         <a class="tm-chip-btn" style="padding:5px 12px;" href="${esc(exportUrl("/data/export/drive.gpx", { id: d.id }))}" target="_blank" rel="noopener" download>&#11015; GPX</a>
         <span style="font-size:12px;color:var(--sub);">Driver:</span>
@@ -1258,11 +1276,28 @@ async function renderDriveDetail() {
     </div>` : ""}
     ${riskCertificateSection(d)}
     <div class="tm-grid-2-wide">
+      ${hasRoute ? `
       <div class="tm-card tm-map-card" style="min-height:300px;">
         <div id="tm-drive-map" class="tm-map-canvas"></div>
-        ${path.length >= 2 ? `<button class="tm-replay-btn" id="tm-replay-btn" title="Replay drive">&#9654;</button>` : ""}
-        ${path.length < 2 ? `<div class="tm-empty" style="height:100%;">No GPS path recorded for this drive</div>` : ""}
-      </div>
+        <button class="tm-replay-btn" id="tm-replay-btn" title="Replay drive">&#9654;</button>
+      </div>` : `
+      <div class="tm-card tm-card-pad-lg tm-flex-col" style="min-height:300px;justify-content:center;gap:16px;">
+        ${synthetic ? syntheticBadgeHtml() : ""}
+        <div class="tm-route-placeholder">
+          <div class="tm-route-endpoint">
+            <span class="tm-route-dot" style="background:var(--good);"></span>
+            <span class="tm-ellipsis">${esc(driveEndpoint(d, "start", locations))}</span>
+          </div>
+          <div class="tm-route-connector"></div>
+          <div class="tm-route-endpoint">
+            <span class="tm-route-dot" style="background:var(--accent);"></span>
+            <span class="tm-ellipsis">${esc(driveEndpoint(d, "end", locations))}</span>
+          </div>
+        </div>
+        <div class="tm-stat-note" style="margin-top:0;">${synthetic
+          ? "No GPS route recorded for this drive — it was reconstructed from the odometer, so distance & endpoints are known but there's no trace to map."
+          : "No GPS route recorded for this drive."}</div>
+      </div>`}
       <div class="tm-grid-half" style="align-content:start;">
         <div class="tm-card" style="padding:18px 20px;"><div class="tm-stat-label">Distance</div><div style="font-size:19px;font-weight:600;margin-top:5px;" class="tm-mono">${d.distance_km != null ? fmt1(d.distance_km) : "—"} km</div></div>
         <div class="tm-card" style="padding:18px 20px;"><div class="tm-stat-label">Duration</div><div style="font-size:19px;font-weight:600;margin-top:5px;" class="tm-mono">${fmtDurationMin(d.duration_min)}</div></div>
@@ -1290,7 +1325,7 @@ async function renderDriveDetail() {
     </div>
   `);
 
-  if (path.length >= 2) {
+  if (hasRoute) {
     requestAnimationFrame(() => {
       const map = renderRouteMap(document.getElementById("tm-drive-map"), path);
       attachReplay(map, path, document.getElementById("tm-replay-btn"));
@@ -1317,7 +1352,17 @@ const FIDELITY_LABEL = {
 async function renderDrivers() {
   const res = await data.driverScores(vin());
   const drivers = res?.drivers || [];
-  if (!drivers.length) return setContent(emptyHtml("No drives recorded yet", "Once trips are logged you can assign each drive to a driver (on the Drives page) and their risk profile appears here."));
+  // Full household roster (Tesla-reported + tagged). 404s gracefully → []. Any
+  // roster member without a scored drive is surfaced in a "Household drivers"
+  // section below, so a shared driver with 0 tagged trips is still visible.
+  const roster = await loadDriverRoster();
+  const scoredNames = new Set(drivers.map((d) => (d.driver || "").toLowerCase()));
+  const rosterOnly = roster.filter((r) => {
+    const name = rosterName(r);
+    return name && name !== "Unknown" && !scoredNames.has(name.toLowerCase());
+  });
+
+  if (!drivers.length && !rosterOnly.length) return setContent(emptyHtml("No drives recorded yet", "Once trips are logged you can assign each drive to a driver (on the Drives page) and their risk profile appears here."));
 
   const hasScores = drivers.some((d) => d.behavior_score != null);
   const baselineNote = res?.baseline_note || res?.note || null;
@@ -1332,7 +1377,7 @@ async function renderDrivers() {
       </div>
       ${baselineNote ? `<div style="font-size:12px;color:var(--faint);line-height:1.5;margin-top:10px;border-top:1px solid var(--line2);padding-top:10px;"><b>Baseline.</b> ${esc(baselineNote)}</div>` : ""}
     </div>
-    <div class="tm-grid-3col">
+    ${drivers.length ? `<div class="tm-grid-3col">
       ${drivers.map((d) => `
         <div class="tm-card tm-card-pad">
           <div class="tm-flex-row" style="justify-content:space-between;align-items:flex-start;">
@@ -1356,7 +1401,27 @@ async function renderDrivers() {
           </div>
           <div class="tm-stat-note" style="margin-top:12px;">Harsh-event fidelity: ${esc(FIDELITY_LABEL[d.fidelity] || d.fidelity)}</div>
         </div>`).join("")}
+    </div>` : ""}
+    ${rosterOnly.length ? `
+    <div class="tm-flex-row" style="align-items:baseline;gap:10px;margin-top:4px;">
+      <div style="font-size:14px;font-weight:600;">Household drivers</div>
+      <div style="font-size:12px;color:var(--faint);">on the roster but with no scored trips yet</div>
     </div>
+    <div class="tm-grid-3col">
+      ${rosterOnly.map((r) => `
+        <div class="tm-card tm-card-pad">
+          <div class="tm-flex-row" style="justify-content:space-between;align-items:flex-start;gap:10px;">
+            <div style="min-width:0;">
+              <div class="tm-ellipsis" style="font-size:15px;font-weight:600;">${esc(rosterName(r))}</div>
+              <div style="font-size:12px;color:var(--faint);margin-top:4px;">no drives tagged yet</div>
+            </div>
+            <span class="tm-pill tm-pill-chip" style="font-size:11px;white-space:nowrap;" title="${esc(r.source === "tesla" ? "from your Tesla account" : "previously tagged")}">
+              ${r.source === "tesla" ? `<span class="tm-roster-dot">⬤</span> Household · Tesla` : "Tagged"}
+            </span>
+          </div>
+          <div class="tm-stat-note" style="margin-top:14px;">Assign this person's trips on the <b>Drives</b> page and their risk profile will appear here.</div>
+        </div>`).join("")}
+    </div>` : ""}
   `);
 }
 
