@@ -155,10 +155,12 @@ export async function fetchNumber(source: FeedSource): Promise<number> {
   return n;
 }
 
-async function underCooldown(env: Env, rule: AutomationRule, defaultMinutes: number): Promise<boolean> {
+async function underCooldown(env: Env, rule: AutomationRule, defaultMinutes: number, scope = ""): Promise<boolean> {
   const minutes = rule.cooldown_minutes ?? defaultMinutes;
   if (minutes <= 0) return false;
-  const key = `cooldown:${rule.id}:${rule.vin}`;
+  // `scope` gives independent conditions (e.g. each tyre, phantom-drain) their
+  // own cooldown so one firing doesn't suppress a different, concurrent one.
+  const key = `cooldown:${rule.id}:${rule.vin}${scope ? `:${scope}` : ""}`;
   if (await env.TESLA_KV.get(key)) return true;
   await env.TESLA_KV.put(key, "1", { expirationTtl: Math.max(60, minutes * 60) });
   return false;
@@ -527,7 +529,7 @@ async function evalSentinel(env: Env, rule: AutomationRule): Promise<boolean> {
   if (trend) {
     for (const w of ["fl", "fr", "rl", "rr"] as const) {
       if (typeof trend[w] === "number" && trend[w]! <= -leakBar) {
-        if (!(await underCooldown(env, rule, 1440))) {
+        if (!(await underCooldown(env, rule, 1440, `tyre:${w}`))) {
           await fire(env, rule, "sentinel", `${rule.vin} ${w.toUpperCase()} tyre losing ${Math.abs(trend[w]!).toFixed(2)} bar/week — likely a slow leak`, { wheel: w, trend_bar_per_week: trend[w] });
           fired = true;
         }
@@ -541,7 +543,7 @@ async function evalSentinel(env: Env, rule: AutomationRule): Promise<boolean> {
   const awake = vamp?.awake?.pct_per_day;
   const maxAwake = asNum(rule.max_awake_pct_per_day) ?? 8;
   if (typeof awake === "number" && awake >= maxAwake) {
-    if (!(await underCooldown(env, rule, 1440))) {
+    if (!(await underCooldown(env, rule, 1440, "drain"))) {
       await fire(env, rule, "sentinel", `${rule.vin} awake-idle drain ${awake.toFixed(1)}%/day (Sentry/preconditioning?) — well above a healthy sleep baseline`, { awake_pct_per_day: awake });
       fired = true;
     }

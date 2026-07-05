@@ -107,7 +107,13 @@ export async function verifyDriveCertificate(
   env: Env,
   body: { canonical?: unknown; signature_hex?: unknown },
 ): Promise<{ valid: boolean; reason?: string }> {
-  if (!body || typeof body.canonical !== "object" || typeof body.signature_hex !== "string") {
+  if (
+    !body ||
+    typeof body.canonical !== "object" ||
+    body.canonical === null || // typeof null === "object"
+    Array.isArray(body.canonical) ||
+    typeof body.signature_hex !== "string"
+  ) {
     return { valid: false, reason: "missing canonical or signature_hex" };
   }
   const sigBytes = body.signature_hex.match(/../g)?.map((h) => parseInt(h, 16));

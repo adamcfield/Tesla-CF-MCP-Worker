@@ -793,7 +793,16 @@ export async function getDrive(env: Env, id: number): Promise<unknown> {
  */
 export async function getDrivers(env: Env, vin: string): Promise<unknown> {
   await ensureSchema(env);
-  const roster = await getVehicleDrivers(env, vin);
+  // Cache the Tesla roster (5-min TTL): list_drivers is read-scope (any device
+  // token can call it), so without this a tight loop would hammer the shared
+  // Fleet API OAuth client and risk Tesla-side rate-limiting for every
+  // integration. The tagged-drivers D1 merge below stays live (cheap, local).
+  const CACHE_KEY = `drivers:${vin}`;
+  let roster = await env.TESLA_KV.get<Awaited<ReturnType<typeof getVehicleDrivers>>>(CACHE_KEY, "json").catch(() => null);
+  if (!roster) {
+    roster = await getVehicleDrivers(env, vin);
+    await env.TESLA_KV.put(CACHE_KEY, JSON.stringify(roster), { expirationTtl: 300 }).catch(() => {});
+  }
   const taggedRs = await env.DB.prepare(
     `SELECT driver, COUNT(*) AS n FROM drives WHERE vin = ?1 AND driver IS NOT NULL AND status = 'complete' GROUP BY driver`,
   ).bind(vin).all<{ driver: string; n: number }>();

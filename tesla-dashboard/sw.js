@@ -1,18 +1,21 @@
 /**
- * Service worker: offline-capable app shell, strictly network-only data.
+ * Service worker: offline-capable, but UPDATE-FIRST so a fresh deploy is seen
+ * immediately (no stale-shell trap).
  *
- * - App shell (this page, the JS/CSS modules, manifest, icons, and the two
- *   unpkg Leaflet files) is served CACHE-FIRST, with a background revalidate
- *   so a deployed update still lands on the next load.
- * - Anything touching the worker API is NEVER cached: /data/, /mcp, /ai/,
- *   /geocode, /govtiles, or any URL carrying a token= param falls through to
- *   the network untouched — vehicle data, AI answers, and bearer-token
- *   responses must not persist in Cache Storage.
+ * Strategy:
+ * - App shell (HTML/JS/CSS/manifest, same-origin): NETWORK-FIRST. We always try
+ *   the network, cache the fresh copy, and only fall back to cache when offline.
+ *   This is what makes a new deploy show up on the very next load instead of one
+ *   load later (the classic cache-first PWA "I don't see my changes" problem).
+ * - Static, versioned assets (icons, the pinned Leaflet CDN files): CACHE-FIRST
+ *   with background revalidate — they rarely change and are safe to serve fast.
+ * - API/data/AI/tokened requests: NEVER cached — straight to network.
  *
- * Bump CACHE_NAME on shell changes; activate deletes every older cache.
+ * skipWaiting + clients.claim + a controllerchange reload in app.js mean an
+ * updated worker takes over and refreshes the page automatically.
  */
 
-const CACHE_NAME = "tesla-dash-shell-v2";
+const CACHE_NAME = "tesla-dash-shell-v3";
 
 const SHELL = [
   "./",
@@ -23,6 +26,8 @@ const SHELL = [
   "./charts.js",
   "./styles.css",
   "./manifest.webmanifest",
+];
+const STATIC = [
   "./icons/icon-192.png",
   "./icons/icon-512.png",
   "./icons/apple-touch-icon.png",
@@ -33,12 +38,27 @@ const SHELL = [
 /** URL fragments that must never enter the cache (API data + AI answers + tokened requests). */
 const NEVER_CACHE = ["/data/", "/mcp", "/ai/", "/geocode", "/govtiles", "token="];
 
+/** True for the app shell (same-origin HTML/JS/CSS/manifest) → network-first. */
+function isShell(url) {
+  return (
+    url.origin === self.location.origin &&
+    /\.(html|js|css|webmanifest)$/.test(url.pathname.split("?")[0] || "") ||
+    url.pathname === "/" ||
+    url.pathname.endsWith("/")
+  );
+}
+function isStatic(url) {
+  return STATIC.some((s) => url.href === new URL(s, self.location.href).href) ||
+    /\.(png|jpg|jpeg|svg|gif|webp)$/.test(url.pathname);
+}
+
 self.addEventListener("install", (event) => {
   event.waitUntil(
     caches
       .open(CACHE_NAME)
-      // allSettled, not addAll: one unreachable CDN file shouldn't block install.
-      .then((cache) => Promise.allSettled(SHELL.map((url) => cache.add(url))))
+      // Pre-cache both sets so the very first offline load works; allSettled so
+      // one unreachable CDN file doesn't block install.
+      .then((cache) => Promise.allSettled([...SHELL, ...STATIC].map((u) => cache.add(u))))
       .then(() => self.skipWaiting()),
   );
 });
@@ -55,24 +75,41 @@ self.addEventListener("activate", (event) => {
 self.addEventListener("fetch", (event) => {
   const req = event.request;
   if (req.method !== "GET") return;
-  if (NEVER_CACHE.some((frag) => req.url.includes(frag))) return; // network-only, untouched
+  const url = new URL(req.url);
+  if (NEVER_CACHE.some((frag) => req.url.includes(frag))) return; // network-only
 
-  event.respondWith(
-    caches.open(CACHE_NAME).then(async (cache) => {
-      const hit = await cache.match(req);
-      const refresh = fetch(req)
+  // Network-first for the app shell: always prefer a fresh deploy.
+  if (req.mode === "navigate" || isShell(url)) {
+    event.respondWith(
+      fetch(req)
         .then((resp) => {
-          if (resp.ok && (resp.type === "basic" || resp.type === "cors")) {
-            cache.put(req, resp.clone());
-          }
+          if (resp.ok) caches.open(CACHE_NAME).then((c) => c.put(req, resp.clone()));
           return resp;
         })
-        .catch(() => hit); // offline: whatever the cache had (or undefined → error)
-      if (hit) {
-        event.waitUntil(refresh.then(() => undefined).catch(() => undefined));
-        return hit;
-      }
-      return refresh;
-    }),
-  );
+        .catch(() => caches.match(req).then((hit) => hit || caches.match("./index.html"))),
+    );
+    return;
+  }
+
+  // Cache-first (+ background revalidate) for versioned static assets.
+  if (isStatic(url)) {
+    event.respondWith(
+      caches.open(CACHE_NAME).then(async (cache) => {
+        const hit = await cache.match(req);
+        const refresh = fetch(req)
+          .then((resp) => {
+            if (resp.ok && (resp.type === "basic" || resp.type === "cors")) cache.put(req, resp.clone());
+            return resp;
+          })
+          .catch(() => hit);
+        if (hit) {
+          event.waitUntil(refresh.then(() => undefined).catch(() => undefined));
+          return hit;
+        }
+        return refresh;
+      }),
+    );
+    return;
+  }
+  // Everything else: straight to network.
 });

@@ -39,14 +39,12 @@ interface Way {
   nodes: Array<{ lat: number; lon: number }>;
 }
 
-/** Fetches ways with a maxspeed tag inside a bbox from Overpass (best-effort). */
-async function fetchWays(bbox: { s: number; w: number; n: number; e: number }): Promise<Way[]> {
-  const q =
-    `[out:json][timeout:20];way["maxspeed"](${bbox.s},${bbox.w},${bbox.n},${bbox.e});out geom;`;
+/** Runs a raw Overpass QL query and parses ways with a maxspeed tag (best-effort). */
+async function fetchWaysRaw(query: string): Promise<Way[]> {
   const resp = await fetch("https://overpass-api.de/api/interpreter", {
     method: "POST",
     headers: { "content-type": "application/x-www-form-urlencoded", "User-Agent": "tesla-cf-mcp-worker/1.0" },
-    body: "data=" + encodeURIComponent(q),
+    body: "data=" + encodeURIComponent(query),
     signal: AbortSignal.timeout(9000),
   });
   if (!resp.ok) throw new Error(`overpass ${resp.status}`);
@@ -59,6 +57,9 @@ async function fetchWays(bbox: { s: number; w: number; n: number; e: number }): 
   }
   return ways;
 }
+
+const fetchWays = (bbox: { s: number; w: number; n: number; e: number }): Promise<Way[]> =>
+  fetchWaysRaw(`[out:json][timeout:20];way["maxspeed"](${bbox.s},${bbox.w},${bbox.n},${bbox.e});out geom;`);
 
 /**
  * Returns a per-sample posted limit (km/h) aligned to `samples`, plus the
@@ -93,15 +94,27 @@ export async function postedLimitsForSamples(
 
   let hadFetchError = false;
   if (missing.length > 0) {
-    // One Overpass query over the drive bbox (padded), then snap each missing
-    // cell to the nearest road node within 60 m.
+    // Snap each missing cell to the nearest road node within 60 m. For a
+    // compact drive one padded whole-drive bbox is efficient; for a long or
+    // diagonal drive that rectangle would be mostly off-route, so query a
+    // UNION of tight per-cell boxes instead (one round-trip either way).
     const lats = valid.map((p) => p.lat);
     const lons = valid.map((p) => p.lon);
-    const pad = 0.003;
-    const bbox = { s: Math.min(...lats) - pad, w: Math.min(...lons) - pad, n: Math.max(...lats) + pad, e: Math.max(...lons) + pad };
+    const spanLat = Math.max(...lats) - Math.min(...lats);
+    const spanLon = Math.max(...lons) - Math.min(...lons);
+    const MAX_BBOX_DEG = 0.25; // ~25 km; above this the rectangle is mostly off-route
+    const CELL_PAD = 0.001; // ~110 m, matches the grid + 60 m snap
     let ways: Way[] = [];
     try {
-      ways = await fetchWays(bbox);
+      if (spanLat <= MAX_BBOX_DEG && spanLon <= MAX_BBOX_DEG) {
+        const pad = 0.003;
+        ways = await fetchWays({ s: Math.min(...lats) - pad, w: Math.min(...lons) - pad, n: Math.max(...lats) + pad, e: Math.max(...lons) + pad });
+      } else {
+        const clauses = missing
+          .map((c) => `way["maxspeed"](${c.lat_r - CELL_PAD},${c.lon_r - CELL_PAD},${c.lat_r + CELL_PAD},${c.lon_r + CELL_PAD});`)
+          .join("");
+        ways = await fetchWaysRaw(`[out:json][timeout:20];(${clauses});out geom;`);
+      }
     } catch {
       hadFetchError = true;
     }

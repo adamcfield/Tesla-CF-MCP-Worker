@@ -144,8 +144,13 @@ export function scoreDrive(samples: BehaviorSample[], opts: ScoreOpts = {}): Beh
       if (decel > maxDecel) maxDecel = decel;
       if (decel >= HARSH_BRAKE) harshBrake++;
     }
-    // Cornering proxy only when no real lateral IMU.
-    if (!hasImu && typeof a.heading === "number" && typeof b.heading === "number" && (b.speed as number) >= TURN_MIN_SPEED) {
+    // Cornering proxy whenever THIS sample lacks real lateral g — per-sample,
+    // not drive-wide. lon_accel/lat_accel stream independently, so a drive with
+    // IMU can still have per-sample lateral-g gaps; the lateral-g loop above
+    // already counts samples that DO have lat_accel, so gating here on its
+    // absence means at most one of {measured, proxy} fires per sample (no
+    // double-count, no silent gap).
+    if (typeof b.lat_accel !== "number" && typeof a.heading === "number" && typeof b.heading === "number" && (b.speed as number) >= TURN_MIN_SPEED) {
       const rate = Math.abs(headingDelta(a.heading, b.heading)) / dt;
       if (rate >= HARSH_TURN_DEG_PER_S) harshTurn++;
     }

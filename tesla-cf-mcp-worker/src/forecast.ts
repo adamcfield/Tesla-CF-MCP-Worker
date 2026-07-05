@@ -61,6 +61,7 @@ export async function getBatteryForecast(env: Env, vin: string, warrantyKm = 192
   let slopePctPerYear: number | null = null;
   let r2: number | null = null;
   let currentPct: number | null = null;
+  let baselineKnown = false;
   if (pts.length >= 3) {
     const n = pts.length;
     const mx = pts.reduce((s, p) => s + p.x, 0) / n;
@@ -70,7 +71,13 @@ export async function getBatteryForecast(env: Env, vin: string, warrantyKm = 192
     if (sxx > 0 && syy > 0) {
       const slope = sxy / sxx; // km per second
       r2 = round((sxy * sxy) / (sxx * syy), 3);
-      const baseline = pts[0]!.y; // ≈ range at 100% when new (first observation)
+      // Baseline = true as-delivered range if known (KV override), else the
+      // FIRST logged charge. The latter is an OPTIMISTIC anchor: real
+      // degradation before logging began is invisible, so current_pct reads
+      // high and the health-cliff reads far. baselineKnown flags which.
+      const ratedNew = Number((await env.TESLA_KV.get(`rated_range_new:${vin}`).catch(() => null)) ?? "");
+      baselineKnown = Number.isFinite(ratedNew) && ratedNew > 0;
+      const baseline = baselineKnown ? ratedNew : pts[0]!.y;
       const latest = pts[n - 1]!.y;
       currentPct = round((latest / baseline) * 100, 1);
       slopePctPerYear = round((-slope * YEAR_S / baseline) * 100, 2); // +ve = losing %/yr
@@ -112,9 +119,23 @@ export async function getBatteryForecast(env: Env, vin: string, warrantyKm = 192
     for (let y = 0; y <= 5; y++) projected.push({ year: y, pct: round(Math.max(0, currentPct - slopePctPerYear * y), 1) });
   }
 
+  const notes: string[] = [];
+  if (pts.length < 3) notes.push("Need at least three charges above 50% to project degradation.");
+  if (!baselineKnown && pts.length >= 3) {
+    notes.push(
+      "current_pct, slope and the health cliff are measured vs your FIRST logged charge, not as-delivered — " +
+      "so they're OPTIMISTIC (degradation before logging began is invisible; true retention vs the 70% floor is worse). " +
+      "Set rated_range_new:VIN in KV (the as-new 100% rated range in km) for an accurate anchor.",
+    );
+  }
+  if (!(cliff as { warranty_start_known?: boolean }).warranty_start_known && candidates.some((c) => c.kind === "time")) {
+    notes.push("Warranty time-remaining assumes in-service = first logged data (a lower bound; set warranty_start:VIN in KV).");
+  }
+
   return {
     vin,
     current_pct: currentPct,
+    current_pct_baseline: baselineKnown ? "as_delivered" : "first_logged",
     slope_pct_per_year: slopePctPerYear,
     r2,
     samples: pts.length,
@@ -123,12 +144,7 @@ export async function getBatteryForecast(env: Env, vin: string, warrantyKm = 192
     warranty: { years: WARRANTY_YEARS, km: warrantyKm, floor_pct: WARRANTY_FLOOR_PCT, start_ts: warrantyStart },
     cliff,
     projected_pct: projected,
-    note:
-      pts.length < 3
-        ? "Need at least three charges above 50% to project degradation."
-        : (cliff as { warranty_start_known?: boolean }).warranty_start_known
-          ? "Forecast from your logged degradation + mileage rate."
-          : "Warranty time-remaining assumes in-service = first logged data (a lower bound; set warranty_start:VIN in KV for accuracy).",
+    note: notes.length ? notes.join(" ") : "Forecast from your logged degradation + mileage rate.",
   };
 }
 

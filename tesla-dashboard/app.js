@@ -5,13 +5,20 @@ import { destroyMaps, renderPointMap, renderRouteMap, renderLifetimeMap, attachR
 const root = document.getElementById("app");
 let shellBound = false; // guards one-time attach of the root click handler + sync timer
 
-// PWA: cache-first app shell via sw.js. Progressive enhancement only — the
-// try/catch (plus register()'s own rejection handler) means an environment
-// without service workers, or plain localhost dev with a strict browser
-// profile, never breaks the app.
+// PWA: network-first app shell via sw.js (see sw.js). Progressive enhancement
+// only — the try/catch means an environment without service workers never
+// breaks the app. When an updated worker takes control, reload ONCE so the new
+// build is shown immediately (guarded so it fires only on a real update, never
+// on first install).
 try {
   if ("serviceWorker" in navigator) {
     navigator.serviceWorker.register("./sw.js").catch(() => { /* e.g. file://, private mode */ });
+    let reloadedForUpdate = false;
+    navigator.serviceWorker.addEventListener("controllerchange", () => {
+      if (reloadedForUpdate || !navigator.serviceWorker.controller) return;
+      reloadedForUpdate = true;
+      location.reload();
+    });
   }
 } catch { /* service workers unavailable — fine */ }
 

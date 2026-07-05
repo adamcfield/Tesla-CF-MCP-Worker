@@ -47,6 +47,14 @@ describe("drive risk certificate", () => {
     const other = { MCP_AUTH_TOKEN: "different", PUBLIC_ORIGIN: "https://t.example.com" } as Env;
     expect((await verifyDriveCertificate(other, cert)).valid).toBe(false);
   });
+
+  it("rejects a null/array canonical with a reason (typeof null === object guard)", async () => {
+    const nullRes = await verifyDriveCertificate(env, { canonical: null, signature_hex: "a".repeat(64) });
+    expect(nullRes.valid).toBe(false);
+    expect(nullRes.reason).toBe("missing canonical or signature_hex");
+    const arrRes = await verifyDriveCertificate(env, { canonical: [] as unknown, signature_hex: "a".repeat(64) });
+    expect(arrRes.valid).toBe(false);
+  });
 });
 
 describe("scoring: posted limits, IMU, confidence", () => {
@@ -81,6 +89,20 @@ describe("scoring: posted limits, IMU, confidence", () => {
     expect(m.accel_source).toBe("derived");
     expect(m.score_confidence).toBe("low");
     expect(m.score_low!).toBeLessThanOrEqual(m.score_high!);
+  });
+
+  it("counts a harsh turn via heading proxy for a sample that lacks lat_accel even when the drive has IMU elsewhere", () => {
+    // Sample 1 has lon_accel (⇒ drive is 'imu'), but the sharp turn at sample 2→3
+    // has NO lat_accel; the per-sample heading proxy must still catch it.
+    const samples = [
+      { ts: 0, speed: 40, heading: 0, lon_accel: 0.5 },
+      { ts: 10, speed: 40, heading: 0 }, // no lat_accel here
+      { ts: 20, speed: 40, heading: 90 }, // 90° in 10s = 9°/s... below 12; make it sharper
+      { ts: 25, speed: 40, heading: 180 }, // 90° in 5s = 18°/s ≥ 12 → harsh turn
+    ];
+    const m = scoreDrive(samples, { distanceKm: 2 });
+    expect(m.accel_source).toBe("imu");
+    expect(m.harsh_turn_count).toBeGreaterThanOrEqual(1); // NOT silently dropped
   });
 });
 

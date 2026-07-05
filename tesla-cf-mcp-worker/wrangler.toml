@@ -8,6 +8,9 @@
 #   MCP_AUTH_TOKEN       — shared secret gating /mcp (Claude Code bearer / claude.ai OAuth)
 #   INGEST_TOKEN         — (optional) separate bearer for POST /ingest/telemetry
 #   WEBHOOK_SECRET       — (optional) x-webhook-token header on outbound alert webhooks
+#   CERT_SECRET          — HMAC secret for signed drive risk certificates; kept SEPARATE
+#                          from MCP_AUTH_TOKEN so the public/read-scope certificate trust
+#                          boundary doesn't share fate with the full-privilege bearer. (Set.)
 
 name = "tesla-cf-mcp-worker"
 main = "src/index.ts"
