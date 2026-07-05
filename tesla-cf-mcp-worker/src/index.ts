@@ -45,6 +45,7 @@ import { loadCommandKey } from "./protocol";
 import { runCronTick } from "./rules";
 import { getLatest, querySeries } from "./store";
 import {
+  backfillChargeHistory,
   getBatteryDegradation,
   getChargeCurve,
   getChargeSessions,
@@ -275,6 +276,11 @@ export default {
         return handleRegisterPartner(env);
       }
       if (path === "/setup/partner-public-key") return handlePartnerPublicKey(env);
+      if (path === "/setup/backfill-charges" && request.method === "POST") {
+        const vin = url.searchParams.get("vin");
+        if (!vin) return json({ error: "vin query param required" }, 400);
+        return json(await backfillChargeHistory(env, vin));
+      }
 
       return new Response("Not found", { status: 404 });
     } catch (e) {

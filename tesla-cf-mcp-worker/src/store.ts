@@ -156,7 +156,15 @@ export async function ensureSchema(env: Env): Promise<void> {
     location_id: "INTEGER",
     outside_temp_avg: "REAL",
     status: "TEXT",
+    // Backfill from Tesla's charging history (Supercharger sessions).
+    external_id: "INTEGER", // Tesla sessionId — dedup key for re-runnable backfill
+    site_name: "TEXT", // Supercharger site label (no lat/lon from that endpoint)
+    currency: "TEXT",
+    source: "TEXT", // 'derived' (live telemetry) | 'backfill' (Tesla history)
   });
+  await env.DB.prepare(
+    `CREATE UNIQUE INDEX IF NOT EXISTS idx_charge_sessions_ext ON charge_sessions (external_id) WHERE external_id IS NOT NULL`,
+  ).run();
 
   schemaReady = true;
 }

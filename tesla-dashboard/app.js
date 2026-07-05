@@ -14,6 +14,27 @@ const fmt1 = (n) => (n == null || Number.isNaN(n) ? "—" : (Math.round(n * 10) 
 const fmt2 = (n) => (n == null || Number.isNaN(n) ? "—" : (Math.round(n * 100) / 100).toFixed(2));
 const esc = (s) => String(s ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;");
 
+const CURRENCY_SYMBOL = { ILS: "₪", USD: "$", EUR: "€", GBP: "£", AUD: "A$", CAD: "C$" };
+function money(amount, currency, decimals = 2) {
+  if (amount == null || Number.isNaN(amount)) return "—";
+  const sym = CURRENCY_SYMBOL[currency] ?? (currency ? currency + " " : "€");
+  return sym + (decimals === 0 ? fmt0(amount) : fmt2(amount));
+}
+/** Charge-session location: a geofence name if matched, else the Supercharger site label. */
+function chargeLocName(c, locations) {
+  if (c.location_id != null) {
+    const l = locations.find((x) => x.id === c.location_id);
+    if (l) return l.name;
+  }
+  return c.site_name || "Unknown location";
+}
+/** Most common currency across sessions, for the aggregate stat cards. */
+function dominantCurrency(sessions) {
+  const counts = {};
+  for (const c of sessions) if (c.currency) counts[c.currency] = (counts[c.currency] || 0) + 1;
+  return Object.keys(counts).sort((a, b) => counts[b] - counts[a])[0] || null;
+}
+
 function fmtDay(ts) {
   const d = new Date(ts * 1000);
   const now = new Date();
@@ -556,10 +577,17 @@ async function renderOverview() {
 function buildDayTicks(points) {
   if (!points.length) return [];
   const first = points[0][0], last = points[points.length - 1][0];
+  const spanH = (last - first) / 3600;
+  // Under a day of data, weekday labels all collapse to the same day — label
+  // by time-of-day instead so the axis is meaningful from the first sample on.
+  const fmt = spanH < 30
+    ? (ts) => new Date(ts * 1000).toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit", hour12: false })
+    : (ts) => new Date(ts * 1000).toLocaleDateString(undefined, { weekday: "short" });
+  const n = last > first ? 6 : 1;
   const out = [];
-  for (let i = 0; i <= 6; i++) {
-    const ts = first + ((last - first) * i) / 6;
-    out.push({ value: ts, label: new Date(ts * 1000).toLocaleDateString(undefined, { weekday: "short" }) });
+  for (let i = 0; i <= n; i++) {
+    const ts = first + ((last - first) * i) / (n || 1);
+    out.push({ value: ts, label: fmt(ts) });
   }
   return out;
 }
@@ -609,8 +637,8 @@ async function buildEventFeed(locations, driveLimit = 200) {
     events.push({
       ts: c.start_ts,
       type: "charge",
-      title: `Charged at ${locName(c.location_id) || "Unknown location"}`,
-      meta: `${c.energy_added_kwh != null ? "+" + fmt1(c.energy_added_kwh) + " kWh" : "—"}${c.start_soc != null && c.end_soc != null ? ` · ${c.start_soc} → ${c.end_soc}%` : ""}${c.cost != null ? ` · €${fmt2(c.cost)}` : ""}`,
+      title: `Charged at ${chargeLocName(c, locations)}`,
+      meta: `${c.energy_added_kwh != null ? "+" + fmt1(c.energy_added_kwh) + " kWh" : "—"}${c.start_soc != null && c.end_soc != null ? ` · ${c.start_soc} → ${c.end_soc}%` : ""}${c.cost != null ? ` · ${money(c.cost, c.currency)}` : ""}`,
       raw: c,
     });
   }
@@ -683,6 +711,7 @@ async function renderStatistics() {
   const totalKwhUsed = recentDrives.reduce((s, d) => s + (d.energy_used_kwh || 0), 0);
   const totalKwhCharged = recentCharges.reduce((s, c) => s + (c.energy_added_kwh || 0), 0);
   const totalCost = recentCharges.reduce((s, c) => s + (c.cost || 0), 0);
+  const cur = dominantCurrency(recentCharges);
   const avgWh = totalKm > 1 ? (totalKwhUsed * 1000) / totalKm : null;
 
   const byMonth = new Map();
@@ -710,7 +739,7 @@ async function renderStatistics() {
       <div class="tm-card tm-card-pad-metric"><div class="tm-stat-label">Distance · 12 mo</div><div class="tm-stat-value">${fmt0(totalKm)} <span class="tm-stat-unit">km</span></div></div>
       <div class="tm-card tm-card-pad-metric"><div class="tm-stat-label">Energy charged</div><div class="tm-stat-value">${fmt0(totalKwhCharged)} <span class="tm-stat-unit">kWh</span></div></div>
       <div class="tm-card tm-card-pad-metric"><div class="tm-stat-label">Avg efficiency</div><div class="tm-stat-value">${avgWh != null ? fmt0(avgWh) : "—"} <span class="tm-stat-unit">Wh/km</span></div></div>
-      <div class="tm-card tm-card-pad-metric"><div class="tm-stat-label">Charging cost</div><div class="tm-stat-value">€${fmt0(totalCost)}</div></div>
+      <div class="tm-card tm-card-pad-metric"><div class="tm-stat-label">Charging cost</div><div class="tm-stat-value">${money(totalCost, cur, 0)}</div></div>
     </div>
     <div class="tm-card tm-card-pad">
       <div class="tm-flex-row" style="align-items:baseline;margin-bottom:18px;">
@@ -731,7 +760,7 @@ async function renderStatistics() {
             <div class="tm-right tm-mono">${fmt0(m.km)} km</div>
             <div class="tm-right tm-mono" style="color:var(--sub);">${fmt0(m.kwh)} kWh</div>
             <div class="tm-right tm-mono" style="color:var(--sub);">${m.km > 1 ? fmt0((m.kwh * 1000) / m.km) : "—"} Wh/km</div>
-            <div class="tm-right tm-mono">€${fmt0(m.cost)}</div>
+            <div class="tm-right tm-mono">${money(m.cost, cur, 0)}</div>
           </div>`).join("")}
       </div>
     </div>
@@ -875,7 +904,6 @@ async function renderCharges() {
   if (state.openChargeId != null) return renderChargeDetail();
   const charges = await cached("all_charges", () => data.chargeSessions(vin(), 2000));
   const locations = await safe(cached("locations", () => data.locations()), []);
-  const locName = (id) => (id == null ? "Unknown location" : locations.find((l) => l.id === id)?.name || "Unknown location");
 
   if (!charges.length) return setContent(emptyHtml("No charge sessions recorded yet", "Charging history will appear here once sessions have been logged."));
 
@@ -888,13 +916,13 @@ async function renderCharges() {
         ${charges.map((c) => `
           <div class="tm-table-row" data-action="open-charge" data-id="${c.id}" style="grid-template-columns:140px 1fr 56px 92px 96px 96px 88px 80px;">
             <div style="font-size:12.5px;color:var(--sub);">${fmtDateTime(c.start_ts)}</div>
-            <div class="tm-ellipsis" style="font-size:13.5px;font-weight:500;">${esc(locName(c.location_id))}</div>
+            <div class="tm-ellipsis" style="font-size:13.5px;font-weight:500;">${esc(chargeLocName(c, locations))}</div>
             <div><span class="tm-badge ${c.charge_type === "DC" ? "tm-badge-dc" : "tm-badge-ac"}">${esc(c.charge_type || "AC")}</span></div>
             <div class="tm-right tm-mono">${c.energy_added_kwh != null ? "+" + fmt1(c.energy_added_kwh) : "—"} kWh</div>
             <div class="tm-right tm-mono" style="color:var(--sub);">${c.start_soc != null && c.end_soc != null ? `${c.start_soc} → ${c.end_soc}` : "—"} %</div>
             <div class="tm-right tm-mono" style="color:var(--sub);">${c.max_charger_power != null ? fmt0(c.max_charger_power) : "—"} kW</div>
             <div class="tm-right tm-mono" style="color:var(--sub);">${fmtDurationMin(c.duration_min)}</div>
-            <div class="tm-right tm-mono">${c.cost != null ? "€" + fmt2(c.cost) : "—"}</div>
+            <div class="tm-right tm-mono">${money(c.cost, c.currency)}</div>
           </div>`).join("")}
         <div class="tm-foot-note">${charges.length} session${charges.length === 1 ? "" : "s"}.</div>
       </div>
@@ -907,17 +935,17 @@ async function renderChargeDetail() {
   if (detail.error) return setContent(errorHtml(detail.error));
   const { session: c, curve } = detail;
   const locations = await safe(cached("locations", () => data.locations()), []);
-  const locName = (id) => (id == null ? "Unknown location" : locations.find((l) => l.id === id)?.name || "Unknown location");
 
   const t0 = c.start_ts;
   const powerPts = curve.filter((p) => p.charger_power != null).map((p) => [(p.ts - t0) / 60, p.charger_power]);
   const socPts = curve.filter((p) => p.soc != null).map((p) => [(p.ts - t0) / 60, p.soc]);
   const rate = c.energy_added_kwh && c.cost ? c.cost / c.energy_added_kwh : null;
+  const backfilled = c.source === "backfill";
 
   setContent(`
     <div class="tm-flex-row" style="gap:14px;">
       <button class="tm-back-btn" data-action="back-charges">← Charges</button>
-      <div style="font-size:15px;font-weight:600;">${esc(locName(c.location_id))}</div>
+      <div style="font-size:15px;font-weight:600;">${esc(chargeLocName(c, locations))}</div>
       <span class="tm-badge ${c.charge_type === "DC" ? "tm-badge-dc" : "tm-badge-ac"}">${esc(c.charge_type || "AC")}</span>
       <div style="font-size:12.5px;color:var(--faint);">${fmtDateTime(c.start_ts)}</div>
     </div>
@@ -925,8 +953,9 @@ async function renderChargeDetail() {
       <div class="tm-card" style="padding:18px 20px;"><div class="tm-stat-label">Energy added</div><div style="font-size:19px;font-weight:600;margin-top:5px;" class="tm-mono">${c.energy_added_kwh != null ? "+" + fmt1(c.energy_added_kwh) : "—"} kWh</div></div>
       <div class="tm-card" style="padding:18px 20px;"><div class="tm-stat-label">Battery</div><div style="font-size:19px;font-weight:600;margin-top:5px;" class="tm-mono">${c.start_soc != null && c.end_soc != null ? `${c.start_soc} → ${c.end_soc}` : "—"} %</div></div>
       <div class="tm-card" style="padding:18px 20px;"><div class="tm-stat-label">Peak power</div><div style="font-size:19px;font-weight:600;margin-top:5px;" class="tm-mono">${c.max_charger_power != null ? fmt0(c.max_charger_power) : "—"} <span style="font-size:12px;color:var(--sub);">kW</span></div></div>
-      <div class="tm-card" style="padding:18px 20px;"><div class="tm-stat-label">Cost</div><div style="font-size:19px;font-weight:600;margin-top:5px;" class="tm-mono">${c.cost != null ? "€" + fmt2(c.cost) : "—"}${rate != null ? ` <span style="font-size:12px;color:var(--sub);">@ €${fmt2(rate)}/kWh</span>` : ""}</div></div>
+      <div class="tm-card" style="padding:18px 20px;"><div class="tm-stat-label">Cost</div><div style="font-size:19px;font-weight:600;margin-top:5px;" class="tm-mono">${money(c.cost, c.currency)}${rate != null ? ` <span style="font-size:12px;color:var(--sub);">@ ${money(rate, c.currency)}/kWh</span>` : ""}</div></div>
     </div>
+    ${backfilled ? `<div style="font-size:11.5px;color:var(--faint);">Imported from Tesla charging history — SoC and per-minute charge curve aren't available for backfilled Supercharger sessions.</div>` : ""}
     <div class="tm-card tm-card-pad">
       <div class="tm-flex-row" style="align-items:baseline;gap:14px;margin-bottom:18px;">
         <div style="font-size:14px;font-weight:600;">Charge curve</div>
@@ -957,10 +986,11 @@ async function renderChargingStats() {
 
   if (!complete.length) return setContent(emptyHtml("No completed charge sessions yet", "Lifetime charging stats will appear here once sessions have been logged."));
 
+  const cur = dominantCurrency(complete);
   const totalEnergy = complete.reduce((s, c) => s + (c.energy_added_kwh || 0), 0);
   const totalCost = complete.reduce((s, c) => s + (c.cost || 0), 0);
   const avgPrice = totalEnergy > 0 ? totalCost / totalEnergy : null;
-  const totalKm = (await cached("all_drives", () => data.drives(vin(), 2000))).reduce((s, d) => s + (d.distance_km || 0), 0);
+  const totalKm = (await safe(cached("all_drives", () => data.drives(vin(), 2000)), [])).reduce((s, d) => s + (d.distance_km || 0), 0);
   const costPer100 = totalKm > 0 ? (totalCost / totalKm) * 100 : null;
 
   const byMonth = new Map();
@@ -978,9 +1008,9 @@ async function renderChargingStats() {
 
   const byLoc = new Map();
   for (const c of complete) {
-    const id = c.location_id ?? "none";
-    if (!byLoc.has(id)) byLoc.set(id, { name: locations.find((l) => l.id === c.location_id)?.name || "Unknown", kwh: 0, n: 0 });
-    const row = byLoc.get(id);
+    const name = chargeLocName(c, locations);
+    if (!byLoc.has(name)) byLoc.set(name, { name, kwh: 0, n: 0 });
+    const row = byLoc.get(name);
     row.kwh += c.energy_added_kwh || 0;
     row.n += 1;
   }
@@ -990,9 +1020,9 @@ async function renderChargingStats() {
   setContent(`
     <div class="tm-grid-metrics">
       <div class="tm-card tm-card-pad-metric"><div class="tm-stat-label">Total energy</div><div class="tm-stat-value">${fmt0(totalEnergy)} <span class="tm-stat-unit">kWh</span></div></div>
-      <div class="tm-card tm-card-pad-metric"><div class="tm-stat-label">Total cost</div><div class="tm-stat-value">€${fmt0(totalCost)}</div></div>
-      <div class="tm-card tm-card-pad-metric"><div class="tm-stat-label">Avg price</div><div class="tm-stat-value">${avgPrice != null ? "€" + fmt2(avgPrice) : "—"} <span class="tm-stat-unit">/kWh</span></div></div>
-      <div class="tm-card tm-card-pad-metric"><div class="tm-stat-label">Cost per 100 km</div><div class="tm-stat-value">${costPer100 != null ? "€" + fmt2(costPer100) : "—"}</div></div>
+      <div class="tm-card tm-card-pad-metric"><div class="tm-stat-label">Total cost</div><div class="tm-stat-value">${money(totalCost, cur, 0)}</div></div>
+      <div class="tm-card tm-card-pad-metric"><div class="tm-stat-label">Avg price</div><div class="tm-stat-value">${money(avgPrice, cur)} <span class="tm-stat-unit">/kWh</span></div></div>
+      <div class="tm-card tm-card-pad-metric"><div class="tm-stat-label">Cost per 100 km</div><div class="tm-stat-value">${money(costPer100, cur)}</div></div>
     </div>
     <div class="tm-grid-2">
       <div class="tm-card tm-card-pad">

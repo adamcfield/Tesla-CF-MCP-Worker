@@ -457,6 +457,16 @@ const TOOLS: Tool[] = [
 
   // ------------------------------------------------- tracking (TeslaMate-grade)
   {
+    name: "backfill_charge_history",
+    description:
+      "Import past Supercharger sessions from Tesla's charging-history API into the charge log " +
+      "(idempotent — safe to re-run; dedups by Tesla session id). Backfills energy, cost, site and time " +
+      "for Tesla-billed DC charging only (home AC charging isn't in Tesla's records, and no SoC/curve is " +
+      "included). Populates the Charges and Charging-stats views instantly. Free — does not wake the vehicle.",
+    inputSchema: vinSchema,
+    handler: (env, a) => tracking.backfillChargeHistory(env, a.vin),
+  },
+  {
     name: "get_tracking_summary",
     description:
       "Roll-up for a vehicle: odometer, lifetime driven km & energy, avg efficiency, drive/charge counts, " +

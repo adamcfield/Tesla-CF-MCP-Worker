@@ -15,6 +15,7 @@
  * query over charge_sessions / positions so they are always fresh.
  */
 
+import { getChargingHistory } from "./api";
 import {
   ensureSchema,
   haversineMeters,
@@ -575,6 +576,34 @@ export async function getChargeSessions(env: Env, vin: string, limit = 50): Prom
     .bind(vin, limit)
     .all();
   return rs.results ?? [];
+}
+
+/**
+ * Backfills past Supercharger sessions from Tesla's charging-history API into
+ * charge_sessions (idempotent — dedup by Tesla's sessionId via external_id).
+ * These carry energy/cost/site/time but no SoC, range, or per-sample curve, so
+ * they populate the Charges and Charging-stats views but not battery health.
+ * Live-derived sessions (source='derived') are never touched.
+ */
+export async function backfillChargeHistory(env: Env, vin: string): Promise<Record<string, unknown>> {
+  await ensureSchema(env);
+  const sessions = await getChargingHistory(env, vin);
+  let added = 0;
+  let skipped = 0;
+  for (const s of sessions) {
+    if (!Number.isFinite(s.external_id)) { skipped++; continue; }
+    const durationMin = s.start_ts !== null && s.end_ts !== null ? (s.end_ts - s.start_ts) / 60 : null;
+    const res = await env.DB.prepare(
+      `INSERT OR IGNORE INTO charge_sessions (
+         vin, start_ts, end_ts, status, charge_type, energy_added_kwh, cost, currency,
+         site_name, duration_min, external_id, source
+       ) VALUES (?1,?2,?3,'complete','DC',?4,?5,?6,?7,?8,?9,'backfill')`,
+    )
+      .bind(vin, s.start_ts, s.end_ts, s.energy_kwh, s.cost, s.currency, s.site_name, durationMin, s.external_id)
+      .run();
+    if ((res.meta.changes ?? 0) > 0) added++; else skipped++;
+  }
+  return { vin, fetched: sessions.length, added, skipped_existing: skipped };
 }
 
 export async function getChargeCurve(env: Env, sessionId: number): Promise<unknown> {
