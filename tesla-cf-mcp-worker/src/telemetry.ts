@@ -20,6 +20,7 @@
  */
 
 import { getOwnerToken } from "./auth";
+import { signTelemetryConfig } from "./fleetjws";
 import { Env, TeslaError, fleetBase } from "./types";
 
 async function fleetRequest<T>(env: Env, method: string, path: string, body?: unknown): Promise<T> {
@@ -55,11 +56,21 @@ export interface TelemetryConfigInput {
 
 /**
  * Registers a telemetry stream for the given VINs. The vehicle must have the
- * virtual key paired (same pairing as signed commands). Tesla signs and
- * delivers the config to the vehicle; check status with getTelemetryConfig.
+ * virtual key paired (same pairing as signed commands).
+ *
+ * Modern firmware rejects an unsigned config ("must be called through the
+ * Vehicle Command HTTP Proxy"), so we sign it in-worker as a Schnorr/P-256 JWT
+ * (alg "Tesla.SS256") with the paired command key and POST {vins, token} to
+ * the _jws endpoint — reproducing what tesla-http-proxy does. Check status with
+ * getTelemetryConfig.
  */
-export const createTelemetryConfig = (env: Env, input: TelemetryConfigInput) =>
-  fleetRequest<Record<string, unknown>>(env, "POST", "/api/1/vehicles/fleet_telemetry_config", input);
+export async function createTelemetryConfig(env: Env, input: TelemetryConfigInput): Promise<Record<string, unknown>> {
+  const token = await signTelemetryConfig(env, input.config as unknown as Record<string, unknown>);
+  return fleetRequest<Record<string, unknown>>(env, "POST", "/api/1/vehicles/fleet_telemetry_config_jws", {
+    vins: input.vins,
+    token,
+  });
+}
 
 export const getTelemetryConfig = (env: Env, vin: string) =>
   fleetRequest<Record<string, unknown>>(env, "GET", `/api/1/vehicles/${vin}/fleet_telemetry_config`);
