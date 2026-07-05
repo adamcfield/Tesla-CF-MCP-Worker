@@ -36,6 +36,8 @@ const CHARGING = new Set(["Charging", "Starting"]);
 /** A drive that moves less than this / lasts less than this is discarded as noise. */
 const MIN_DRIVE_KM = 0.05;
 const MIN_DRIVE_SECONDS = 60;
+/** Odometer jump (km) between two parked polls that we treat as a missed drive. */
+const MIN_DRIVE_KM_SYNTH = 0.5;
 
 // ---------------------------------------------------------------------------
 // Canonical-field helpers
@@ -132,6 +134,23 @@ export async function applyDerivation(
 ): Promise<void> {
   await ensureSchema(env);
   const activity = deriveActivity(current);
+
+  // 0. Odometer-jump recovery. Free-cron polling only watches the car ~5 min
+  //    per run and GitHub throttles the schedule to ~hourly, so most drives
+  //    happen entirely between polls and are never seen as a "driving" state.
+  //    If the odometer advanced meaningfully since the last sample while parked
+  //    (no open drive), synthesize the drive from the odometer delta so it
+  //    isn't lost — distance/endpoints/energy are real; only the GPS route is
+  //    missing. (Fleet Telemetry streaming eliminates the gap entirely.)
+  if (previous && activity !== "driving") {
+    const prevOdo = num(previous.odometer);
+    const curOdo = num(current.odometer);
+    const jumpKm = prevOdo !== null && curOdo !== null ? curOdo - prevOdo : 0;
+    const openNow = await getOpenDrive(env, vin);
+    if (!openNow && jumpKm >= MIN_DRIVE_KM_SYNTH && ts > previous.updated_at) {
+      await synthesizeDrive(env, vin, previous, current, ts, jumpKm).catch(() => {});
+    }
+  }
 
   // 1. Drives — open/close BEFORE inserting the position so it can be tagged.
   let openDrive = await getOpenDrive(env, vin);
@@ -290,6 +309,73 @@ async function closeDrive(env: Env, drive: DriveRow, s: LatestState, ts: number)
   // Auto-suggest a driver from historically-tagged drives with the same start
   // context (geofence/grid + hour-of-week bucket). Best-effort; never blocks.
   await suggestDriverForDrive(env, drive.id, drive.vin).catch(() => {});
+}
+
+/**
+ * Inserts a COMPLETE drive recovered from an odometer jump between two parked
+ * polls (a drive that happened entirely within a poll gap). Distance, energy,
+ * SoC delta and endpoints are real; there is no GPS route and no behaviour
+ * score (no per-second samples exist), and it's flagged synthetic=1. Endpoints
+ * are geofence-matched + reverse-geocoded like a normal drive.
+ */
+async function synthesizeDrive(
+  env: Env,
+  vin: string,
+  previous: LatestState,
+  current: LatestState,
+  ts: number,
+  distanceKm: number,
+): Promise<void> {
+  const startTs = previous.updated_at;
+  const startLat = num(previous.lat);
+  const startLon = num(previous.lon);
+  const endLat = num(current.lat);
+  const endLon = num(current.lon);
+  const startOdo = num(previous.odometer);
+  const endOdo = num(current.odometer);
+  const durationMin = Math.max(1, (ts - startTs) / 60);
+
+  // Energy: prefer EnergyRemaining delta, else SoC delta × pack.
+  let energyUsed: number | null = null;
+  const startEr = num(previous.energy_remaining);
+  const endEr = num(current.energy_remaining);
+  if (startEr !== null && endEr !== null && startEr - endEr > 0) energyUsed = startEr - endEr;
+  else {
+    const startSoc = num(previous.soc);
+    const endSoc = num(current.soc);
+    const pack = await getPackKwh(env, vin);
+    if (startSoc !== null && endSoc !== null && pack !== null && startSoc - endSoc > 0) {
+      energyUsed = ((startSoc - endSoc) / 100) * pack;
+    }
+  }
+  const efficiency = energyUsed !== null && distanceKm > 0.1 ? (energyUsed * 1000) / distanceKm : null;
+  const avgSpeed = durationMin > 0 ? distanceKm / (durationMin / 60) : null;
+
+  const startLoc = startLat !== null && startLon !== null ? await matchLocation(env, startLat, startLon) : null;
+  const endLoc = endLat !== null && endLon !== null ? await matchLocation(env, endLat, endLon) : null;
+  const startAddr = startLat !== null && startLon !== null ? await reverseGeocode(env, startLat, startLon) : null;
+  const endAddr = endLat !== null && endLon !== null ? await reverseGeocode(env, endLat, endLon) : null;
+
+  const res = await env.DB.prepare(
+    `INSERT INTO drives (
+       vin, start_ts, end_ts, status, synthetic,
+       start_lat, start_lon, end_lat, end_lon, start_location_id, end_location_id,
+       start_odometer, end_odometer, distance_km, duration_min,
+       start_soc, end_soc, start_rated_range, end_rated_range,
+       energy_used_kwh, efficiency_wh_km, avg_speed, sample_count,
+       start_address, end_address, outside_temp_avg
+     ) VALUES (?1,?2,?3,'complete',1,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,0,?21,?22,?23)`,
+  )
+    .bind(
+      vin, startTs, ts, startLat, startLon, endLat, endLon, startLoc, endLoc,
+      startOdo, endOdo, round(distanceKm, 2), round(durationMin, 1),
+      num(previous.soc), num(current.soc), num(previous.rated_range), num(current.rated_range),
+      energyUsed !== null ? round(energyUsed, 3) : null, efficiency !== null ? round(efficiency, 1) : null,
+      avgSpeed !== null ? round(avgSpeed, 1) : null, startAddr, endAddr, num(current.outside_temp),
+    )
+    .run();
+  const newId = Number(res.meta.last_row_id ?? 0);
+  if (newId) await suggestDriverForDrive(env, newId, vin).catch(() => {});
 }
 
 /**
@@ -505,6 +591,19 @@ async function closeChargeSession(
     )
     .run();
 
+  // Name the charge location — a live-derived session at "Unknown location"
+  // otherwise. A matched geofence name wins in the UI; else reverse-geocode
+  // the coordinates into site_name (the field the dashboard already displays).
+  if (session.location_id == null) {
+    const loc = await env.DB.prepare(`SELECT lat, lon, site_name FROM charge_sessions WHERE id = ?1`)
+      .bind(session.id)
+      .first<{ lat: number | null; lon: number | null; site_name: string | null }>();
+    if (loc && !loc.site_name && loc.lat != null && loc.lon != null) {
+      const addr = await reverseGeocode(env, loc.lat, loc.lon);
+      if (addr) await env.DB.prepare(`UPDATE charge_sessions SET site_name = ?2 WHERE id = ?1`).bind(session.id, addr).run();
+    }
+  }
+
   // Self-calibrate usable pack size from a clean session (>=10% SoC gained).
   if (energyAdded !== null && energyAdded > 0 && session.start_soc !== null && endSoc !== null) {
     const dSoc = endSoc - session.start_soc;
@@ -659,6 +758,65 @@ export async function backfillDriveAddresses(env: Env, vin: string, limit = 40):
       await env.DB.prepare(`UPDATE drives SET start_address = COALESCE(?2, start_address), end_address = COALESCE(?3, end_address) WHERE id = ?1`)
         .bind(d.id, startAddr, endAddr)
         .run();
+      updated++;
+    }
+  }
+  return { vin, examined: (rs.results ?? []).length, updated };
+}
+
+/**
+ * Recovers drives that free-cron polling missed, from the odometer history in
+ * `positions`. Scans consecutive parked samples (drive_id IS NULL) for an
+ * odometer jump ≥ the threshold with no drive already covering that span, and
+ * synthesizes a drive for each. Idempotent (the coverage check skips spans a
+ * prior run already filled). This is how a Home→beach→Home trip that happened
+ * between two hourly polls shows up after the fact.
+ */
+export async function backfillSyntheticDrives(env: Env, vin: string, limit = 100): Promise<Record<string, unknown>> {
+  await ensureSchema(env);
+  const rs = await env.DB.prepare(
+    `SELECT ts, odometer, lat, lon, soc, rated_range, energy_remaining, outside_temp, drive_id
+     FROM positions WHERE vin = ?1 AND odometer IS NOT NULL ORDER BY ts ASC`,
+  )
+    .bind(vin)
+    .all<{ ts: number; odometer: number; lat: number | null; lon: number | null; soc: number | null; rated_range: number | null; energy_remaining: number | null; outside_temp: number | null; drive_id: number | null }>();
+  const rows = rs.results ?? [];
+  let created = 0;
+  let examined = 0;
+  for (let i = 1; i < rows.length && created < limit; i++) {
+    const a = rows[i - 1]!;
+    const b = rows[i]!;
+    if (a.drive_id != null || b.drive_id != null) continue; // part of a real drive
+    const jump = b.odometer - a.odometer;
+    if (jump < MIN_DRIVE_KM_SYNTH) continue;
+    examined++;
+    // Skip if a drive (real or already-synthesized) covers this span.
+    const covered = await env.DB.prepare(
+      `SELECT 1 FROM drives WHERE vin = ?1 AND status = 'complete' AND start_ts <= ?2 AND end_ts >= ?3 LIMIT 1`,
+    ).bind(vin, a.ts, b.ts).first();
+    if (covered) continue;
+    const prev: LatestState = { vin, updated_at: a.ts, odometer: a.odometer, lat: a.lat, lon: a.lon, soc: a.soc, rated_range: a.rated_range, energy_remaining: a.energy_remaining };
+    const cur: LatestState = { vin, updated_at: b.ts, odometer: b.odometer, lat: b.lat, lon: b.lon, soc: b.soc, rated_range: b.rated_range, energy_remaining: b.energy_remaining, outside_temp: b.outside_temp };
+    await synthesizeDrive(env, vin, prev, cur, b.ts, jump).catch(() => {});
+    created++;
+  }
+  return { vin, jumps_examined: examined, drives_recovered: created };
+}
+
+/** Reverse-geocodes derived charge sessions that show as "Unknown location". */
+export async function backfillChargeAddresses(env: Env, vin: string, limit = 40): Promise<Record<string, unknown>> {
+  await ensureSchema(env);
+  const rs = await env.DB.prepare(
+    `SELECT id, lat, lon FROM charge_sessions
+     WHERE vin = ?1 AND status = 'complete' AND location_id IS NULL
+       AND (site_name IS NULL OR site_name = '') AND lat IS NOT NULL AND lon IS NOT NULL
+     ORDER BY start_ts DESC LIMIT ?2`,
+  ).bind(vin, limit).all<{ id: number; lat: number; lon: number }>();
+  let updated = 0;
+  for (const c of rs.results ?? []) {
+    const addr = await reverseGeocode(env, c.lat, c.lon);
+    if (addr) {
+      await env.DB.prepare(`UPDATE charge_sessions SET site_name = ?2 WHERE id = ?1`).bind(c.id, addr).run();
       updated++;
     }
   }

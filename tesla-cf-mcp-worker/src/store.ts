@@ -201,6 +201,7 @@ export async function ensureSchema(env: Env): Promise<void> {
     score_high: "REAL", // upper bound
     score_confidence: "TEXT", // 'high' | 'medium' | 'low' (from sampling density)
     accel_source: "TEXT", // 'imu' (real telemetry) | 'derived' (Δv/Δt proxy)
+    synthetic: "INTEGER", // 1 = recovered from an odometer jump (no GPS route; drive happened in a poll gap)
     coach_note: "TEXT", // AI per-drive coaching note
     // Active-driver-profile fingerprint captured at drive start (differs per
     // person — the exposed stand-in for seat-position memory).

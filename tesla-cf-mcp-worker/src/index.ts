@@ -61,8 +61,10 @@ import { loadCommandKey } from "./protocol";
 import { runCronTick } from "./rules";
 import { getAppState, getLatest, listAlerts, querySeries } from "./store";
 import {
+  backfillChargeAddresses,
   backfillChargeHistory,
   backfillDriveAddresses,
+  backfillSyntheticDrives,
   getBatteryDegradation,
   getChargeCurve,
   getChargeSessions,
@@ -470,7 +472,14 @@ export default {
       if (path === "/setup/backfill-addresses" && request.method === "POST") {
         const vin = url.searchParams.get("vin");
         if (!vin) return json({ error: "vin query param required" }, 400);
-        return json(await backfillDriveAddresses(env, vin));
+        const drives = await backfillDriveAddresses(env, vin);
+        const charges = await backfillChargeAddresses(env, vin);
+        return json({ drives, charges });
+      }
+      if (path === "/setup/recover-drives" && request.method === "POST") {
+        const vin = url.searchParams.get("vin");
+        if (!vin) return json({ error: "vin query param required" }, 400);
+        return json(await backfillSyntheticDrives(env, vin));
       }
 
       return new Response("Not found", { status: 404 });

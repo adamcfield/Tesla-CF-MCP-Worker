@@ -6,7 +6,9 @@
 import { describe, it, expect, beforeEach } from "vitest";
 import { scoreDrive } from "../src/scoring";
 import { ensureSchema, resetSchemaCacheForTests } from "../src/store";
-import { closeStaleSessions, getEfficiencyByTemp, getMonthlyReport } from "../src/tracking";
+import { applyDerivation } from "../src/tracking";
+import { backfillSyntheticDrives, closeStaleSessions, getEfficiencyByTemp, getMonthlyReport } from "../src/tracking";
+import type { LatestState } from "../src/store";
 import { FakeD1 } from "./helpers/d1";
 import { FakeKV } from "./helpers/kv";
 import type { Env } from "../src/types";
@@ -136,6 +138,54 @@ describe("stale-session auto-close", () => {
     const stillOpen = await env.DB.prepare(`SELECT status FROM drives WHERE id = ?1`)
       .bind(Number(fresh.meta.last_row_id)).first<any>();
     expect(stillOpen.status).toBe("active");
+  });
+});
+
+describe("odometer-jump drive recovery (missed by poll gaps)", () => {
+  let env: Env;
+  beforeEach(async () => {
+    env = makeEnv();
+    await ensureSchema(env);
+  });
+
+  it("synthesizes a drive when the odometer jumps between two parked polls", async () => {
+    const t = 1_750_000_000;
+    // Poll 1: parked at home, odo 1000. Poll 2 (an hour later): parked, odo 1012
+    // — 12 km driven in the gap, never seen as "driving".
+    const p1: LatestState = { vin: VIN, updated_at: t, odometer: 1000, lat: 32.08, lon: 34.79, soc: 80, gear: "P", speed: 0 };
+    const p2: LatestState = { vin: VIN, updated_at: t + 3600, odometer: 1012, lat: 32.02, lon: 34.75, soc: 74, gear: "P", speed: 0 };
+    await applyDerivation(env, VIN, t, null, p1);
+    await applyDerivation(env, VIN, t + 3600, p1, p2);
+
+    const rs = await env.DB.prepare(`SELECT distance_km, synthetic, status, start_odometer, end_odometer FROM drives WHERE vin = ?1`).bind(VIN).all<any>();
+    const synth = (rs.results ?? []).find((d) => d.synthetic === 1);
+    expect(synth).toBeTruthy();
+    expect(synth.distance_km).toBeCloseTo(12, 1);
+    expect(synth.status).toBe("complete");
+  });
+
+  it("does NOT synthesize during a real captured drive (guarded by activity + open drive)", async () => {
+    const t = 1_750_100_000;
+    // P -> D -> P with a moving odometer: the normal engine captures it; no synthetic dup.
+    const park: LatestState = { vin: VIN, updated_at: t, odometer: 2000, lat: 32.0, lon: 34.8, soc: 90, gear: "P", speed: 0 };
+    const drive: LatestState = { vin: VIN, updated_at: t + 60, odometer: 2003, lat: 32.01, lon: 34.81, soc: 89, gear: "D", speed: 40 };
+    const park2: LatestState = { vin: VIN, updated_at: t + 120, odometer: 2005, lat: 32.02, lon: 34.82, soc: 88, gear: "P", speed: 0 };
+    await applyDerivation(env, VIN, t, null, park);
+    await applyDerivation(env, VIN, t + 60, park, drive);
+    await applyDerivation(env, VIN, t + 120, drive, park2);
+    const synthCount = await env.DB.prepare(`SELECT COUNT(*) n FROM drives WHERE vin = ?1 AND synthetic = 1`).bind(VIN).first<{ n: number }>();
+    expect(synthCount!.n).toBe(0); // real drive captured, no synthetic duplicate
+  });
+
+  it("backfillSyntheticDrives recovers a jump from the positions history, idempotently", async () => {
+    const t = 1_750_200_000;
+    // Two parked position samples (drive_id NULL) with a 9 km odometer jump.
+    await env.DB.prepare(`INSERT INTO positions (vin, ts, activity, odometer, lat, lon, soc) VALUES (?1,?2,'idle',5000,32.0,34.8,70)`).bind(VIN, t).run();
+    await env.DB.prepare(`INSERT INTO positions (vin, ts, activity, odometer, lat, lon, soc) VALUES (?1,?2,'idle',5009,32.05,34.85,66)`).bind(VIN, t + 3600).run();
+    const first = await backfillSyntheticDrives(env, VIN) as { drives_recovered: number };
+    expect(first.drives_recovered).toBe(1);
+    const again = await backfillSyntheticDrives(env, VIN) as { drives_recovered: number };
+    expect(again.drives_recovered).toBe(0); // idempotent — the span is already covered
   });
 });
 
