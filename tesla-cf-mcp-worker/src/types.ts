@@ -27,6 +27,17 @@ export interface Env {
    * automation tick. Unset/invalid = keep everything forever.
    */
   RETENTION_DAYS?: string;
+  /**
+   * Optional soft cap (USD) for AUTOMATED polling spend per month, default 8.
+   * Clamped under the $9.50 hard ceiling that protects Tesla's $10 disable line.
+   */
+  BUDGET_POLL_USD?: string;
+  /**
+   * Optional quiet window for idle probes, UTC hours "start-end" (e.g. "21-3"
+   * = 00:00–06:00 Israel time). Free connectivity checks continue; billed
+   * idle probes pause. Unset = probe around the clock.
+   */
+  QUIET_HOURS_UTC?: string;
 }
 
 /** Regional Fleet API bases — https://developer.tesla.com/docs/fleet-api */

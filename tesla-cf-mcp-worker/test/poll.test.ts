@@ -68,7 +68,7 @@ describe("pollOnce adaptive interval", () => {
     const r = await pollOnce(makeEnv(kv), VIN);
     expect(r.activity).toBe("driving");
     expect(r.active).toBe(true);
-    expect(r.next_interval_s).toBe(10);
+    expect(r.next_interval_s).toBe(30); // budget-tuned driving cadence
     expect(r.polled).toBe(true);
   });
 
@@ -77,7 +77,7 @@ describe("pollOnce adaptive interval", () => {
     const r = await pollOnce(makeEnv(kv), VIN);
     expect(r.activity).toBe("charging");
     expect(r.active).toBe(true);
-    expect(r.next_interval_s).toBe(30);
+    expect(r.next_interval_s).toBe(90);
   });
 
   it("idle-online → watch at 60s while recently active, then suspend so it can sleep", async () => {

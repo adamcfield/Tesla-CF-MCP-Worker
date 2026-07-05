@@ -39,6 +39,7 @@ import {
   timingSafeEqual,
   unauthorized,
 } from "./auth";
+import { getBudgetStatus } from "./budget";
 import { handleIngest } from "./ingest";
 import { handleMcp, SERVER_VERSION } from "./mcp";
 import { pollOnce } from "./poll";
@@ -117,6 +118,7 @@ async function handleHealth(request: Request, url: URL, env: Env): Promise<Respo
 
   if (tokenAuthorized(request, url, env.MCP_AUTH_TOKEN)) {
     body.owner_grant = (await ownerGrantPresent(env).catch(() => false)) ? "present" : "missing";
+    body.budget = await getBudgetStatus(env).catch(() => "unavailable");
     try {
       const rs = await env.DB.prepare(
         `SELECT vin, MAX(ts) AS last_ts FROM positions GROUP BY vin`,

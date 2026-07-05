@@ -8,6 +8,7 @@
  */
 
 import { getOwnerToken } from "./auth";
+import { getBudgetStatus, recordSpend } from "./budget";
 import { Env, TeslaError, VehicleSummary, fleetBase } from "./types";
 
 async function fleetGet<T>(env: Env, path: string): Promise<T> {
@@ -123,6 +124,14 @@ export async function getVehicleData(
   vin: string,
   endpoints?: string[],
 ): Promise<Record<string, unknown>> {
+  const budget = await getBudgetStatus(env);
+  if (!budget.commands_allowed) {
+    throw new TeslaError(
+      `Monthly Tesla API budget exhausted ($${budget.spent_usd} of $${budget.hard_ceiling_usd} ceiling). ` +
+        "Billed reads are paused until the 1st so Tesla never hard-disables the app. Cached data (get_latest_state, /data/*) still works.",
+      429,
+    );
+  }
   const state = await getVehicle(env, vin);
   if (state.state !== "online") {
     throw new TeslaError(
@@ -132,12 +141,24 @@ export async function getVehicleData(
       408,
     );
   }
+  // Tesla bills any response with status <500, so count before the call
+  // (a rare 5xx overcounts a fraction of a cent — the safe direction).
+  await recordSpend(env, "vehicle_data");
   const qs = endpoints?.length ? `?endpoints=${encodeURIComponent(endpoints.join(";"))}` : "";
   return fleetGet<Record<string, unknown>>(env, `/api/1/vehicles/${vin}/vehicle_data${qs}`);
 }
 
-export const wakeVehicle = (env: Env, vin: string): Promise<VehicleSummary> =>
-  fleetPost<VehicleSummary>(env, `/api/1/vehicles/${vin}/wake_up`);
+export async function wakeVehicle(env: Env, vin: string): Promise<VehicleSummary> {
+  const budget = await getBudgetStatus(env);
+  if (!budget.commands_allowed) {
+    throw new TeslaError(
+      `Monthly Tesla API budget exhausted ($${budget.spent_usd}). Wakes are paused until the 1st.`,
+      429,
+    );
+  }
+  await recordSpend(env, "wake");
+  return fleetPost<VehicleSummary>(env, `/api/1/vehicles/${vin}/wake_up`);
+}
 
 export function nearbyChargingSites(
   env: Env,

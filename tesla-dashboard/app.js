@@ -408,6 +408,23 @@ async function loadLiveVehicleData() {
   await renderOverview();
 }
 
+/** Tesla API spend card: month-to-date vs the free-tier poll cap, with a bar. */
+function budgetCard(b) {
+  if (!b || typeof b !== "object") return "";
+  const pct = b.poll_budget_usd > 0 ? Math.min(100, (b.spent_usd / b.poll_budget_usd) * 100) : 0;
+  const color = !b.poll_allowed ? "var(--warn)" : "var(--good)";
+  const note = !b.poll_allowed ? "polling paused — resumes on the 1st" : "of free-tier cap · never charged";
+  return `
+    <div class="tm-card tm-card-pad-metric">
+      <div class="tm-stat-label">Tesla API spend · ${esc(b.month || "")}</div>
+      <div class="tm-stat-value">$${fmt2(b.spent_usd)} <span class="tm-stat-unit">/ $${fmt0(b.poll_budget_usd)}</span></div>
+      <div style="height:5px;border-radius:999px;background:var(--chip);margin-top:8px;position:relative;overflow:hidden;">
+        <div style="position:absolute;inset:0 auto 0 0;width:${pct.toFixed(1)}%;background:${color};border-radius:999px;"></div>
+      </div>
+      <div class="tm-stat-note">${esc(note)}</div>
+    </div>`;
+}
+
 function readTyres(src) {
   // Live vehicle_data uses tpms_pressure_fl; the worker's latest-state store
   // uses the canonical short form tpms_fl. Accept both. Values are bar.
@@ -539,6 +556,7 @@ async function renderOverview() {
         <div class="tm-stat-label">Avg efficiency</div>
         <div class="tm-stat-value">${summary?.avg_efficiency_wh_km != null ? fmt0(summary.avg_efficiency_wh_km) : "—"} <span class="tm-stat-unit">Wh/km</span></div>
       </div>
+      ${budgetCard(summary?.api_budget)}
     </div>
 
     <div class="tm-grid-2">

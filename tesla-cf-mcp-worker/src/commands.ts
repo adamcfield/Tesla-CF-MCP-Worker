@@ -5,6 +5,7 @@
  */
 
 import { getOwnerToken } from "./auth";
+import { getBudgetStatus, recordSpend } from "./budget";
 import {
   CarServer,
   ClosureMove,
@@ -56,6 +57,15 @@ interface CommandContext {
 }
 
 async function sendRoutable(ctx: CommandContext, msg: Uint8Array): Promise<Uint8Array> {
+  const budget = await getBudgetStatus(ctx.env);
+  if (!budget.commands_allowed) {
+    throw new TeslaError(
+      `Monthly Tesla API budget exhausted ($${budget.spent_usd} of $${budget.hard_ceiling_usd} ceiling). ` +
+        "Commands are paused until the 1st so Tesla never hard-disables the app.",
+      429,
+    );
+  }
+  await recordSpend(ctx.env, "command"); // every signed_command POST (incl. handshakes) is billed
   const token = await getOwnerToken(ctx.env);
   const resp = await fetch(`${fleetBase(ctx.env)}/api/1/vehicles/${ctx.vin}/signed_command`, {
     method: "POST",
