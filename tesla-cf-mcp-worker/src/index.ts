@@ -63,6 +63,27 @@ const json = (data: unknown, status = 200): Response =>
     headers: { "content-type": "application/json", "access-control-allow-origin": "*" },
   });
 
+/**
+ * CORS for browser-based clients (the tesla-dashboard, MCP inspector, etc.).
+ * A wildcard origin is safe here: auth is a bearer token the caller must
+ * already hold, never a cookie, so cross-origin requests carry no ambient
+ * credentials to steal. The preflight MUST be answered before the auth gate —
+ * browsers send OPTIONS without the Authorization header, so a gated
+ * preflight 401s and the real request is never sent.
+ */
+const CORS_HEADERS: Record<string, string> = {
+  "access-control-allow-origin": "*",
+  "access-control-allow-methods": "GET, POST, OPTIONS",
+  "access-control-allow-headers": "authorization, content-type, mcp-protocol-version, mcp-session-id",
+  "access-control-max-age": "86400",
+};
+
+function withCors(resp: Response): Response {
+  const out = new Response(resp.body, resp);
+  for (const [k, v] of Object.entries(CORS_HEADERS)) out.headers.set(k, v);
+  return out;
+}
+
 /** Bearer header or ?token= query param (documented tradeoff for OBS/Grafana). */
 function tokenAuthorized(request: Request, url: URL, expected: string): boolean {
   const header = request.headers.get("authorization")?.match(/^Bearer\s+(.+)$/i)?.[1]?.trim();
@@ -154,6 +175,11 @@ export default {
     const path = url.pathname;
 
     try {
+      // --- CORS preflight (must precede every auth gate) ------------------
+      if (request.method === "OPTIONS") {
+        return new Response(null, { status: 204, headers: CORS_HEADERS });
+      }
+
       // --- public -------------------------------------------------------
       if (path === "/.well-known/appspecific/com.tesla.3p.public-key.pem") {
         const key = await loadCommandKey(env.TESLA_PRIVATE_KEY);
@@ -192,9 +218,11 @@ export default {
       }
 
       // --- gated --------------------------------------------------------
-      if (!(await isMcpAuthorized(request, env))) return unauthorized(env);
+      if (!(await isMcpAuthorized(request, env))) {
+        return path === "/mcp" ? withCors(unauthorized(env)) : unauthorized(env);
+      }
 
-      if (path === "/mcp") return handleMcp(request, env);
+      if (path === "/mcp") return withCors(await handleMcp(request, env));
       if (path === "/setup/register-partner" && request.method === "POST") {
         return handleRegisterPartner(env);
       }
