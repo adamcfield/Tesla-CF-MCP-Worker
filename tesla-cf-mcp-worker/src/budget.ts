@@ -30,9 +30,9 @@ export const COST_MICRO = {
 export type BillableKind = keyof typeof COST_MICRO;
 
 /** Automated polling stops here (micro-dollars). Override with BUDGET_POLL_USD. */
-const DEFAULT_POLL_BUDGET = 8_000_000; // $8.00
-/** Absolute ceiling for ALL tracked spend, kept under Tesla's $10 disable line. */
-const HARD_CEILING = 9_500_000; // $9.50
+const DEFAULT_POLL_BUDGET = 9_000_000; // $9.00 — use most of the free $10 credit
+/** Absolute ceiling for ALL tracked spend, kept just under Tesla's $10 disable line. */
+const HARD_CEILING = 9_700_000; // $9.70 (leaves headroom for user-initiated commands)
 
 const monthKey = (): string => {
   const d = new Date();

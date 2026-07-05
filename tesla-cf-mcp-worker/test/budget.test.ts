@@ -40,13 +40,13 @@ describe("spend accounting", () => {
   it("closes the poll gate at the poll budget and the command gate at the ceiling", async () => {
     const kv = new FakeKV();
     const env = makeEnv(kv);
-    // 4001 vehicle_data reads = $8.002 — past the $8 poll cap, under the $9.50 ceiling.
-    await recordSpend(env, "vehicle_data", 4001);
+    // 4501 vehicle_data reads = $9.002 — past the $9 poll cap, under the $9.70 ceiling.
+    await recordSpend(env, "vehicle_data", 4501);
     let s = await getBudgetStatus(env);
     expect(s.poll_allowed).toBe(false);
     expect(s.commands_allowed).toBe(true);
-    // push over the ceiling
-    await recordSpend(env, "wake", 80); // +$1.60 → $9.602
+    // push over the $9.70 ceiling
+    await recordSpend(env, "wake", 40); // +$0.80 → $9.802
     s = await getBudgetStatus(env);
     expect(s.commands_allowed).toBe(false);
   });

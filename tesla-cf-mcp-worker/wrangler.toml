@@ -34,9 +34,9 @@ TESLA_REGION = "eu"
 # Public origin this Worker is served from. Used for OAuth redirect URIs and the
 # partner-account domain registration. Set to your custom domain once routed.
 PUBLIC_ORIGIN = "https://tesla-cf-mcp-worker.adamcfield.workers.dev"
-# Automated-polling spend cap (USD/month). Kept under Tesla's $10 credit so the
-# account is never hard-disabled; billed reads pause at this and resume on the 1st.
-BUDGET_POLL_USD = "8"
+# Automated-polling spend cap (USD/month). Uses most of Tesla's free $10 credit;
+# billed reads pause here (never a charge — Tesla suspends past $10) and resume on the 1st.
+BUDGET_POLL_USD = "9"
 # Pause billed idle probes overnight (UTC hours). 21-3 = 00:00–06:00 Israel time.
 # Active driving/charging is still recorded; only the every-15-min idle probe pauses.
 QUIET_HOURS_UTC = "21-3"
