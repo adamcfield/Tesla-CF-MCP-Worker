@@ -1,0 +1,73 @@
+# Adaptive high-frequency vehicle poller — the mechanism that gives
+# TeslaMate-grade history (full drive routes, speed curves, charge curves,
+# state timeline, degradation, vampire drain) without any always-on server.
+#
+# TeslaMate records by polling the car every few seconds while it's active;
+# this does the same, using free GitHub Actions compute (this repo is public,
+# so Actions minutes are unlimited). Each run loops for ~4.5 minutes calling
+# the worker's /poll/now, which does ONE billed vehicle_data read when the car
+# is online and returns how long to wait before the next poll:
+#   driving  -> ~10s   charging -> ~30s   idle-online -> ~60s
+#   asleep/offline/suspended -> the loop exits (no billed reads; never wakes
+#   the car), and the next scheduled run picks back up.
+#
+# Cost: billed Tesla reads happen ONLY while the car is online. An hour of
+# driving is a few hundred reads (~$0.12-equivalent); parked/asleep is free.
+# For lower cost at full fidelity, switch to Fleet Telemetry streaming later
+# (~18x cheaper) — the worker's /ingest path already supports it.
+#
+# Requires the MCP_AUTH_TOKEN repo secret (already set) and the VIN below.
+
+name: tesla-poll
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch: {}
+
+concurrency:
+  group: tesla-poll
+  cancel-in-progress: false
+
+env:
+  WORKER: https://tesla-cf-mcp-worker.adamcfield.workers.dev
+  VIN: LRW3E7ET1RC159967
+
+jobs:
+  poll:
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    steps:
+      - name: Adaptive poll loop
+        run: |
+          set -uo pipefail
+          # Run for ~4.5 min, then let the next scheduled run take over. The
+          # concurrency group prevents two loops overlapping.
+          DEADLINE=$(( $(date +%s) + 270 ))
+          idle_polls=0
+          while [ "$(date +%s)" -lt "$DEADLINE" ]; do
+            RESP=$(curl -sS --max-time 30 \
+              -H "Authorization: Bearer ${{ secrets.MCP_AUTH_TOKEN }}" \
+              "$WORKER/poll/now?vin=$VIN" || echo '{}')
+            STATE=$(echo "$RESP"  | python3 -c "import sys,json;print(json.load(sys.stdin).get('state','?'))" 2>/dev/null || echo '?')
+            ACT=$(echo "$RESP"    | python3 -c "import sys,json;print(json.load(sys.stdin).get('activity','?'))" 2>/dev/null || echo '?')
+            ACTIVE=$(echo "$RESP" | python3 -c "import sys,json;print(json.load(sys.stdin).get('active',False))" 2>/dev/null || echo 'False')
+            IVAL=$(echo "$RESP"   | python3 -c "import sys,json;print(int(json.load(sys.stdin).get('next_interval_s',60)))" 2>/dev/null || echo 60)
+            echo "$(date -u +%H:%M:%S)  state=$STATE activity=$ACT active=$ACTIVE next=${IVAL}s"
+
+            if [ "$ACTIVE" != "True" ]; then
+              # Car is asleep/offline/suspended. Do a couple of light re-checks
+              # in case it wakes, then exit so we don't hold a runner idle.
+              idle_polls=$((idle_polls + 1))
+              [ "$idle_polls" -ge 2 ] && { echo "car not active — exiting until next scheduled run"; break; }
+            else
+              idle_polls=0
+            fi
+
+            # Don't oversleep past the deadline.
+            NOW=$(date +%s)
+            REMAIN=$(( DEADLINE - NOW ))
+            [ "$REMAIN" -le 0 ] && break
+            [ "$IVAL" -gt "$REMAIN" ] && IVAL=$REMAIN
+            sleep "$IVAL"
+          done

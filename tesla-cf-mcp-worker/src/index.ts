@@ -41,6 +41,7 @@ import {
 } from "./auth";
 import { handleIngest } from "./ingest";
 import { handleMcp, SERVER_VERSION } from "./mcp";
+import { pollOnce } from "./poll";
 import { loadCommandKey } from "./protocol";
 import { runCronTick } from "./rules";
 import { getLatest, querySeries } from "./store";
@@ -272,6 +273,11 @@ export default {
       }
 
       if (path === "/mcp") return withCors(await handleMcp(request, env));
+      if (path === "/poll/now") {
+        const pollVin = url.searchParams.get("vin");
+        if (!pollVin) return json({ error: "vin query param required" }, 400);
+        return json(await pollOnce(env, pollVin));
+      }
       if (path === "/setup/register-partner" && request.method === "POST") {
         return handleRegisterPartner(env);
       }
