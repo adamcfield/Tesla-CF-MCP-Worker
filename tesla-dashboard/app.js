@@ -387,8 +387,12 @@ async function loadLiveVehicleData() {
   await renderOverview();
 }
 
-function readTyres(vs) {
-  const vals = [vs?.tpms_pressure_fl, vs?.tpms_pressure_fr, vs?.tpms_pressure_rl, vs?.tpms_pressure_rr].filter((v) => typeof v === "number");
+function readTyres(src) {
+  // Live vehicle_data uses tpms_pressure_fl; the worker's latest-state store
+  // uses the canonical short form tpms_fl. Accept both. Values are bar.
+  const vals = ["fl", "fr", "rl", "rr"]
+    .map((w) => src?.[`tpms_pressure_${w}`] ?? src?.[`tpms_${w}`])
+    .filter((v) => typeof v === "number");
   if (!vals.length) return null;
   return vals.reduce((a, b) => a + b, 0) / vals.length;
 }
@@ -406,14 +410,20 @@ async function renderOverview() {
   const cs = vd?.charge_state, cl = vd?.climate_state, vs = vd?.vehicle_state, ds = vd?.drive_state, vc = vd?.vehicle_config;
 
   const soc = cs?.battery_level ?? latest?.soc ?? null;
-  const range = cs?.est_battery_range ?? latest?.est_range ?? null;
+  // Live vehicle_data ranges are miles; the worker's store is normalized km.
+  // Some firmware omits est_battery_range entirely — fall back to rated range.
+  const MI = 1.609344;
+  const liveRange = [cs?.est_battery_range, cs?.battery_range].find((v) => typeof v === "number");
+  const storedRange = [latest?.est_range, latest?.rated_range].find((v) => typeof v === "number");
+  const range = liveRange != null ? liveRange * MI : storedRange ?? null;
   const chargeLimit = cs?.charge_limit_soc ?? null;
   const inside = cl?.inside_temp ?? latest?.inside_temp ?? null;
   const outside = cl?.outside_temp ?? latest?.outside_temp ?? null;
   const tyres = readTyres(vs) ?? readTyres(latest);
   const locked = vs?.locked ?? latest?.locked ?? null;
-  const odometer = vs?.odometer ?? summary?.odometer_km ?? latest?.odometer ?? null;
-  const swVersion = vs?.car_version ?? null;
+  // vs.odometer (live read) is miles; summary/latest are already-normalized km.
+  const odometer = typeof vs?.odometer === "number" ? vs.odometer * MI : summary?.odometer_km ?? latest?.odometer ?? null;
+  const swVersion = vs?.car_version ?? latest?.software_version ?? null;
   const lat = ds?.latitude ?? latest?.lat ?? null;
   const lon = ds?.longitude ?? latest?.lon ?? null;
   const modelSub = vc ? [vc.car_type, vc.trim_badging].filter(Boolean).join(" · ") : "";
@@ -468,7 +478,7 @@ async function renderOverview() {
           <div class="tm-grid-metrics" style="grid-template-columns:repeat(auto-fit,minmax(90px,1fr));gap:14px;">
             <div><div class="tm-readout-label">Inside</div><div class="tm-readout-value">${inside != null ? fmt1(inside) + " °C" : "—"}</div></div>
             <div><div class="tm-readout-label">Outside</div><div class="tm-readout-value">${outside != null ? fmt1(outside) + " °C" : "—"}</div></div>
-            <div><div class="tm-readout-label">Tyres</div><div class="tm-readout-value">${tyres != null ? fmt1(tyres) + " PSI" : "—"}</div></div>
+            <div><div class="tm-readout-label">Tyres</div><div class="tm-readout-value">${tyres != null ? fmt1(tyres * 14.5038) + " PSI" : "—"}</div></div>
             <div><div class="tm-readout-label">Security</div><div class="tm-readout-value">${locked == null ? "—" : locked ? "Locked" : "Unlocked"}</div></div>
           </div>
         ` : `
