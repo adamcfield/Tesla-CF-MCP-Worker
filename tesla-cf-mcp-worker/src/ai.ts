@@ -13,6 +13,7 @@
 
 import { getBudgetStatus } from "./budget";
 import { getBatteryForecast } from "./forecast";
+import { findSimilarDrives, TripQuery } from "./twin";
 import {
   getChargeSessions,
   getDriverScores,
@@ -124,7 +125,10 @@ export interface AskResult {
 
 export async function askTessa(env: Env, question: string, vin: string): Promise<AskResult> {
   const q = (question || "").trim().slice(0, 500);
-  if (!q) return { answer: "Ask me anything about your car — efficiency, battery health, charging cost, who drives safest…", tools_used: [], data: null };
+  if (!q) return { answer: "Ask me anything about your car — efficiency, battery health, charging cost, who drives safest, or a trip you're planning…", tools_used: [], data: null };
+
+  // Trip-planning questions go to the Digital Twin (k-nearest historical drives).
+  if (looksLikeTripQuestion(q)) return askDigitalTwin(env, vin, q);
 
   const { tools, data } = await assembleContext(env, vin, q);
   const system =
@@ -141,6 +145,70 @@ export async function askTessa(env: Env, question: string, vin: string): Promise
     data,
     note: `Workers AI unavailable — showing structured data instead. (${lastAiError || "unknown"})`,
   };
+}
+
+const numOrNull = (v: unknown): number | null =>
+  typeof v === "number" && Number.isFinite(v) ? v : typeof v === "string" && v.trim() !== "" && Number.isFinite(Number(v)) ? Number(v) : null;
+
+/** Extracts trip features from free text (Workers AI, with a heuristic fallback). */
+async function extractTripFeatures(env: Env, description: string): Promise<TripQuery> {
+  const system =
+    "Extract trip parameters from the user's text as a compact JSON object with keys: " +
+    "distance_km (number — ESTIMATE from place names using your geography knowledge, e.g. Tel Aviv→Eilat ≈ 340, Tel Aviv→Haifa ≈ 95; null if unknowable), " +
+    "temp_c (number or null), driver (string or null), night (true/false/null). Output ONLY the JSON object, no prose.";
+  const raw = await runModel(env, system, description);
+  if (raw) {
+    try {
+      const m = raw.match(/\{[\s\S]*\}/);
+      if (m) {
+        const j = JSON.parse(m[0]) as Record<string, unknown>;
+        return {
+          distance_km: numOrNull(j.distance_km),
+          temp_c: numOrNull(j.temp_c),
+          driver: typeof j.driver === "string" && j.driver ? j.driver : null,
+          night: typeof j.night === "boolean" ? j.night : null,
+        };
+      }
+    } catch {
+      /* fall through to heuristics */
+    }
+  }
+  const km = /(\d+(?:\.\d+)?)\s*km/i.exec(description);
+  const temp = /(-?\d+(?:\.\d+)?)\s*°?\s*c/i.exec(description);
+  return {
+    distance_km: km ? Number(km[1]) : null,
+    temp_c: temp ? Number(temp[1]) : null,
+    driver: null,
+    night: /\b(night|evening|midnight|late)\b/i.test(description) ? true : null,
+  };
+}
+
+/**
+ * Digital Twin: answers a free-text trip question ("driving to Eilat this
+ * weekend with the AC on") from the k-nearest REAL historical drives, narrated
+ * with provenance. Falls back to the structured twin data if the model layer
+ * is unavailable.
+ */
+export async function askDigitalTwin(env: Env, vin: string, description: string): Promise<AskResult> {
+  const q = (description || "").trim().slice(0, 400);
+  if (!q) return { answer: "Describe a trip and I'll predict it from your most similar past drives.", tools_used: [], data: null };
+  const features = await extractTripFeatures(env, q);
+  const twin = await findSimilarDrives(env, vin, features, 5).catch(() => null);
+  const system =
+    "You are Tessa's trip planner. Using ONLY the provided similar-past-drives data for THIS specific car, give a grounded expectation for the user's trip (expected Wh/km, energy, and SoC used if distance is known) and cite the single most similar real drive as evidence (route, date-agnostic, its efficiency and SoC used). Be concrete with numbers and units. If the matches are weak or absent, say the twin doesn't have a close precedent yet. 2-4 sentences, no preamble.";
+  const user = `Trip: ${q}\nExtracted features: ${JSON.stringify(features)}\nSimilar past drives (JSON): ${JSON.stringify(twin)}`;
+  const answer = await runModel(env, system, user);
+  return {
+    answer: answer ?? "Here are your most similar past drives for this trip.",
+    tools_used: ["get_similar_drives"],
+    data: { features, ...(twin as object) },
+    note: answer ? undefined : `Workers AI unavailable (${lastAiError || "unknown"}) — showing the matched drives directly.`,
+  };
+}
+
+/** True for a trip-planning / range question the Digital Twin should answer. */
+export function looksLikeTripQuestion(q: string): boolean {
+  return /\b(drive|driving|trip|going|go)\s+to\b|\brange\b|\bmake it\b|\breach\b|\bhow (far|much charge)|\bwill i\b|\benough (charge|battery|range)\b/i.test(q);
 }
 
 /**

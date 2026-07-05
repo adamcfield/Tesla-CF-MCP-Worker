@@ -53,6 +53,7 @@ import { getBudgetStatus } from "./budget";
 import { verifyDriveCertificate } from "./certificate";
 import { exportChargesCsv, exportDriveGpx, exportDrivesCsv } from "./export";
 import { getBatteryForecast, predictRange } from "./forecast";
+import { findSimilarDrives } from "./twin";
 import { handleGeocode, handleGovTile, probeGovmap } from "./govmap";
 import { handleIngest } from "./ingest";
 import { handleMcp, SERVER_VERSION } from "./mcp";
@@ -281,6 +282,18 @@ async function handleData(url: URL, env: Env): Promise<Response> {
       return json(await getMonthlyReport(env, vin, numParam("months", 12)));
     case "/data/suggested-locations":
       return json(await getSuggestedLocations(env, vin));
+    case "/data/similar-drives": {
+      const nOpt = (name: string): number | undefined => {
+        const raw = q.get(name);
+        if (raw === null || raw.trim() === "") return undefined;
+        const n = Number(raw);
+        return Number.isFinite(n) ? n : undefined;
+      };
+      return json(await findSimilarDrives(env, vin, {
+        distance_km: nOpt("distance_km"), temp_c: nOpt("temp_c"),
+        driver: q.get("driver") ?? undefined, night: q.get("night") === "1" ? true : q.get("night") === "0" ? false : undefined,
+      }, nOpt("k") ?? 5));
+    }
     case "/data/drivers":
       return json(await getDrivers(env, vin));
     case "/data/battery-forecast":

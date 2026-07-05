@@ -6,8 +6,9 @@
  * (via the OAuth shim in auth.ts).
  */
 
-import { askTessa } from "./ai";
+import { askDigitalTwin, askTessa } from "./ai";
 import * as api from "./api";
+import { findSimilarDrives } from "./twin";
 import * as cmd from "./commands";
 import * as forecast from "./forecast";
 import * as rules from "./rules";
@@ -663,13 +664,48 @@ const TOOLS: Tool[] = [
     name: "ask_tessa",
     description:
       "Ask a natural-language question about THIS car's data ('how efficient was I this month?', 'is my battery " +
-      "healthy?', 'who drives most safely?'). Answers are grounded in the logged data via Cloudflare Workers AI. Free.",
+      "healthy?', 'who drives most safely?', or a trip you're planning). Grounded in the logged data via Cloudflare " +
+      "Workers AI; trip questions are answered by the Digital Twin from similar past drives. Free.",
     inputSchema: {
       type: "object",
       properties: { ...vinProp, question: { type: "string" } },
       required: ["vin", "question"],
     },
     handler: (env, a) => askTessa(env, a.question, a.vin),
+  },
+  {
+    name: "get_similar_drives",
+    description:
+      "Digital Twin: the k most similar REAL past drives to a candidate trip (by distance, ambient temp, driver, " +
+      "day/night), with each match's actual efficiency/energy/SoC-used and a similarity-weighted prediction. The " +
+      "interpretable, evidence-based complement to get_predicted_range. Free — reads logged data.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        ...vinProp,
+        distance_km: { type: "number" },
+        temp_c: { type: "number" },
+        driver: { type: "string" },
+        night: { type: "boolean" },
+        k: { type: "number", default: 5 },
+      },
+      required: ["vin"],
+    },
+    handler: (env, a) =>
+      findSimilarDrives(env, a.vin, { distance_km: a.distance_km, temp_c: a.temp_c, driver: a.driver, night: a.night }, a.k ?? 5),
+  },
+  {
+    name: "ask_digital_twin",
+    description:
+      "Predict a trip in plain language from your OWN nearest historical drives ('driving to Eilat this weekend " +
+      "with the kids and AC on — what range should I expect?'). Extracts the trip's features, finds the most " +
+      "similar real drives, and answers with provenance. Free.",
+    inputSchema: {
+      type: "object",
+      properties: { ...vinProp, description: { type: "string" } },
+      required: ["vin", "description"],
+    },
+    handler: (env, a) => askDigitalTwin(env, a.vin, a.description),
   },
   {
     name: "get_state_timeline",
@@ -825,6 +861,8 @@ const READ_TOOLS = new Set([
   "get_predicted_range",
   "get_drive_certificate",
   "ask_tessa",
+  "get_similar_drives",
+  "ask_digital_twin",
   "list_locations",
   "get_location_stats",
   "list_automations",
