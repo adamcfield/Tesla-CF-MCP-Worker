@@ -51,3 +51,14 @@ POLL_VINS = "LRW3E7ET1RC159967"
 # Workers AI (Llama, free tier) — powers Ask-Tessa, proactive briefings, coach notes.
 [ai]
 binding = "AI"
+
+# Durable Object poll scheduler — a self-rearming alarm that polls reliably
+# (~90s, adaptive to 10s while driving) with no cron trigger needed.
+[[durable_objects.bindings]]
+name = "POLL_SCHEDULER"
+class_name = "PollScheduler"
+
+# SQLite-backed DO class (free-tier compatible).
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["PollScheduler"]

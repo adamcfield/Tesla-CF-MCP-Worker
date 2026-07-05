@@ -11,6 +11,8 @@ export interface Env {
   DB: D1Database;
   /** Cloudflare Workers AI (Llama) — powers Ask-Tessa, briefings, coach notes. Optional. */
   AI?: WorkersAI;
+  /** Durable Object namespace for the self-rearming poll scheduler (reliable native polling). */
+  POLL_SCHEDULER?: DurableObjectNamespace;
   /** HMAC secret for signed drive risk certificates (falls back to MCP_AUTH_TOKEN). */
   CERT_SECRET?: string;
 

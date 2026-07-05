@@ -59,6 +59,7 @@ import { handleMcp, SERVER_VERSION } from "./mcp";
 import { pollOnce } from "./poll";
 import { loadCommandKey } from "./protocol";
 import { runCronTick } from "./rules";
+import { ensureSchedulerArmed, PollScheduler } from "./scheduler";
 import { getAppState, getLatest, listAlerts, putAppState, querySeries } from "./store";
 import {
   backfillChargeAddresses,
@@ -460,6 +461,12 @@ export default {
         if (!pollVin) return json({ error: "vin query param required" }, 400);
         return json(await pollOnce(env, pollVin));
       }
+      if (path === "/scheduler/start") {
+        // Arm the Durable Object poll scheduler (self-sustaining once started).
+        if (!env.POLL_SCHEDULER) return json({ error: "scheduler DO not bound" }, 501);
+        await ensureSchedulerArmed(env);
+        return json({ ok: true, note: "poll scheduler armed — self-rearms every ~90s (10s while driving)" });
+      }
       if (path === "/setup/register-partner" && request.method === "POST") {
         return handleRegisterPartner(env);
       }
@@ -502,6 +509,8 @@ export default {
     const jobs: Promise<unknown>[] = pollVins.map((vin) =>
       pollOnce(env, vin).catch((e) => console.error("cron poll failed:", e instanceof Error ? e.message : e)),
     );
+    // Keep the DO poll scheduler armed (self-heals if it was ever lost).
+    jobs.push(ensureSchedulerArmed(env).catch(() => {}));
     // Run the automation tick at most ~every 13 min even if the cron fires more
     // often for polling (so a */2 poll cron doesn't re-run the tick 7× as much).
     jobs.push(
@@ -517,3 +526,6 @@ export default {
     ctx.waitUntil(Promise.allSettled(jobs).then(() => undefined));
   },
 } satisfies ExportedHandler<Env>;
+
+// Durable Object class export (referenced by the wrangler.toml binding).
+export { PollScheduler };
