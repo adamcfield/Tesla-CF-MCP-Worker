@@ -38,6 +38,14 @@ export interface Env {
    * idle probes pause. Unset = probe around the clock.
    */
   QUIET_HOURS_UTC?: string;
+  /**
+   * Optional Fleet API base override (e.g. https://api.myteslamate.com) so the
+   * worker polls a cost-absorbing proxy instead of Tesla directly. Pair with
+   * TESLA_AUTH_BASE and re-run the owner grant through the proxy. Empty = Tesla.
+   */
+  TESLA_API_BASE?: string;
+  /** Optional OAuth base override to match TESLA_API_BASE (e.g. the proxy's auth host). */
+  TESLA_AUTH_BASE?: string;
 }
 
 /** Regional Fleet API bases — https://developer.tesla.com/docs/fleet-api */
@@ -53,12 +61,15 @@ export const AUTH_BASES: Record<string, string> = {
   cn: "https://auth.tesla.cn",
 };
 
+// Optional overrides let the worker point at a proxy (e.g. MyTeslaMate's free
+// api.myteslamate.com, which absorbs Tesla's per-call cost) instead of Tesla
+// directly — a config flip, no code change. Empty = use Tesla's regional host.
 export function fleetBase(env: Env): string {
-  return FLEET_BASES[env.TESLA_REGION] ?? FLEET_BASES.na!;
+  return env.TESLA_API_BASE?.replace(/\/+$/, "") || FLEET_BASES[env.TESLA_REGION] || FLEET_BASES.na!;
 }
 
 export function authBase(env: Env): string {
-  return AUTH_BASES[env.TESLA_REGION] ?? AUTH_BASES.na!;
+  return env.TESLA_AUTH_BASE?.replace(/\/+$/, "") || AUTH_BASES[env.TESLA_REGION] || AUTH_BASES.na!;
 }
 
 /** OAuth scopes requested from the vehicle owner. */
