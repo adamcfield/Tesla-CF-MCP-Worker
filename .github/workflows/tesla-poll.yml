@@ -46,15 +46,20 @@ env:
 jobs:
   poll:
     runs-on: ubuntu-latest
-    timeout-minutes: 6
+    timeout-minutes: 58
     steps:
       - name: Adaptive poll loop
         run: |
           set -uo pipefail
-          # Run for ~4.5 min, then let the next scheduled run take over. The
-          # concurrency group prevents two loops overlapping.
-          DEADLINE=$(( $(date +%s) + 270 ))
-          idle_polls=0
+          # Run CONTINUOUSLY for ~55 min (Actions minutes are unlimited on a
+          # public repo). GitHub throttles the */5 schedule to ~hourly, so a
+          # short 4.5-min run left the car unwatched ~55 min of every hour and
+          # missed most drives. A ~55-min loop means back-to-back hourly runs
+          # give near-continuous coverage. Budget-safe: the worker gates billed
+          # reads (free connectivity checks when parked; billed vehicle_data only
+          # when online + under the $9 governor; ~15-min probes while idle-online
+          # so the car can still sleep). The concurrency group prevents overlap.
+          DEADLINE=$(( $(date +%s) + 3300 ))
           consecutive_errors=0
           while [ "$(date +%s)" -lt "$DEADLINE" ]; do
             RESP=$(curl -sS --max-time 30 \
@@ -90,16 +95,14 @@ jobs:
             IVAL=$(echo "$RESP"   | python3 -c "import sys,json;print(int(json.load(sys.stdin).get('next_interval_s',60)))" 2>/dev/null || echo 60)
             echo "$(date -u +%H:%M:%S)  state=$STATE activity=$ACT active=$ACTIVE next=${IVAL}s"
 
-            if [ "$ACTIVE" != "True" ]; then
-              # Car is asleep/offline/suspended. Do a couple of light re-checks
-              # in case it wakes, then exit so we don't hold a runner idle.
-              idle_polls=$((idle_polls + 1))
-              [ "$idle_polls" -ge 2 ] && { echo "car not active — exiting until next scheduled run"; break; }
-            else
-              idle_polls=0
-            fi
+            # Keep watching the whole window even when parked/asleep: the free
+            # connectivity check every cycle (worker returns next_interval_s =
+            # 300s when inactive) costs nothing and is what catches the car
+            # starting a drive. We do NOT exit early — that's exactly what left
+            # the ~55-min gaps. When inactive, never sleep longer than 5 min so
+            # a new drive is picked up promptly.
+            if [ "$ACTIVE" != "True" ] && [ "$IVAL" -gt 300 ]; then IVAL=300; fi
 
-            # Don't oversleep past the deadline; keep bursts honest at 10s.
             NOW=$(date +%s)
             REMAIN=$(( DEADLINE - NOW ))
             [ "$REMAIN" -le 0 ] && break
