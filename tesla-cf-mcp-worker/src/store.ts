@@ -41,6 +41,8 @@ export const POSITION_COLUMNS = new Set([
   "soc", "usable_soc", "energy_remaining", "rated_range", "est_range",
   "ideal_range", "inside_temp", "outside_temp", "charging_state",
   "charger_power", "charger_voltage", "charger_current", "charge_energy_added",
+  // Real IMU / pedal (Fleet Telemetry only) — true g-force & braking effort.
+  "lon_accel", "lat_accel", "brake_pedal",
 ]);
 
 export async function ensureSchema(env: Env): Promise<void> {
@@ -83,7 +85,8 @@ export async function ensureSchema(env: Env): Promise<void> {
          rated_range REAL, est_range REAL, ideal_range REAL,
          inside_temp REAL, outside_temp REAL,
          charging_state TEXT, charger_power REAL, charger_voltage REAL,
-         charger_current REAL, charge_energy_added REAL
+         charger_current REAL, charge_energy_added REAL,
+         lon_accel REAL, lat_accel REAL, brake_pedal REAL
        )`,
     ),
     env.DB.prepare(`CREATE INDEX IF NOT EXISTS idx_positions_vin_ts ON positions (vin, ts)`),
@@ -189,10 +192,34 @@ export async function ensureSchema(env: Env): Promise<void> {
     harsh_accel_count: "INTEGER",
     harsh_brake_count: "INTEGER",
     harsh_turn_count: "INTEGER", // heading-change spikes at speed
-    over_limit_frac: "REAL", // fraction of samples above OVER_SPEED_KMH
-    night_frac: "REAL", // fraction of duration in local night hours
+    over_limit_frac: "REAL", // fraction of samples above the posted (or fallback) limit
+    over_limit_severity: "REAL", // avg km/h over the posted limit while speeding
+    speed_limit_source: "TEXT", // 'osm' | 'partial' | 'none' (flat-limit fallback)
+    night_frac: "REAL", // fraction of samples in astronomical darkness (solar-computed)
     behavior_score: "REAL", // 0-100 composite (100 = safest)
+    score_low: "REAL", // lower bound of the score confidence interval
+    score_high: "REAL", // upper bound
+    score_confidence: "TEXT", // 'high' | 'medium' | 'low' (from sampling density)
+    accel_source: "TEXT", // 'imu' (real telemetry) | 'derived' (Δv/Δt proxy)
+    coach_note: "TEXT", // AI per-drive coaching note
+    // Active-driver-profile fingerprint captured at drive start (differs per
+    // person — the exposed stand-in for seat-position memory).
+    fp_temp_set: "REAL", // driver-side climate setpoint
+    fp_seat_heater: "REAL", // driver seat-heater level (0-3)
   });
+
+  // Positions predates the IMU columns — widen in place for old deployments.
+  await addMissingColumns(env, "positions", {
+    lon_accel: "REAL", lat_accel: "REAL", brake_pedal: "REAL",
+  });
+
+  // Posted-speed-limit cache (OSM maxspeed by ~110 m grid; -1 = negative cache).
+  await env.DB.prepare(
+    `CREATE TABLE IF NOT EXISTS road_segments (
+       lat_r REAL NOT NULL, lon_r REAL NOT NULL, maxspeed_kmh REAL NOT NULL,
+       created_ts INTEGER, PRIMARY KEY (lat_r, lon_r)
+     )`,
+  ).run();
 
   // Small key/value app state in D1 (latest-state doc, poll state, stamps).
   // Lives here rather than KV because these are HOT-PATH writes (every poll):
@@ -421,6 +448,9 @@ export interface PositionSample {
   charger_voltage?: number | null;
   charger_current?: number | null;
   charge_energy_added?: number | null;
+  lon_accel?: number | null;
+  lat_accel?: number | null;
+  brake_pedal?: number | null;
 }
 
 /** Inserts one positions row and returns its id (for drive tagging). */
@@ -435,8 +465,9 @@ export async function insertPosition(
        vin, ts, drive_id, activity, lat, lon, elevation, heading, speed, power,
        odometer, soc, usable_soc, energy_remaining, rated_range, est_range,
        ideal_range, inside_temp, outside_temp, charging_state, charger_power,
-       charger_voltage, charger_current, charge_energy_added
-     ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24)`,
+       charger_voltage, charger_current, charge_energy_added,
+       lon_accel, lat_accel, brake_pedal
+     ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27)`,
   )
     .bind(
       vin, ts, s.drive_id ?? null, s.activity ?? null,
@@ -447,6 +478,7 @@ export async function insertPosition(
       s.inside_temp ?? null, s.outside_temp ?? null,
       s.charging_state ?? null, s.charger_power ?? null, s.charger_voltage ?? null,
       s.charger_current ?? null, s.charge_energy_added ?? null,
+      s.lon_accel ?? null, s.lat_accel ?? null, s.brake_pedal ?? null,
     )
     .run();
   return Number(res.meta.last_row_id ?? 0);

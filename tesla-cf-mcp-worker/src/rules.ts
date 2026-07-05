@@ -23,12 +23,13 @@
  * trunk/frunk opening from automations (those remain manual MCP tools).
  */
 
+import { generateBrief, generateCoachNote } from "./ai";
 import { getVehicle, getVehicleData } from "./api";
 import { getBudgetStatus } from "./budget";
 import * as cmd from "./commands";
 import { applyVehicleData } from "./ingest";
 import { getAppState, getLatest, LatestState, logAlert, putAppState, tzOffsetMinutes } from "./store";
-import { closeStaleSessions, recordConnectivityState } from "./tracking";
+import { closeStaleSessions, getTirePressures, getVampireDrain, recordConnectivityState } from "./tracking";
 import { Env } from "./types";
 
 // ---------------------------------------------------------------------------
@@ -52,7 +53,9 @@ export interface AutomationRule {
     | "scheduled_precondition"
     | "geofence"
     | "alert"
-    | "log_snapshot";
+    | "log_snapshot"
+    | "ai_brief"
+    | "sentinel";
   vin: string;
   enabled?: boolean;
   /** Webhook URLs notified when the rule fires (MessageBird flow, Make, n8n, Sheets…). */
@@ -451,6 +454,12 @@ async function runCronTickInner(env: Env): Promise<Record<string, unknown>> {
         case "log_snapshot":
           if (online && rule.allow_poll && state.polled) fired.push(rule.id);
           break;
+        case "ai_brief":
+          if (await evalAiBrief(env, rule)) fired.push(rule.id);
+          break;
+        case "sentinel":
+          if (await evalSentinel(env, rule)) fired.push(rule.id);
+          break;
       }
     } catch (e) {
       await logAlert(env, {
@@ -473,8 +482,92 @@ async function runCronTickInner(env: Env): Promise<Record<string, unknown>> {
   }
 
   await pollWatchdog(env, summary);
+  // Generate AI coach notes for recently-closed drives that don't have one.
+  try {
+    const n = await backfillCoachNotes(env);
+    if (n > 0) summary.coach_notes = n;
+  } catch { /* AI is best-effort */ }
   await purgeExpiredHistory(env, summary);
   return summary;
+}
+
+/**
+ * ai_brief rule: once per configured cadence, generate a one-sentence briefing
+ * from the month's derivations via Workers AI and push it through the normal
+ * notify/webhook path. Edge-triggered by a daily key so it never spams; skips
+ * silently when the model has nothing noteworthy to say (generateBrief → null).
+ */
+async function evalAiBrief(env: Env, rule: AutomationRule): Promise<boolean> {
+  const everyHours = asNum(rule.every_hours) ?? 24;
+  const key = `aibrief:${rule.id}`;
+  const last = Number((await getAppState(env, key).catch(() => "0")) ?? "0");
+  const now = Math.floor(Date.now() / 1000);
+  if (now - last < everyHours * 3600) return false;
+  const line = await generateBrief(env, rule.vin).catch(() => null);
+  await putAppState(env, key, String(now)).catch(() => {});
+  if (!line) return false;
+  await dispatchWebhooks(env, rule, "ai_brief", line, { brief: line });
+  return true;
+}
+
+/**
+ * sentinel rule: statistical-process-control alerts over signals we already
+ * compute but never acted on — a slow tyre leak, a phantom-drain regression,
+ * abnormal awake-idle drain. Fires through the existing alert/webhook path,
+ * cooldown-guarded so a persisting condition alerts once, not every tick.
+ */
+async function evalSentinel(env: Env, rule: AutomationRule): Promise<boolean> {
+  let fired = false;
+  // Tyre slow-leak: any wheel losing pressure faster than the threshold/week.
+  const leakBar = asNum(rule.leak_bar_per_week) ?? 0.15;
+  const tires = (await getTirePressures(env, rule.vin, 30).catch(() => null)) as
+    | { trend_bar_per_week?: Record<string, number> | null; latest?: Record<string, number> | null }
+    | null;
+  const trend = tires?.trend_bar_per_week;
+  if (trend) {
+    for (const w of ["fl", "fr", "rl", "rr"] as const) {
+      if (typeof trend[w] === "number" && trend[w]! <= -leakBar) {
+        if (!(await underCooldown(env, rule, 1440))) {
+          await fire(env, rule, "sentinel", `${rule.vin} ${w.toUpperCase()} tyre losing ${Math.abs(trend[w]!).toFixed(2)} bar/week — likely a slow leak`, { wheel: w, trend_bar_per_week: trend[w] });
+          fired = true;
+        }
+      }
+    }
+  }
+  // Phantom-drain regression: awake-idle drain far above the sleep baseline.
+  const vamp = (await getVampireDrain(env, rule.vin, 21).catch(() => null)) as
+    | { awake?: { pct_per_day?: number | null } | null; sleep?: { pct_per_day?: number | null } | null }
+    | null;
+  const awake = vamp?.awake?.pct_per_day;
+  const maxAwake = asNum(rule.max_awake_pct_per_day) ?? 8;
+  if (typeof awake === "number" && awake >= maxAwake) {
+    if (!(await underCooldown(env, rule, 1440))) {
+      await fire(env, rule, "sentinel", `${rule.vin} awake-idle drain ${awake.toFixed(1)}%/day (Sentry/preconditioning?) — well above a healthy sleep baseline`, { awake_pct_per_day: awake });
+      fired = true;
+    }
+  }
+  return fired;
+}
+
+/** Generates coach notes for up to N recent drives that lack one (best-effort). */
+async function backfillCoachNotes(env: Env, limit = 3): Promise<number> {
+  if (!env.AI) return 0;
+  const rs = await env.DB.prepare(
+    `SELECT * FROM drives WHERE status = 'complete' AND coach_note IS NULL AND behavior_score IS NOT NULL
+     ORDER BY end_ts DESC LIMIT ?1`,
+  ).bind(limit).all<Record<string, unknown>>();
+  let n = 0;
+  for (const drive of rs.results ?? []) {
+    const note = await generateCoachNote(env, drive).catch(() => null);
+    if (note) {
+      await env.DB.prepare(`UPDATE drives SET coach_note = ?2 WHERE id = ?1`).bind(drive.id, note).run().catch(() => {});
+      n++;
+    } else {
+      // Mark as attempted (empty string) so we don't retry a note-less drive forever.
+      await env.DB.prepare(`UPDATE drives SET coach_note = '' WHERE id = ?1`).bind(drive.id).run().catch(() => {});
+    }
+  }
+  return n;
 }
 
 /**

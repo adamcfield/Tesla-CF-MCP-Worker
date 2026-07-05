@@ -4,15 +4,15 @@
  * - App shell (this page, the JS/CSS modules, manifest, icons, and the two
  *   unpkg Leaflet files) is served CACHE-FIRST, with a background revalidate
  *   so a deployed update still lands on the next load.
- * - Anything touching the worker API is NEVER cached: /data/, /mcp, /geocode,
- *   /govtiles, or any URL carrying a token= param falls through to the
- *   network untouched — vehicle data and bearer-token responses must not
- *   persist in Cache Storage.
+ * - Anything touching the worker API is NEVER cached: /data/, /mcp, /ai/,
+ *   /geocode, /govtiles, or any URL carrying a token= param falls through to
+ *   the network untouched — vehicle data, AI answers, and bearer-token
+ *   responses must not persist in Cache Storage.
  *
  * Bump CACHE_NAME on shell changes; activate deletes every older cache.
  */
 
-const CACHE_NAME = "tesla-dash-shell-v1";
+const CACHE_NAME = "tesla-dash-shell-v2";
 
 const SHELL = [
   "./",
@@ -30,8 +30,8 @@ const SHELL = [
   "https://unpkg.com/leaflet@1.9.4/dist/leaflet.js",
 ];
 
-/** URL fragments that must never enter the cache (API data + tokened requests). */
-const NEVER_CACHE = ["/data/", "/mcp", "/geocode", "/govtiles", "token="];
+/** URL fragments that must never enter the cache (API data + AI answers + tokened requests). */
+const NEVER_CACHE = ["/data/", "/mcp", "/ai/", "/geocode", "/govtiles", "token="];
 
 self.addEventListener("install", (event) => {
   event.waitUntil(

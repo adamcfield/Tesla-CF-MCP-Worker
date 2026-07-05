@@ -70,6 +70,36 @@ const FIELD_MAP: Record<string, string> = {
   TpmsPressureRr: "tpms_rr",
   DoorState: "door_state",
   FdWindow: "window_fd",
+  // --- Safety / driving-dynamics fields. Names verified against the official
+  // Fleet Telemetry "Available Data" field list (2026). Real onboard IMU +
+  // pedals give TRUE g-force & braking effort when streamed, so scoring.ts
+  // prefers lon_accel/lat_accel over the Δv/Δt proxy. Units: accel m/s².
+  LongitudinalAcceleration: "lon_accel", // m/s² (+ accel, − brake)
+  LateralAcceleration: "lat_accel", // m/s² cornering
+  BrakePedalPos: "brake_pedal", // master-cylinder pressure (braking effort)
+  BrakePedal: "brake_pressed", // boolean pedal status
+  PedalPosition: "accel_pedal", // accelerator position
+  CruiseSetSpeed: "cruise_set_speed",
+  CruiseFollowDistance: "follow_distance", // enum
+  CurrentLimitMph: "car_speed_limit_mph", // limit the car itself detects
+  LaneDepartureAvoidance: "lane_departure", // enum: assist level
+  AutomaticEmergencyBrakingOff: "aeb_off", // boolean: AEB disabled (risk signal)
+  ForwardCollisionWarning: "fcw_sensitivity",
+  DriverSeatOccupied: "driver_present",
+  DriverSeatBelt: "driver_seatbelt_unbuckled", // boolean — a real UBI risk factor
+  LightsTurnSignal: "turn_signal", // signaling behaviour
+  LightsHazardsActive: "hazards",
+  DriveRail: "drive_rail",
+  // --- Active-driver-profile fingerprint. Tesla exposes no active-driver name,
+  // but these fields TRACK WITH the active profile, so they fingerprint who is
+  // driving (like a seat-position memory would): the driver-side climate
+  // setpoint and seat-heater habit differ per person, and LocatedAtHome/Work
+  // are computed against the ACTIVE driver's own saved locations. tracking.ts
+  // uses them as extra votes in driver auto-suggestion.
+  HvacLeftTemperatureRequest: "cabin_temp_set",
+  SeatHeaterLeft: "seat_heater_l",
+  LocatedAtHome: "at_home",
+  LocatedAtWork: "at_work",
 };
 
 /** Canonical fields that live only on `current` for derivation — never stored to EAV. */

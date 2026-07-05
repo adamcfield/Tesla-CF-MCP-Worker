@@ -277,6 +277,116 @@ a.tm-chip-btn { text-decoration: none; }
 .tm-flex-row { display: flex; align-items: center; gap: 8px; }
 .tm-svg-block { display: block; width: 100%; height: auto; }
 
+/* ---------- Frontier 1: driver roster hint + percentile ---------- */
+.tm-roster-hint { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; }
+.tm-roster-hint-label {
+  font-size: 10.5px; font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase; color: var(--faint);
+}
+.tm-roster-chip {
+  display: inline-flex; align-items: center; gap: 5px; padding: 3px 10px; border-radius: 999px;
+  background: var(--chip); color: var(--sub); font-size: 11.5px; font-weight: 600;
+}
+.tm-roster-dot { color: var(--accent); font-size: 7px; line-height: 1; }
+.tm-driver-percentile { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+
+/* ---------- Frontier 1: risk certificate + coach note ---------- */
+.tm-coach-note {
+  margin-top: 14px; padding: 12px 14px; border-radius: 10px; font-size: 13px; line-height: 1.5;
+  color: var(--sub); background: color-mix(in oklab, var(--accent) 6%, var(--card)); border: 1px solid var(--line2);
+}
+.tm-coach-badge {
+  display: inline-block; margin-right: 8px; padding: 2px 8px; border-radius: 999px; font-size: 10px;
+  font-weight: 700; letter-spacing: 0.04em; text-transform: uppercase; color: var(--accent);
+  background: color-mix(in oklab, var(--accent) 14%, transparent); vertical-align: 1px;
+}
+.tm-cert-panel {
+  margin-top: 14px; padding: 16px; border-radius: 10px; background: var(--bg); border: 1px solid var(--line2);
+}
+.tm-cert-key {
+  font-size: 10.5px; font-weight: 600; letter-spacing: 0.06em; text-transform: uppercase; color: var(--faint);
+}
+.tm-cert-json {
+  margin: 6px 0 0; padding: 12px; border-radius: 8px; background: var(--card); border: 1px solid var(--line2);
+  font-family: var(--mono); font-size: 11.5px; line-height: 1.5; color: var(--text);
+  white-space: pre-wrap; word-break: break-word; max-height: 260px; overflow: auto;
+}
+.tm-cert-sig {
+  margin-top: 6px; padding: 8px 10px; border-radius: 8px; background: var(--card); border: 1px solid var(--line2);
+  font-size: 11.5px; color: var(--sub); word-break: break-all;
+}
+
+/* ---------- Frontier 2: warranty cliff gauge ---------- */
+.tm-cliff { border-top: 1px solid var(--line2); border-bottom: 1px solid var(--line2); padding: 14px 0; }
+.tm-cliff-track {
+  position: relative; height: 10px; border-radius: 999px; background: var(--chip); margin-top: 10px; overflow: visible;
+}
+.tm-cliff-fill { position: absolute; inset: 0 auto 0 0; border-radius: 999px; opacity: 0.85; }
+.tm-cliff-marker {
+  position: absolute; top: -4px; bottom: -4px; width: 2px; border-radius: 2px; background: var(--text);
+  transform: translateX(-1px);
+}
+
+/* ---------- Frontier 2: range predictor form ---------- */
+.tm-predict-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 12px; }
+.tm-predict-field { display: flex; flex-direction: column; gap: 5px; font-size: 12px; color: var(--sub); font-weight: 600; }
+.tm-predict-field .tm-gate-input { font-family: var(--mono); font-size: 13px; padding: 8px 10px; }
+select.tm-gate-input { font-family: var(--ui); cursor: pointer; }
+.tm-predict-result { margin-top: 14px; padding-top: 14px; border-top: 1px solid var(--line2); }
+
+/* ---------- Frontier 3: Ask Tessa chat ---------- */
+.tm-ask-wrap { display: flex; flex-direction: column; height: 100%; }
+.tm-ask-card { display: flex; flex-direction: column; overflow: hidden; height: calc(100vh - 190px); min-height: 380px; }
+.tm-ask-scroll { flex: 1; overflow-y: auto; padding: 22px 22px 8px; display: flex; flex-direction: column; gap: 14px; }
+.tm-ask-intro { max-width: 480px; margin: auto; text-align: center; padding: 20px; }
+.tm-ask-intro-icon {
+  font-size: 26px; color: var(--accent); width: 52px; height: 52px; margin: 0 auto 14px; border-radius: 14px;
+  display: grid; place-items: center; background: color-mix(in oklab, var(--accent) 12%, var(--card));
+}
+.tm-ask-intro-title { font-size: 16px; font-weight: 600; }
+.tm-ask-intro-sub { font-size: 13px; color: var(--sub); line-height: 1.5; margin-top: 6px; }
+.tm-ask-suggest-row { display: flex; flex-wrap: wrap; gap: 8px; justify-content: center; margin-top: 18px; }
+.tm-ask-msg { display: flex; flex-direction: column; max-width: 82%; }
+.tm-ask-user { align-self: flex-end; align-items: flex-end; }
+.tm-ask-tessa { align-self: flex-start; align-items: flex-start; }
+.tm-ask-bubble {
+  padding: 11px 14px; border-radius: 14px; font-size: 13.5px; line-height: 1.5; white-space: pre-wrap; word-break: break-word;
+}
+.tm-ask-user .tm-ask-bubble { background: var(--accent); color: #fff; border-bottom-right-radius: 4px; }
+.tm-ask-tessa .tm-ask-bubble { background: var(--chip); color: var(--text); border-bottom-left-radius: 4px; }
+.tm-ask-bubble-error { background: color-mix(in oklab, var(--warn) 14%, var(--card)); color: var(--warn); }
+.tm-ask-note { font-size: 11.5px; color: var(--faint); margin-top: 5px; padding-left: 4px; }
+.tm-ask-tools { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 7px; padding-left: 4px; }
+.tm-ask-toolchip {
+  font-size: 10.5px; font-weight: 600; color: var(--sub); background: var(--card); border: 1px solid var(--line);
+  padding: 2px 8px; border-radius: 999px; font-family: var(--mono);
+}
+.tm-ask-data { margin-top: 8px; font-size: 12px; }
+.tm-ask-data summary { cursor: pointer; color: var(--faint); font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; font-weight: 600; }
+.tm-ask-data-grid { display: grid; grid-template-columns: auto 1fr; gap: 4px 14px; margin-top: 8px; }
+.tm-ask-data-k { color: var(--sub); font-size: 12px; }
+.tm-ask-data-v { font-size: 12px; }
+.tm-ask-typing { display: inline-flex; gap: 4px; align-items: center; }
+.tm-ask-typing span {
+  width: 6px; height: 6px; border-radius: 50%; background: var(--faint); animation: tmPulse 1.1s ease-in-out infinite;
+}
+.tm-ask-typing span:nth-child(2) { animation-delay: 0.18s; }
+.tm-ask-typing span:nth-child(3) { animation-delay: 0.36s; }
+.tm-ask-inputbar {
+  flex: none; display: flex; align-items: center; gap: 10px; padding: 14px 16px;
+  border-top: 1px solid var(--line);
+}
+.tm-ask-input {
+  flex: 1; font-size: 14px; padding: 11px 14px; border-radius: 999px; border: 1px solid var(--line);
+  background: var(--bg); color: var(--text); font-family: var(--ui);
+}
+.tm-ask-input:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+.tm-ask-send {
+  flex: none; width: 38px; height: 38px; border-radius: 50%; border: none; background: var(--accent);
+  color: #fff; font-size: 18px; cursor: pointer; line-height: 1; display: grid; place-items: center;
+}
+.tm-ask-send:hover { opacity: 0.92; }
+.tm-ask-send:disabled { opacity: 0.4; cursor: default; }
+
 /* ---------- mobile (<= 760px): sidebar becomes a slide-in drawer ---------- */
 @media (max-width: 760px) {
   .tm-menu-btn { display: inline-block; }
@@ -310,4 +420,9 @@ a.tm-chip-btn { text-decoration: none; }
 
   /* Tables scroll horizontally rather than squashing (wrappers already have overflow-x). */
   .tm-map-card, .tm-map-card .tm-map-canvas { min-height: 240px; }
+
+  /* Ask Tessa: use most of the viewport, and let bubbles run a bit wider. */
+  .tm-ask-card { height: calc(100vh - 150px); }
+  .tm-ask-msg { max-width: 90%; }
+  .tm-ask-inputbar { padding: 12px; }
 }

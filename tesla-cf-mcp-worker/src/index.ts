@@ -48,15 +48,18 @@ import {
   timingSafeEqual,
   unauthorized,
 } from "./auth";
+import { askTessa } from "./ai";
 import { getBudgetStatus } from "./budget";
+import { verifyDriveCertificate } from "./certificate";
 import { exportChargesCsv, exportDriveGpx, exportDrivesCsv } from "./export";
+import { getBatteryForecast, predictRange } from "./forecast";
 import { handleGeocode, handleGovTile, probeGovmap } from "./govmap";
 import { handleIngest } from "./ingest";
 import { handleMcp, SERVER_VERSION } from "./mcp";
 import { pollOnce } from "./poll";
 import { loadCommandKey } from "./protocol";
 import { runCronTick } from "./rules";
-import { getAppState, getLatest, querySeries } from "./store";
+import { getAppState, getLatest, listAlerts, querySeries } from "./store";
 import {
   backfillChargeHistory,
   backfillDriveAddresses,
@@ -64,7 +67,9 @@ import {
   getChargeCurve,
   getChargeSessions,
   getDrive,
+  getDriveCertificate,
   getDriverScores,
+  getDrivers,
   getDrives,
   getEfficiencyByTemp,
   getLocationStats,
@@ -214,10 +219,19 @@ async function handleData(url: URL, env: Env): Promise<Response> {
 
   // Routes keyed by id / session_id (no vin needed).
   if (p === "/data/locations") return json(await listLocations(env));
+  if (p === "/data/alerts") {
+    // Recent alert-log entries incl. sentinel anomaly + ai_brief firings. vin optional.
+    return json(await listAlerts(env, q.get("vin") ?? undefined, numParam("limit", 50)));
+  }
   if (p === "/data/drive") {
     const id = requireId("id");
     if (id === null) return json({ error: "id query param required" }, 400);
     return json(await getDrive(env, id));
+  }
+  if (p === "/data/drive-certificate") {
+    const id = requireId("id");
+    if (id === null) return json({ error: "id query param required" }, 400);
+    return json(await getDriveCertificate(env, id, Math.floor(Date.now() / 1000)));
   }
   if (p === "/data/charge-curve") {
     const id = requireId("session_id");
@@ -264,6 +278,22 @@ async function handleData(url: URL, env: Env): Promise<Response> {
       return json(await getMonthlyReport(env, vin, numParam("months", 12)));
     case "/data/suggested-locations":
       return json(await getSuggestedLocations(env, vin));
+    case "/data/drivers":
+      return json(await getDrivers(env, vin));
+    case "/data/battery-forecast":
+      return json(await getBatteryForecast(env, vin));
+    case "/data/predict-range": {
+      const nOpt = (name: string): number | undefined => {
+        const raw = q.get(name);
+        if (raw === null || raw.trim() === "") return undefined;
+        const n = Number(raw);
+        return Number.isFinite(n) ? n : undefined;
+      };
+      return json(await predictRange(env, vin, {
+        distance_km: nOpt("distance_km"), temp_c: nOpt("temp_c"),
+        driver: q.get("driver") ?? undefined, elevation_gain_m: nOpt("elevation_gain_m"),
+      }));
+    }
     default:
       return json({ error: "not found" }, 404);
   }
@@ -300,6 +330,14 @@ export default {
       // these are public map tiles behind a Referer gate the worker satisfies).
       if (path.startsWith("/govtiles/")) {
         return handleGovTile(path.split("/").filter(Boolean));
+      }
+      // --- Certificate verification (PUBLIC: a third party — e.g. an insurer —
+      // must be able to verify a drive certificate without holding a token; it
+      // only returns valid:true/false and reveals nothing beyond what the
+      // certificate holder already has).
+      if (path === "/data/verify-certificate" && request.method === "POST") {
+        const body = await request.json().catch(() => null);
+        return json(await verifyDriveCertificate(env, body as { canonical?: unknown; signature_hex?: unknown }));
       }
 
       if (path === "/" || path === "") {
@@ -363,6 +401,15 @@ export default {
           return exportDriveGpx(env, id);
         }
         return json({ error: "not found" }, 404);
+      }
+
+      // --- Ask-Tessa: natural-language Q&A over the car's data (read scope) --
+      if (path === "/ai/ask" && request.method === "POST") {
+        if (scope === null) return json({ error: "unauthorized" }, 401);
+        const body = (await request.json().catch(() => ({}))) as { question?: string; vin?: string };
+        const vin = body.vin ?? url.searchParams.get("vin");
+        if (!vin) return json({ error: "vin required" }, 400);
+        return json(await askTessa(env, String(body.question ?? ""), vin));
       }
 
       // --- read-only data endpoints (header or ?token=; read scope) ------

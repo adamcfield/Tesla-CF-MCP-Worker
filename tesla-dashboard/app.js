@@ -24,6 +24,34 @@ const fmt1 = (n) => (n == null || Number.isNaN(n) ? "—" : (Math.round(n * 10) 
 const fmt2 = (n) => (n == null || Number.isNaN(n) ? "—" : (Math.round(n * 100) / 100).toFixed(2));
 const esc = (s) => String(s ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/"/g, "&quot;");
 
+/** Copy text to the clipboard, flashing a "Copied ✓" confirmation on the button. */
+function copyToClipboard(text, btn) {
+  const flash = () => {
+    if (!btn) return;
+    const prev = btn.textContent;
+    btn.textContent = "Copied ✓";
+    setTimeout(() => { btn.textContent = prev; }, 1400);
+  };
+  const fallback = () => {
+    try {
+      const ta = document.createElement("textarea");
+      ta.value = text;
+      ta.style.position = "fixed";
+      ta.style.opacity = "0";
+      document.body.appendChild(ta);
+      ta.select();
+      document.execCommand("copy");
+      document.body.removeChild(ta);
+      flash();
+    } catch { if (btn) btn.textContent = "Copy failed"; }
+  };
+  if (navigator.clipboard?.writeText) {
+    navigator.clipboard.writeText(text).then(flash).catch(fallback);
+  } else {
+    fallback();
+  }
+}
+
 const CURRENCY_SYMBOL = { ILS: "₪", USD: "$", EUR: "€", GBP: "£", AUD: "A$", CAD: "C$" };
 function money(amount, currency, decimals = 2) {
   if (amount == null || Number.isNaN(amount)) return "—";
@@ -125,16 +153,19 @@ const state = {
   syncing: false,
   lastSync: null,
   cache: {}, // per-screen fetched payloads, cleared on manual refresh
+  askTranscript: [], // Ask-Tessa chat history — in-memory only, never persisted
+  askPending: false, // true while an /ai/ask request is in flight
 };
 
 const NAV = [
-  { label: "", items: [["ov", "Overview"], ["tl", "Timeline"], ["st", "Statistics"]] },
+  { label: "", items: [["ask", "✦ Ask Tessa"], ["ov", "Overview"], ["tl", "Timeline"], ["st", "Statistics"]] },
   { label: "Driving", items: [["dr", "Drives"], ["dv", "Drivers"], ["pl", "Places"], ["map", "Lifetime map"]] },
   { label: "Charging", items: [["ch", "Charges"], ["cs", "Charging stats"]] },
-  { label: "Battery", items: [["bh", "Battery health"], ["vd", "Vampire drain"]] },
+  { label: "Battery", items: [["bh", "Battery health"], ["pr", "Predictions"], ["vd", "Vampire drain"]] },
 ];
 
 const TITLES = {
+  ask: ["Ask Tessa", "natural-language answers about your car"],
   ov: ["Overview", ""],
   tl: ["Timeline", "drives, charges & sleep/wake"],
   st: ["Statistics", "last 12 months"],
@@ -145,6 +176,7 @@ const TITLES = {
   ch: ["Charges", ""],
   cs: ["Charging stats", "lifetime"],
   bh: ["Battery health", ""],
+  pr: ["Predictions", "battery forecast & range predictor"],
   vd: ["Vampire drain", "standby losses"],
 };
 
@@ -417,6 +449,21 @@ function onRootClick(e) {
     showScreen();
   } else if (action === "load-live") {
     loadLiveVehicleData();
+  } else if (action === "ask-send") {
+    askSubmit();
+  } else if (action === "ask-suggest") {
+    const q = t.dataset.q || "";
+    const input = document.getElementById("tm-ask-input");
+    if (input) input.value = q;
+    askSubmit(q);
+  } else if (action === "predict-run") {
+    runRangePrediction();
+  } else if (action === "view-cert") {
+    loadDriveCertificate(Number(t.dataset.id));
+  } else if (action === "copy-cert") {
+    copyToClipboard(t.dataset.text || "", t);
+  } else if (action === "print-report") {
+    openPrintableReport(Number(t.dataset.id));
   }
 }
 
@@ -457,6 +504,10 @@ function skeletonHtml(screen) {
   const cards3 = `<div class="tm-grid-3col">${(`<div class="tm-card tm-card-pad">${skel("height:15px;width:45%;")}${skel("height:11px;width:65%;margin-top:10px;")}${skel("height:80px;margin-top:16px;")}</div>`).repeat(3)}</div>`;
 
   switch (screen) {
+    case "ask":
+      return `<div class="tm-card tm-card-pad">${skel("height:15px;width:45%;")}${skel("height:12px;width:70%;margin-top:12px;")}<div class="tm-flex-row" style="gap:8px;margin-top:18px;">${skel("height:30px;width:150px;border-radius:999px;").repeat(3)}</div></div>`;
+    case "pr":
+      return `<div class="tm-grid-2">${chart}${chart}</div>`;
     case "ov":
       return `<div class="tm-grid-2-wide"><div class="tm-card tm-card-pad-lg">${skel("height:20px;width:80px;")}${skel("height:54px;width:45%;margin-top:22px;")}${skel("height:10px;margin-top:22px;border-radius:999px;")}${skel("height:40px;margin-top:20px;")}</div>${mapCard(280)}</div>${metrics}<div class="tm-grid-2">${chart}${chart}</div>`;
     case "tl":
@@ -493,6 +544,7 @@ async function showScreen() {
   setSyncing(true);
   try {
     switch (state.screen) {
+      case "ask": await renderAskTessa(); break;
       case "ov": await renderOverview(); break;
       case "tl": await renderTimeline(); break;
       case "st": await renderStatistics(); break;
@@ -503,6 +555,7 @@ async function showScreen() {
       case "ch": await renderCharges(); break;
       case "cs": await renderChargingStats(); break;
       case "bh": await renderBatteryHealth(); break;
+      case "pr": await renderPredictions(); break;
       case "vd": await renderVampireDrain(); break;
     }
     state.renderedScreen = state.screen;
@@ -1101,6 +1154,7 @@ async function renderDrives() {
   if (state.openDriveId != null) return renderDriveDetail();
   const all = await cached("all_drives", () => data.drives(vin(), 2000));
   const locations = await safe(cached("locations", () => data.locations()), []);
+  const roster = await loadDriverRoster();
 
   const now = Math.floor(Date.now() / 1000);
   const windows = [now - 7 * 86400, now - 30 * 86400, 0];
@@ -1136,7 +1190,8 @@ async function renderDrives() {
         <button class="tm-chip-btn ${state.driverFilter === key ? "active" : ""}" data-action="driver-filter" data-driver="${esc(key)}">${esc(label)}<span class="n">${n}</span></button>
       `).join("")}
     </div>` : ""}
-    <datalist id="tm-driver-names">${drivers.map((n) => `<option value="${esc(n)}"></option>`).join("")}</datalist>
+    ${roster.length ? rosterHintHtml(roster) : ""}
+    <datalist id="tm-driver-names">${[...new Set([...drivers, ...roster.map(rosterName)].filter(Boolean))].sort((a, b) => a.localeCompare(b)).map((n) => `<option value="${esc(n)}"></option>`).join("")}</datalist>
     ${filtered.length ? `
     <div class="tm-card tm-table-wrap">
       <div style="min-width:960px;">
@@ -1154,7 +1209,7 @@ async function renderDrives() {
             <div class="tm-right tm-mono">${d.efficiency_wh_km != null ? fmt0(d.efficiency_wh_km) : "—"} Wh/km</div>
             <div class="tm-right tm-mono" style="color:var(--sub);">${d.start_soc != null && d.end_soc != null ? `${d.start_soc} → ${d.end_soc}` : "—"} %</div>
           </div>`).join("")}
-        <div class="tm-foot-note">${filtered.length} drive${filtered.length === 1 ? "" : "s"} in range. Click a driver cell to assign; <span class="tm-driver-suggested">italic?</span> names are unconfirmed suggestions.</div>
+        <div class="tm-foot-note">${filtered.length} drive${filtered.length === 1 ? "" : "s"} in range. Click a driver cell to assign; <span class="tm-driver-suggested">italic?</span> names are unconfirmed suggestions. ${esc(DRIVER_MANUAL_NOTE)}</div>
       </div>
     </div>` : emptyHtml("No drives in this range", "Try a wider filter, or check back once more trips are logged.")}
   `);
@@ -1165,12 +1220,14 @@ async function renderDriveDetail() {
   if (detail.error) return setContent(errorHtml(detail.error));
   const { drive: d, path } = detail;
   const locations = await safe(cached("locations", () => data.locations()), []);
+  const roster = await loadDriverRoster();
   const locName = (id) => (id == null ? "Unknown" : locations.find((l) => l.id === id)?.name || "Unknown");
 
   const speedPts = path.filter((p) => p.speed != null).map((p) => [(p.ts - d.start_ts) / 60, p.speed]);
   const elevPts = path.filter((p) => p.elevation != null).map((p) => [(p.ts - d.start_ts) / 60, p.elevation]);
 
   setContent(`
+    ${driverDatalistHtml(roster, "tm-driver-names-detail")}
     <div class="tm-flex-row" style="gap:14px;flex-wrap:wrap;">
       <button class="tm-back-btn" data-action="back-drives">← Drives</button>
       <div style="font-size:15px;font-weight:600;">${esc(driveEndpoint(d, "start", locations))} <span style="color:var(--faint);">→</span> ${esc(driveEndpoint(d, "end", locations))}</div>
@@ -1178,11 +1235,12 @@ async function renderDriveDetail() {
       <div class="tm-flex-row" style="margin-left:auto;gap:6px;">
         <a class="tm-chip-btn" style="padding:5px 12px;" href="${esc(exportUrl("/data/export/drive.gpx", { id: d.id }))}" target="_blank" rel="noopener" download>&#11015; GPX</a>
         <span style="font-size:12px;color:var(--sub);">Driver:</span>
-        <input id="tm-driver-input" class="tm-gate-input" style="width:140px;padding:5px 9px;font-family:var(--ui);" placeholder="${esc(d.suggested_driver ? `${d.suggested_driver}?` : "unassigned")}" value="${esc(d.driver || "")}">
+        <input id="tm-driver-input" list="tm-driver-names-detail" class="tm-gate-input" style="width:140px;padding:5px 9px;font-family:var(--ui);" placeholder="${esc(d.suggested_driver ? `${d.suggested_driver}?` : "unassigned")}" value="${esc(d.driver || "")}" autocomplete="off">
         <button class="tm-chip-btn" style="padding:5px 12px;" data-action="save-driver" data-id="${d.id}">Save</button>
       </div>
     </div>
-    ${!d.driver && d.suggested_driver ? `<div style="font-size:12px;color:var(--faint);">Looks like <span class="tm-driver-suggested">${esc(d.suggested_driver)}</span> drove this — type a name and Save to confirm.</div>` : ""}
+    ${rosterHintHtml(roster)}
+    <div style="font-size:12px;color:var(--faint);">${esc(DRIVER_MANUAL_NOTE)}${!d.driver && d.suggested_driver ? ` Looks like <span class="tm-driver-suggested">${esc(d.suggested_driver)}</span> drove this — pick a name and Save to confirm.` : ""}</div>
     ${d.behavior_score != null || d.max_decel_ms2 != null ? `
     <div class="tm-grid-metrics">
       <div class="tm-card tm-card-pad-metric"><div class="tm-stat-label">Safety score</div><div class="tm-stat-value" style="color:${scoreColor(d.behavior_score)};">${d.behavior_score != null ? d.behavior_score : "—"}</div></div>
@@ -1191,6 +1249,7 @@ async function renderDriveDetail() {
       <div class="tm-card tm-card-pad-metric"><div class="tm-stat-label">Speeding · night</div><div class="tm-stat-value">${d.over_limit_frac != null ? fmt0(d.over_limit_frac * 100) : "—"} · ${d.night_frac != null ? fmt0(d.night_frac * 100) : "—"} <span class="tm-stat-unit">%</span></div></div>
       ${d.max_jerk_ms3 != null ? `<div class="tm-card tm-card-pad-metric"><div class="tm-stat-label">Peak jerk</div><div class="tm-stat-value">${fmt1(d.max_jerk_ms3)} <span class="tm-stat-unit">m/s³</span></div></div>` : ""}
     </div>` : ""}
+    ${riskCertificateSection(d)}
     <div class="tm-grid-2-wide">
       <div class="tm-card tm-map-card" style="min-height:300px;">
         <div id="tm-drive-map" class="tm-map-canvas"></div>
@@ -1254,6 +1313,7 @@ async function renderDrivers() {
   if (!drivers.length) return setContent(emptyHtml("No drives recorded yet", "Once trips are logged you can assign each drive to a driver (on the Drives page) and their risk profile appears here."));
 
   const hasScores = drivers.some((d) => d.behavior_score != null);
+  const baselineNote = res?.baseline_note || res?.note || null;
 
   setContent(`
     <div class="tm-card tm-card-pad" style="background:color-mix(in oklab, var(--accent) 5%, var(--card));">
@@ -1263,6 +1323,7 @@ async function renderDrivers() {
         reliable; <b>harsh braking / acceleration / g-force need ~1-second sampling</b> to be meaningful, so at the current
         logging cadence those show as low-fidelity. ${hasScores ? "" : "No behaviour scores yet — they populate as multi-sample drives accumulate."}
       </div>
+      ${baselineNote ? `<div style="font-size:12px;color:var(--faint);line-height:1.5;margin-top:10px;border-top:1px solid var(--line2);padding-top:10px;"><b>Baseline.</b> ${esc(baselineNote)}</div>` : ""}
     </div>
     <div class="tm-grid-3col">
       ${drivers.map((d) => `
@@ -1277,6 +1338,7 @@ async function renderDrivers() {
               <div style="font-size:10.5px;color:var(--faint);">safety score</div>
             </div>
           </div>
+          ${driverPercentileHtml(d)}
           <div class="tm-grid-half" style="gap:12px;margin-top:16px;">
             ${driverStat("Avg speed", d.avg_speed_kmh, "km/h")}
             ${driverStat("Top speed", d.max_speed_kmh, "km/h")}
@@ -1289,6 +1351,28 @@ async function renderDrivers() {
         </div>`).join("")}
     </div>
   `);
+}
+
+/** Percentile-vs-baseline + confidence band strip on a driver card (new score fields; may be absent). */
+function driverPercentileHtml(d) {
+  const hasPercentile = d.percentile != null;
+  const hasBand = d.score_low != null && d.score_high != null;
+  if (!hasPercentile && !hasBand && !d.score_confidence) return "";
+  const conf = d.score_confidence ? (CONFIDENCE_LABEL[d.score_confidence] || d.score_confidence) : null;
+  const parts = [];
+  if (d.behavior_score != null) parts.push(`${d.behavior_score}/100`);
+  if (hasPercentile) parts.push(`${ordinal(Math.round(d.percentile))} percentile`);
+  if (conf) parts.push(esc(conf));
+  return `<div class="tm-driver-percentile">
+    <span class="tm-pill tm-pill-chip" style="font-size:11px;">${parts.join(" · ")}</span>
+    ${hasBand ? `<span class="tm-stat-note" style="margin-top:0;">band ${d.score_low}–${d.score_high}</span>` : ""}
+  </div>`;
+}
+
+/** 82 → "82nd", 76 → "76th" etc. */
+function ordinal(n) {
+  const s = ["th", "st", "nd", "rd"], v = n % 100;
+  return n + (s[(v - 20) % 10] || s[v] || s[0]);
 }
 
 function driverStat(label, value, unit) {
@@ -1693,6 +1777,561 @@ async function renderVampireDrain() {
   `);
 }
 function fmt3(n) { return n == null ? "—" : (Math.round(n * 1000) / 1000).toString(); }
+
+// ===========================================================================
+// FRONTIER 1 — Insurance-grade
+// ===========================================================================
+
+/**
+ * Household driver roster from /data/drivers (Tesla-reported names + anyone
+ * already tagged). New endpoint — 404s until the worker ships it, in which case
+ * we fall back to names harvested from loaded drives so the picker still works.
+ * Returns [{ name, source, ... }] with source "tesla" | "tagged".
+ */
+async function loadDriverRoster() {
+  const roster = await safe(cached("drivers_roster", () => data.drivers(vin())), null);
+  if (roster && Array.isArray(roster.drivers)) return roster.drivers;
+  // Fallback: reuse whatever names we've seen assigned across loaded drives.
+  const fromDrives = knownDrivers(state.cache.all_drives || []);
+  return fromDrives.map((name) => ({ name, source: "tagged" }));
+}
+
+/** Roster display name — prefer the composed first/last, else the raw name. */
+function rosterName(r) {
+  const composed = [r.first_name, r.last_name].filter(Boolean).join(" ").trim();
+  return composed || r.name || "Unknown";
+}
+
+/** <datalist> options + a small "who's in the household" hint, from the roster. */
+function driverDatalistHtml(roster, id = "tm-driver-names") {
+  const names = [...new Set(roster.map(rosterName).filter(Boolean))].sort((a, b) => a.localeCompare(b));
+  return `<datalist id="${id}">${names.map((n) => `<option value="${esc(n)}"></option>`).join("")}</datalist>`;
+}
+
+/** Roster chips (Tesla-sourced names get a ⬤ badge) — a visual hint of who to assign. */
+function rosterHintHtml(roster) {
+  if (!roster.length) return "";
+  return `<div class="tm-roster-hint">
+    <span class="tm-roster-hint-label">Household</span>
+    ${roster.map((r) => `<span class="tm-roster-chip" title="${esc(r.source === "tesla" ? "from your Tesla account" : "previously tagged")}">${r.source === "tesla" ? `<span class="tm-roster-dot">⬤</span>` : ""}${esc(rosterName(r))}</span>`).join("")}
+  </div>`;
+}
+
+const DRIVER_MANUAL_NOTE = "Tesla can't auto-detect who drove — assignment is manual/assisted.";
+
+// --- Claims-grade drive report: risk certificate + printable report ---------
+
+const CONFIDENCE_LABEL = { high: "high confidence", medium: "medium confidence", low: "low confidence" };
+
+/**
+ * Risk-certificate section on the drive-detail screen: score + confidence band,
+ * over-limit severity + speed-limit source, coach note, plus the always-available
+ * "View signed certificate" and "Printable report" buttons (these are claims/
+ * incident artifacts for any drive, independent of whether behaviour scores
+ * exist — the score sub-parts degrade individually to "—").
+ */
+function riskCertificateSection(d) {
+  const hasBand = d.score_low != null && d.score_high != null;
+  const hasSeverity = d.over_limit_severity != null;
+  const hasCoach = !!d.coach_note;
+  const conf = d.score_confidence ? CONFIDENCE_LABEL[d.score_confidence] || d.score_confidence : null;
+  const limitSrc = d.speed_limit_source === "osm" ? "OSM posted limits" : d.speed_limit_source === "none" ? "no limit data" : null;
+  return `
+    <div class="tm-card tm-card-pad">
+      <div class="tm-flex-row" style="align-items:baseline;margin-bottom:14px;">
+        <div style="font-size:14px;font-weight:600;">Risk certificate</div>
+        <div style="font-size:12px;color:var(--faint);">claims-grade, signed on demand</div>
+        <div class="tm-flex-row" style="margin-left:auto;gap:6px;">
+          <button class="tm-chip-btn" style="padding:5px 12px;" data-action="view-cert" data-id="${d.id}">View signed certificate</button>
+          <button class="tm-chip-btn" style="padding:5px 12px;" data-action="print-report" data-id="${d.id}">🖨 Printable report</button>
+        </div>
+      </div>
+      <div class="tm-grid-metrics">
+        <div class="tm-card tm-card-pad-metric" style="background:var(--bg);">
+          <div class="tm-stat-label">Safety score</div>
+          <div class="tm-stat-value" style="color:${scoreColor(d.behavior_score)};">${d.behavior_score != null ? d.behavior_score : "—"}${hasBand ? ` <span class="tm-stat-unit">band ${d.score_low}–${d.score_high}</span>` : ""}</div>
+          <div class="tm-stat-note">${conf ? esc(conf) : "confidence not reported"}</div>
+        </div>
+        <div class="tm-card tm-card-pad-metric" style="background:var(--bg);">
+          <div class="tm-stat-label">Over-limit severity</div>
+          <div class="tm-stat-value">${hasSeverity ? "+" + fmt1(d.over_limit_severity) : "—"} <span class="tm-stat-unit">km/h avg</span></div>
+          <div class="tm-stat-note">${limitSrc ? esc(limitSrc) : "vs posted speed limit"}</div>
+        </div>
+      </div>
+      ${hasCoach ? `<div class="tm-coach-note"><span class="tm-coach-badge">Coach</span>${esc(d.coach_note)}</div>` : ""}
+      <div id="tm-cert-body"></div>
+    </div>`;
+}
+
+/** Fetch + render the signed certificate inline (canonical JSON + signature + verify URL + copy). */
+async function loadDriveCertificate(id) {
+  const target = document.getElementById("tm-cert-body");
+  if (!target) return;
+  target.innerHTML = `<div class="tm-cert-panel"><div class="tm-flex-row" style="gap:8px;color:var(--sub);font-size:12.5px;"><div class="tm-spinner" style="width:16px;height:16px;border-width:2px;"></div>Fetching signed certificate…</div></div>`;
+  let cert;
+  try {
+    cert = await data.driveCertificate(id);
+  } catch (e) {
+    // The currently-deployed worker uniformly 400s unknown /data/* routes, so a
+    // 400/404/501 here almost always means "certificate endpoint not deployed yet".
+    const unavailable = !(e instanceof ApiError) || [400, 404, 501].includes(e.status);
+    target.innerHTML = `<div class="tm-cert-panel"><div style="font-size:12.5px;color:var(--faint);">${unavailable
+      ? "Signed certificates aren't available on this worker yet — this endpoint hasn't been deployed. The score, band and coach note above are the shareable summary for now."
+      : "Couldn't fetch the certificate: " + esc(e.message)}</div></div>`;
+    return;
+  }
+  if (!cert || cert.error) {
+    target.innerHTML = `<div class="tm-cert-panel"><div style="font-size:12.5px;color:var(--faint);">${esc(cert?.error || "No certificate returned for this drive.")}</div></div>`;
+    return;
+  }
+  const canonicalJson = JSON.stringify(cert.canonical ?? {}, null, 2);
+  const copyPayload = JSON.stringify(cert, null, 2);
+  target.innerHTML = `
+    <div class="tm-cert-panel">
+      <div class="tm-flex-row" style="flex-wrap:wrap;gap:8px 14px;margin-bottom:10px;">
+        <div><span class="tm-cert-key">Algorithm</span> <span class="tm-mono" style="font-size:12px;">${esc(cert.algorithm || "—")}</span></div>
+        ${cert.issued_ts != null ? `<div><span class="tm-cert-key">Issued</span> <span class="tm-mono" style="font-size:12px;">${esc(fmtDateTime(cert.issued_ts))}</span></div>` : ""}
+        ${cert.drive_id != null ? `<div><span class="tm-cert-key">Drive</span> <span class="tm-mono" style="font-size:12px;">#${esc(cert.drive_id)}</span></div>` : ""}
+      </div>
+      <div class="tm-cert-key">Canonical drive metrics</div>
+      <pre class="tm-cert-json">${esc(canonicalJson)}</pre>
+      <div class="tm-cert-key" style="margin-top:10px;">Signature (HMAC-SHA256)</div>
+      <div class="tm-cert-sig tm-mono">${esc(cert.signature_hex || "—")}</div>
+      <div class="tm-flex-row" style="gap:8px;margin-top:12px;flex-wrap:wrap;">
+        <button class="tm-chip-btn" style="padding:5px 12px;" data-action="copy-cert" data-text="${esc(copyPayload)}">Copy certificate JSON</button>
+        ${cert.verify_url ? `<a class="tm-chip-btn" style="padding:5px 12px;" href="${esc(cert.verify_url)}" target="_blank" rel="noopener">Open verify URL ↗</a>` : ""}
+      </div>
+      ${cert.verify_url ? `<div class="tm-stat-note" style="margin-top:6px;word-break:break-all;">${esc(cert.verify_url)}</div>` : ""}
+    </div>`;
+}
+
+/**
+ * Open a clean, print-friendly incident/claims report for a drive in a new
+ * window — map snapshot (static, via the route bounds), metrics, harsh-event
+ * summary and the certificate hash. Uses window.print()-friendly markup with
+ * inlined styles so it needs no shared CSS.
+ */
+async function openPrintableReport(id) {
+  const w = window.open("", "_blank");
+  if (!w) return; // popup blocked — nothing else we can do
+  w.document.write(`<!doctype html><meta charset="utf-8"><title>Drive report</title><body style="font-family:Helvetica,Arial,sans-serif;padding:40px;color:#181B20;"><p>Preparing drive report…</p></body>`);
+  w.document.close();
+
+  const locations = await safe(cached("locations", () => data.locations()), []);
+  let detail;
+  try {
+    detail = await data.drive(id);
+  } catch (e) {
+    w.document.body.innerHTML = `<p style="color:#D6453D;">Couldn't load this drive: ${esc(e.message)}</p>`;
+    return;
+  }
+  if (!detail || detail.error) {
+    w.document.body.innerHTML = `<p style="color:#D6453D;">${esc(detail?.error || "Drive not found")}</p>`;
+    return;
+  }
+  const d = detail.drive;
+  const path = (detail.path || []).filter((p) => p.lat != null && p.lon != null);
+  let cert = null;
+  try { cert = await data.driveCertificate(id); } catch { /* cert optional */ }
+
+  const startName = driveEndpoint(d, "start", locations);
+  const endName = driveEndpoint(d, "end", locations);
+  // Static route image: an SVG polyline of the path, normalized to a fixed box.
+  const routeSvg = staticRouteSvg(path, 640, 300);
+  const row = (label, value) => `<tr><td style="padding:6px 14px 6px 0;color:#5F6670;font-size:12px;">${esc(label)}</td><td style="padding:6px 0;font-family:'IBM Plex Mono',monospace;font-size:13px;font-weight:600;">${value}</td></tr>`;
+  const conf = d.score_confidence ? (CONFIDENCE_LABEL[d.score_confidence] || d.score_confidence) : null;
+
+  const html = `<!doctype html><html><head><meta charset="utf-8"><title>Drive report · ${esc(startName)} → ${esc(endName)}</title>
+  <style>
+    @media print { .noprint { display:none !important; } body { padding: 0; } }
+    body { font-family: Helvetica, Arial, sans-serif; color:#181B20; padding:40px; max-width:760px; margin:0 auto; line-height:1.5; }
+    h1 { font-size:20px; margin:0 0 2px; }
+    .sub { color:#5F6670; font-size:13px; margin-bottom:22px; }
+    .sec { font-size:11px; text-transform:uppercase; letter-spacing:0.08em; color:#98A0AA; font-weight:700; margin:26px 0 10px; }
+    table { border-collapse:collapse; width:100%; }
+    .metrics td:first-child { width:40%; }
+    .cert { background:#F5F6F8; border:1px solid rgba(18,24,38,0.09); border-radius:8px; padding:14px; font-family:'IBM Plex Mono',monospace; font-size:11px; white-space:pre-wrap; word-break:break-all; }
+    .badge { display:inline-block; padding:2px 8px; border-radius:999px; font-size:11px; font-weight:700; background:#EDEFF2; color:#5F6670; }
+    .foot { margin-top:30px; padding-top:14px; border-top:1px solid rgba(18,24,38,0.09); font-size:11px; color:#98A0AA; }
+    button { font:inherit; padding:8px 16px; border-radius:8px; border:1px solid rgba(18,24,38,0.2); background:#2E62E8; color:#fff; cursor:pointer; }
+  </style></head><body>
+  <div class="noprint" style="margin-bottom:20px;"><button onclick="window.print()">🖨 Print / Save as PDF</button></div>
+  <h1>Drive incident report</h1>
+  <div class="sub">${esc(startName)} → ${esc(endName)} · ${esc(fmtDateTime(d.start_ts))}${d.driver ? " · driver: " + esc(d.driver) : ""}</div>
+
+  <div class="sec">Route</div>
+  ${routeSvg || `<div style="color:#98A0AA;font-size:13px;">No GPS path recorded for this drive.</div>`}
+
+  <div class="sec">Trip metrics</div>
+  <table class="metrics">
+    ${row("Distance", `${d.distance_km != null ? fmt1(d.distance_km) : "—"} km`)}
+    ${row("Duration", fmtDurationMin(d.duration_min))}
+    ${row("Avg · top speed", `${d.avg_speed != null ? fmt0(d.avg_speed) : "—"} · ${d.max_speed != null ? fmt0(d.max_speed) : "—"} km/h`)}
+    ${row("Consumption", `${d.efficiency_wh_km != null ? fmt0(d.efficiency_wh_km) : "—"} Wh/km`)}
+    ${row("Energy used", `${d.energy_used_kwh != null ? fmt2(d.energy_used_kwh) : "—"} kWh`)}
+    ${row("Battery", `${d.start_soc != null && d.end_soc != null ? `${d.start_soc} → ${d.end_soc}` : "—"} %`)}
+  </table>
+
+  <div class="sec">Risk summary</div>
+  <table class="metrics">
+    ${row("Safety score", `${d.behavior_score != null ? d.behavior_score : "—"}${d.score_low != null && d.score_high != null ? ` (band ${d.score_low}–${d.score_high})` : ""}${conf ? ` · ${esc(conf)}` : ""}`)}
+    ${row("Harsh brakes · accels", `${d.harsh_brake_count ?? 0} · ${d.harsh_accel_count ?? 0}`)}
+    ${row("Peak braking", `${d.max_decel_ms2 != null ? fmt2(d.max_decel_ms2 / 9.81) + " g" : "—"}`)}
+    ${row("Over-limit severity", `${d.over_limit_severity != null ? "+" + fmt1(d.over_limit_severity) + " km/h avg" : "—"}`)}
+    ${row("Speeding · night", `${d.over_limit_frac != null ? fmt0(d.over_limit_frac * 100) : "—"} · ${d.night_frac != null ? fmt0(d.night_frac * 100) : "—"} %`)}
+  </table>
+  ${d.coach_note ? `<p style="margin-top:12px;"><span class="badge">Coach</span> ${esc(d.coach_note)}</p>` : ""}
+
+  ${cert && !cert.error ? `
+  <div class="sec">Tamper-evident certificate</div>
+  <div class="cert">algorithm: ${esc(cert.algorithm || "—")}
+issued: ${cert.issued_ts != null ? esc(fmtDateTime(cert.issued_ts)) : "—"}
+signature: ${esc(cert.signature_hex || "—")}${cert.verify_url ? `
+verify: ${esc(cert.verify_url)}` : ""}</div>` : ""}
+
+  <div class="foot">Generated by the Tesla dashboard · VIN ${esc(vin().slice(-6))} · ${new Date().toLocaleString()}. ${esc(DRIVER_MANUAL_NOTE)}</div>
+  </body></html>`;
+
+  w.document.open();
+  w.document.write(html);
+  w.document.close();
+}
+
+/** Fixed-box SVG polyline of a lat/lon path — a static route thumbnail for the print report. */
+function staticRouteSvg(path, w, h) {
+  const pts = path.filter((p) => p.lat != null && p.lon != null);
+  if (pts.length < 2) return "";
+  const lats = pts.map((p) => p.lat), lons = pts.map((p) => p.lon);
+  const minLat = Math.min(...lats), maxLat = Math.max(...lats);
+  const minLon = Math.min(...lons), maxLon = Math.max(...lons);
+  const pad = 20;
+  // Equirectangular-ish projection is fine at this scale; keep aspect sane.
+  const spanLat = (maxLat - minLat) || 1e-6, spanLon = (maxLon - minLon) || 1e-6;
+  const X = (lon) => pad + ((lon - minLon) / spanLon) * (w - 2 * pad);
+  const Y = (lat) => pad + (1 - (lat - minLat) / spanLat) * (h - 2 * pad);
+  const poly = pts.map((p) => `${X(p.lon).toFixed(1)},${Y(p.lat).toFixed(1)}`).join(" ");
+  const first = pts[0], last = pts[pts.length - 1];
+  return `<svg viewBox="0 0 ${w} ${h}" width="100%" style="border:1px solid rgba(18,24,38,0.12);border-radius:8px;background:#F5F6F8;">
+    <polyline points="${poly}" style="fill:none;stroke:#2E62E8;stroke-width:3;stroke-linejoin:round;stroke-linecap:round;"></polyline>
+    <circle cx="${X(first.lon).toFixed(1)}" cy="${Y(first.lat).toFixed(1)}" r="6" style="fill:#fff;stroke:#2E62E8;stroke-width:3;"></circle>
+    <circle cx="${X(last.lon).toFixed(1)}" cy="${Y(last.lat).toFixed(1)}" r="6" style="fill:#2E62E8;stroke:#fff;stroke-width:2;"></circle>
+  </svg>`;
+}
+
+// ===========================================================================
+// FRONTIER 3 — Ask Tessa (natural-language Q&A over the car's data)
+// ===========================================================================
+
+const ASK_SUGGESTIONS = [
+  "How efficient was I this month?",
+  "Is my battery healthy?",
+  "Who drives the most?",
+  "What's my longest drive?",
+];
+
+async function renderAskTessa() {
+  setContent(askTessaHtml());
+  scrollAskToBottom();
+  const input = document.getElementById("tm-ask-input");
+  if (input) {
+    input.addEventListener("keydown", (e) => {
+      if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); askSubmit(); }
+    });
+    // Don't steal focus on mobile (would pop the keyboard on every nav), but do on desktop.
+    if (window.matchMedia("(min-width: 761px)").matches) input.focus();
+  }
+}
+
+function askTessaHtml() {
+  const t = state.askTranscript;
+  const empty = t.length === 0;
+  return `
+    <div class="tm-ask-wrap">
+      <div class="tm-card tm-ask-card">
+        <div class="tm-ask-scroll" id="tm-ask-scroll">
+          ${empty ? `
+          <div class="tm-ask-intro">
+            <div class="tm-ask-intro-icon">✦</div>
+            <div class="tm-ask-intro-title">Ask Tessa anything about your car</div>
+            <div class="tm-ask-intro-sub">Natural-language answers over your drives, charges, battery health and driver scores. Answers are generated live and aren't stored.</div>
+            <div class="tm-ask-suggest-row">
+              ${ASK_SUGGESTIONS.map((q) => `<button class="tm-chip-btn" data-action="ask-suggest" data-q="${esc(q)}">${esc(q)}</button>`).join("")}
+            </div>
+          </div>` : t.map((m) => askMessageHtml(m)).join("")}
+          ${state.askPending ? askPendingHtml() : ""}
+        </div>
+        <div class="tm-ask-inputbar">
+          <input id="tm-ask-input" class="tm-ask-input" type="text" autocomplete="off" placeholder="Ask about efficiency, battery, drivers…" ${state.askPending ? "disabled" : ""}>
+          <button class="tm-ask-send" data-action="ask-send" ${state.askPending ? "disabled" : ""} aria-label="Send">↑</button>
+        </div>
+      </div>
+    </div>`;
+}
+
+function askMessageHtml(m) {
+  if (m.role === "user") {
+    return `<div class="tm-ask-msg tm-ask-user"><div class="tm-ask-bubble">${esc(m.text)}</div></div>`;
+  }
+  if (m.role === "error") {
+    return `<div class="tm-ask-msg tm-ask-tessa"><div class="tm-ask-bubble tm-ask-bubble-error">${esc(m.text)}</div></div>`;
+  }
+  // assistant
+  const tools = (m.tools_used || []).map((t) => `<span class="tm-ask-toolchip">via ${esc(t)}</span>`).join("");
+  const detail = m.data ? askDataDetailHtml(m.data) : "";
+  return `<div class="tm-ask-msg tm-ask-tessa">
+    <div class="tm-ask-bubble">${esc(m.text)}</div>
+    ${m.note ? `<div class="tm-ask-note">${esc(m.note)}</div>` : ""}
+    ${detail}
+    ${tools ? `<div class="tm-ask-tools">${tools}</div>` : ""}
+  </div>`;
+}
+
+/** Compact key/value view of the answer's structured `data` payload (best-effort). */
+function askDataDetailHtml(dataObj) {
+  if (dataObj == null || typeof dataObj !== "object") return "";
+  const entries = Object.entries(dataObj).filter(([, v]) => v != null && typeof v !== "object").slice(0, 8);
+  if (!entries.length) return "";
+  return `<details class="tm-ask-data"><summary>data</summary><div class="tm-ask-data-grid">${entries
+    .map(([k, v]) => `<div class="tm-ask-data-k">${esc(k)}</div><div class="tm-ask-data-v tm-mono">${esc(typeof v === "number" ? (Number.isInteger(v) ? v : fmt2(v)) : v)}</div>`)
+    .join("")}</div></details>`;
+}
+
+function askPendingHtml() {
+  return `<div class="tm-ask-msg tm-ask-tessa"><div class="tm-ask-bubble tm-ask-typing"><span></span><span></span><span></span></div></div>`;
+}
+
+function scrollAskToBottom() {
+  const el = document.getElementById("tm-ask-scroll");
+  if (el) el.scrollTop = el.scrollHeight;
+}
+
+/** Send a question to /ai/ask, appending both the question and the answer to the in-memory transcript. */
+async function askSubmit(preset) {
+  if (state.askPending) return;
+  const input = document.getElementById("tm-ask-input");
+  const question = (preset ?? (input ? input.value : "")).trim();
+  if (!question) return;
+  if (input) input.value = "";
+  state.askTranscript.push({ role: "user", text: question });
+  state.askPending = true;
+  setContent(askTessaHtml());
+  scrollAskToBottom();
+
+  try {
+    const res = await data.ask(question, vin());
+    state.askPending = false;
+    state.askTranscript.push({
+      role: "assistant",
+      text: res?.answer || "(no answer returned)",
+      tools_used: res?.tools_used || [],
+      data: res?.data ?? null,
+      note: res?.note || null,
+    });
+  } catch (e) {
+    state.askPending = false;
+    const warming = !(e instanceof ApiError) || e.status === 404 || e.status === 500 || e.status === 501 || e.status === 502 || e.status === 503;
+    state.askTranscript.push({
+      role: "error",
+      text: warming
+        ? "Ask Tessa is warming up or unavailable right now — the AI endpoint isn't reachable. This usually means it hasn't been deployed on the worker yet, or it timed out. Try again in a moment."
+        : "Couldn't get an answer: " + e.message,
+    });
+  }
+  // Only repaint if we're still on the Ask screen (user may have navigated away).
+  if (state.screen === "ask") {
+    setContent(askTessaHtml());
+    scrollAskToBottom();
+    const el = document.getElementById("tm-ask-input");
+    if (el && window.matchMedia("(min-width: 761px)").matches) el.focus();
+  }
+}
+
+// ===========================================================================
+// FRONTIER 2 — Predictions (battery forecast + range predictor)
+// ===========================================================================
+
+async function renderPredictions() {
+  const [forecast, rangeModel, roster] = await Promise.all([
+    safe(cached("battery_forecast", () => data.batteryForecast(vin())), null),
+    safe(cached("predict_range_model", () => data.predictRange({ vin: vin() })), null),
+    loadDriverRoster(),
+  ]);
+
+  setContent(`
+    <div class="tm-grid-2">
+      ${batteryForecastCard(forecast)}
+      ${rangePredictorCard(rangeModel, roster)}
+    </div>
+  `);
+
+  // Render the projected-% line chart into its placeholder (chart primitive needs the DOM node).
+  const chartEl = document.getElementById("tm-forecast-chart");
+  if (chartEl && forecast?.projected_pct?.length > 1) {
+    const pts = forecast.projected_pct
+      .filter((p) => p.pct != null && p.year != null)
+      .map((p) => [p.year, p.pct]);
+    if (pts.length > 1) {
+      chartEl.innerHTML = svgLineChart({
+        series: [{ points: pts, area: true }],
+        yTicks: autoTicks(pts.map((p) => p[1]), 4),
+        xTicks: pts.map((p) => ({ value: p[0], label: String(p[0]) })),
+      });
+    }
+  }
+}
+
+/** Battery forecast card: health %, degradation slope + r², warranty-cliff timeline, projected-% chart. */
+function batteryForecastCard(f) {
+  if (!f || f.current_pct == null) {
+    return `<div class="tm-card tm-card-pad">
+      <div style="font-size:14px;font-weight:600;margin-bottom:4px;">Battery forecast</div>
+      <div class="tm-empty">${esc(f?.note || "Not enough data yet — the degradation forecast needs a run of charge sessions before it can project a slope. Check back once more charges are logged, or once the forecast endpoint is deployed.")}</div>
+    </div>`;
+  }
+  const slope = f.slope_pct_per_year;
+  const r2 = f.r2;
+  const cliff = f.cliff || {};
+  const warranty = f.warranty || {};
+  const yearsRemaining = cliff.years_remaining;
+  const binding = cliff.binding; // "time" | "odometer" | "none"
+
+  return `
+    <div class="tm-card tm-card-pad tm-flex-col">
+      <div class="tm-flex-row" style="align-items:baseline;">
+        <div style="font-size:14px;font-weight:600;">Battery forecast</div>
+        <div style="font-size:12px;color:var(--faint);margin-left:auto;">${f.samples != null ? `${f.samples} samples` : ""}</div>
+      </div>
+      <div class="tm-grid-half" style="gap:14px;">
+        <div class="tm-card tm-card-pad-metric" style="background:var(--bg);">
+          <div class="tm-stat-label">Current health</div>
+          <div class="tm-stat-value">${fmt1(f.current_pct)} <span class="tm-stat-unit">%</span></div>
+        </div>
+        <div class="tm-card tm-card-pad-metric" style="background:var(--bg);">
+          <div class="tm-stat-label">Degradation</div>
+          <div class="tm-stat-value">${slope != null ? (slope > 0 ? "−" : "+") + fmt2(Math.abs(slope)) : "—"} <span class="tm-stat-unit">%/yr</span></div>
+          <div class="tm-stat-note">${r2 != null ? `r² ${fmt2(r2)}` : "fit quality n/a"}${f.km_per_year != null ? ` · ${fmt0(f.km_per_year)} km/yr` : ""}</div>
+        </div>
+      </div>
+      ${warrantyCliffHtml(cliff, warranty, yearsRemaining, binding)}
+      <div>
+        <div class="tm-flex-row" style="align-items:baseline;margin-bottom:10px;">
+          <div style="font-size:12.5px;font-weight:600;color:var(--sub);">Projected health</div>
+          <div style="font-size:11.5px;color:var(--faint);margin-left:auto;">% vs year</div>
+        </div>
+        <div id="tm-forecast-chart">${f.projected_pct?.length > 1 ? "" : `<div class="tm-empty" style="padding:24px;">No projection points yet</div>`}</div>
+      </div>
+      ${f.note ? `<div class="tm-stat-note">${esc(f.note)}</div>` : ""}
+    </div>`;
+}
+
+/** Horizontal warranty-cliff timeline/gauge — years remaining + which cap (time vs odometer) binds first. */
+function warrantyCliffHtml(cliff, warranty, yearsRemaining, binding) {
+  const warrantyYears = warranty.years;
+  const floorPct = warranty.floor_pct;
+  // Position the "now" marker on a 0..warrantyYears track; the cliff sits at yearsRemaining.
+  const span = warrantyYears || (yearsRemaining != null ? Math.max(yearsRemaining * 1.2, 1) : 8);
+  const cliffFrac = yearsRemaining != null ? Math.max(0, Math.min(1, yearsRemaining / span)) : null;
+  const bindLabel = binding === "time" ? "time cap (age)" : binding === "odometer" ? "mileage cap (km)" : binding === "none" ? "no cap reached in horizon" : null;
+  const color = yearsRemaining == null ? "var(--faint)" : yearsRemaining < 1 ? "var(--bad)" : yearsRemaining < 3 ? "var(--warn)" : "var(--good)";
+
+  return `
+    <div class="tm-cliff">
+      <div class="tm-flex-row" style="align-items:baseline;">
+        <div style="font-size:12.5px;font-weight:600;color:var(--sub);">Warranty cliff</div>
+        <div style="font-size:11.5px;color:var(--faint);margin-left:auto;">${warrantyYears != null && warranty.km != null ? `${warrantyYears} yr / ${fmt0(warranty.km)} km${floorPct != null ? ` · floor ${floorPct}%` : ""}` : "warranty terms n/a"}</div>
+      </div>
+      <div class="tm-cliff-track">
+        <div class="tm-cliff-fill" style="width:${cliffFrac != null ? (cliffFrac * 100).toFixed(1) : 0}%;background:${color};"></div>
+        ${cliffFrac != null ? `<div class="tm-cliff-marker" style="left:${(cliffFrac * 100).toFixed(1)}%;"></div>` : ""}
+      </div>
+      <div class="tm-flex-row" style="justify-content:space-between;margin-top:6px;">
+        <div class="tm-stat-value" style="font-size:18px;color:${color};">${yearsRemaining != null ? fmt1(yearsRemaining) + " yr" : "—"} <span class="tm-stat-unit" style="font-size:12px;">to cliff</span></div>
+        ${bindLabel ? `<div class="tm-stat-note" style="margin-top:0;align-self:flex-end;">binds on ${esc(bindLabel)}${cliff.time_floor_date && binding === "time" ? ` · ${esc(cliff.time_floor_date)}` : ""}${cliff.odo_floor_date && binding === "odometer" ? ` · ${esc(cliff.odo_floor_date)}` : ""}</div>` : ""}
+      </div>
+    </div>`;
+}
+
+/** Range predictor card: a small form → data.predictRange(...) → predicted Wh/km, kWh, SoC used. */
+function rangePredictorCard(model, roster) {
+  const m = model?.model || null;
+  const ready = model?.ready !== false && (m ? (m.n ?? 0) > 0 : false);
+  const trust = m ? `model r² ${m.r2 != null ? fmt2(m.r2) : "—"} · n=${m.n ?? "—"}` : null;
+  const names = [...new Set(roster.map(rosterName).filter(Boolean))].sort((a, b) => a.localeCompare(b));
+
+  return `
+    <div class="tm-card tm-card-pad tm-flex-col">
+      <div class="tm-flex-row" style="align-items:baseline;">
+        <div style="font-size:14px;font-weight:600;">Range predictor</div>
+        <div style="font-size:12px;color:var(--faint);margin-left:auto;">${trust ? esc(trust) : "trained on your drives"}</div>
+      </div>
+      ${model && !ready ? `<div class="tm-empty" style="padding:20px;">${esc(model?.note || "Not enough data yet — the range model needs more completed drives before it can predict. Keep driving (and logging) and this fills in.")}</div>` : ""}
+      ${!model ? `<div class="tm-empty" style="padding:20px;">The range-prediction endpoint isn't available on this worker yet — it hasn't been deployed. Once it is, enter a trip below to estimate energy use.</div>` : ""}
+      <div class="tm-predict-form" style="${model && !ready ? "opacity:0.5;" : ""}">
+        <div class="tm-predict-grid">
+          <label class="tm-predict-field"><span>Distance (km)</span><input id="tm-pr-distance" class="tm-gate-input" type="number" inputmode="decimal" min="0" step="1" placeholder="e.g. 120"></label>
+          <label class="tm-predict-field"><span>Temp (°C)</span><input id="tm-pr-temp" class="tm-gate-input" type="number" inputmode="decimal" step="1" placeholder="e.g. 18"></label>
+          <label class="tm-predict-field"><span>Elevation gain (m)</span><input id="tm-pr-elev" class="tm-gate-input" type="number" inputmode="decimal" min="0" step="10" placeholder="optional"></label>
+          <label class="tm-predict-field"><span>Driver</span>
+            <select id="tm-pr-driver" class="tm-gate-input">
+              <option value="">Any</option>
+              ${names.map((n) => `<option value="${esc(n)}">${esc(n)}</option>`).join("")}
+            </select>
+          </label>
+        </div>
+        <button class="tm-gate-btn" style="width:auto;padding:9px 18px;margin-top:4px;" data-action="predict-run">Predict</button>
+      </div>
+      <div id="tm-predict-result"></div>
+    </div>`;
+}
+
+/** Read the range-predictor form, call data.predictRange, render the result inline. */
+async function runRangePrediction() {
+  const target = document.getElementById("tm-predict-result");
+  if (!target) return;
+  const distEl = document.getElementById("tm-pr-distance");
+  const distance_km = distEl && distEl.value !== "" ? Number(distEl.value) : null;
+  if (distance_km == null || Number.isNaN(distance_km) || distance_km <= 0) {
+    target.innerHTML = `<div class="tm-stat-note" style="color:var(--warn);">Enter a distance in km to predict.</div>`;
+    return;
+  }
+  const tempEl = document.getElementById("tm-pr-temp");
+  const elevEl = document.getElementById("tm-pr-elev");
+  const driverEl = document.getElementById("tm-pr-driver");
+  const params = {
+    vin: vin(),
+    distance_km,
+    temp_c: tempEl && tempEl.value !== "" ? Number(tempEl.value) : undefined,
+    elevation_gain_m: elevEl && elevEl.value !== "" ? Number(elevEl.value) : undefined,
+    driver: driverEl && driverEl.value ? driverEl.value : undefined,
+  };
+  target.innerHTML = `<div class="tm-flex-row" style="gap:8px;color:var(--sub);font-size:12.5px;margin-top:8px;"><div class="tm-spinner" style="width:16px;height:16px;border-width:2px;"></div>Predicting…</div>`;
+
+  let res;
+  try {
+    res = await data.predictRange(params);
+  } catch (e) {
+    const unavailable = !(e instanceof ApiError) || [400, 404, 501].includes(e.status);
+    target.innerHTML = `<div class="tm-stat-note" style="color:var(--faint);margin-top:8px;">${unavailable
+      ? "The range-prediction endpoint isn't deployed on this worker yet."
+      : "Couldn't predict: " + esc(e.message)}</div>`;
+    return;
+  }
+  if (!res || res.error || res.predicted_wh_km == null) {
+    target.innerHTML = `<div class="tm-stat-note" style="color:var(--faint);margin-top:8px;">${esc(res?.note || res?.error || "No prediction returned — the model may not be ready.")}</div>`;
+    return;
+  }
+  const m = res.model || {};
+  target.innerHTML = `
+    <div class="tm-predict-result">
+      <div class="tm-grid-metrics" style="grid-template-columns:repeat(auto-fit,minmax(120px,1fr));">
+        <div><div class="tm-readout-label">Consumption</div><div class="tm-readout-value">${fmt0(res.predicted_wh_km)} <span style="font-size:11px;color:var(--sub);">Wh/km</span></div></div>
+        <div><div class="tm-readout-label">Energy</div><div class="tm-readout-value">${fmt1(res.predicted_kwh)} <span style="font-size:11px;color:var(--sub);">kWh</span></div></div>
+        <div><div class="tm-readout-label">SoC used</div><div class="tm-readout-value">${fmt1(res.predicted_soc_used_pct)} <span style="font-size:11px;color:var(--sub);">%</span></div></div>
+      </div>
+      ${res.arrival_note ? `<div class="tm-stat-note" style="margin-top:10px;">${esc(res.arrival_note)}</div>` : ""}
+      <div class="tm-stat-note">${m.r2 != null ? `model r² ${fmt2(m.r2)}` : ""}${m.n != null ? ` · trained on ${m.n} drives` : ""}${res.note ? ` · ${esc(res.note)}` : ""}</div>
+    </div>`;
+}
 
 // ---------------------------------------------------------------------------
 

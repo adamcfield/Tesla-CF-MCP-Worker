@@ -17,8 +17,12 @@ its source or its D1/KV state.
   `list_vehicles` and `get_vehicle_data`. `api.js` hard-allowlists these; it
   has no code path that can reach a command tool (lock, charge, climate,
   etc.). Gated by `Authorization: Bearer`.
+- `POST /ai/ask` on the worker — Ask-Tessa natural-language Q&A. The dashboard
+  POSTs `{question, vin}`; the worker answers with `{answer, tools_used,
+  data}`. Gated by the same token (query param + `Authorization: Bearer`).
+  Answers are never cached (see `sw.js`).
 
-Both use the same `MCP_AUTH_TOKEN` you already generated for the worker.
+All use the same `MCP_AUTH_TOKEN` you already generated for the worker.
 
 ## Layout
 
@@ -36,16 +40,48 @@ icons/                generated PNG app icons (192/512 maskable + apple-touch 18
 
 ## Screens
 
-Overview, Timeline, Statistics, Drives (list + detail with route map + speed
-chart), Drivers, Places, Lifetime map, Charges (list + detail with charge
-curve), Charging stats, Battery health, Vampire drain — matching the
-"TeslaMate UI redesign" mockup's layout and color system, but reading real
-data instead of sample numbers. Screens show an honest empty state (not
-fabricated numbers) when the backing D1 tables have nothing yet, and degrade
-gracefully when a newer `/data/*` endpoint hasn't been deployed on the worker
-side.
+Ask Tessa, Overview, Timeline, Statistics, Drives (list + detail with route
+map + speed chart + risk certificate), Drivers, Places, Lifetime map, Charges
+(list + detail with charge curve), Charging stats, Battery health,
+Predictions, Vampire drain — matching the "TeslaMate UI redesign" mockup's
+layout and color system, but reading real data instead of sample numbers.
+Screens show an honest empty state (not fabricated numbers) when the backing
+D1 tables have nothing yet, and degrade gracefully when a newer `/data/*` (or
+`/ai/*`) endpoint hasn't been deployed on the worker side.
 
 Feature highlights:
+
+- **Ask Tessa** — a natural-language chat panel (`POST /ai/ask`). Ask "How
+  efficient was I this month?", "Is my battery healthy?", "Who drives the
+  most?" — the answer renders with the tools it used shown as small chips
+  ("via get_monthly_report") and an optional compact data view. The transcript
+  is kept in memory only (never persisted). When the AI endpoint isn't
+  deployed / reachable it shows a graceful "warming up / unavailable" state.
+- **Predictions** — two cards. **Battery forecast**: current health %,
+  degradation slope %/yr with r², and a warranty-cliff gauge showing years
+  remaining and which cap (age vs odometer) binds first, plus a projected-%
+  line chart. **Range predictor**: a small form (distance, temp, driver,
+  optional elevation) → predicted Wh/km, kWh and SoC used, with the model
+  r²/n as a trust indicator. Both show a "not enough data yet" / "not deployed
+  yet" empty state when the model or endpoint isn't ready.
+- **Insurance-grade drive report** — each drive detail carries a **Risk
+  certificate** section: safety score with its confidence band
+  (`score_low`–`score_high`, confidence label), over-limit severity + speed-
+  limit source, a coach note, a **View signed certificate** button (fetches
+  `/data/drive-certificate` and shows the canonical JSON + HMAC-SHA256
+  signature + a copy button + the verify URL), and a **🖨 Printable report**
+  button that opens a clean, `window.print()`-friendly incident/claims report
+  (map, route, metrics, harsh-event summary, certificate hash).
+- **Household driver picker** — everywhere a driver is assigned (Drives list
+  inline editor + drive detail) the suggestions come from the real household
+  roster (`/data/drivers` — Tesla-reported names get a small ⬤ badge), falling
+  back to names harvested from loaded drives when that endpoint isn't
+  deployed. A note reminds you Tesla can't auto-detect who drove — assignment
+  is manual/assisted.
+- **Driver percentiles** — each Drivers-page card shows percentile + a
+  confidence band (e.g. "82/100 · 76th percentile · high confidence") against
+  a UBI baseline, plus the baseline note, when the score endpoint returns
+  them.
 
 - **Overview** — battery/range/climate, current-location map, TPMS card
   (per-wheel bar pressure, amber when a wheel deviates >0.3 bar from the
@@ -87,19 +123,26 @@ with the blue "T" icon.
 
 `sw.js` caches only the app shell (HTML/JS/CSS, manifest, icons, Leaflet)
 cache-first with a background revalidate. Anything under `/data/`, `/mcp`,
-`/geocode`, `/govtiles`, or any URL carrying a `token=` param is **never
-cached** — vehicle data and tokened responses always hit the network. Bump
-`CACHE_NAME` in `sw.js` when shipping shell changes; old caches are deleted
-on activate. Icons are generated programmatically (no binary assets checked
-in by hand — see the rounded-square "T" PNGs in `icons/`).
+`/ai/`, `/geocode`, `/govtiles`, or any URL carrying a `token=` param is
+**never cached** — vehicle data, AI answers and tokened responses always hit
+the network. Bump `CACHE_NAME` in `sw.js` when shipping shell changes; old
+caches are deleted on activate. Icons are generated programmatically (no
+binary assets checked in by hand — see the rounded-square "T" PNGs in
+`icons/`).
 
 ## Exports
 
 - Drives list → `⬇ CSV` (`/data/export/drives.csv`)
 - Charges list → `⬇ CSV` (`/data/export/charges.csv`)
 - Drive detail → `⬇ GPX` (`/data/export/drive.gpx?id=`)
+- Drive detail → **🖨 Printable report** — a clean, print-to-PDF incident /
+  claims report (map, metrics, harsh-event summary, certificate hash),
+  rendered client-side in a new window.
+- Drive detail → **Signed certificate** — the canonical drive JSON +
+  HMAC-SHA256 signature from `/data/drive-certificate?id=`, with a copy button
+  and the worker's verify URL.
 
-All are plain token-gated GET links served by the worker.
+The CSV/GPX exports are plain token-gated GET links served by the worker.
 
 ## Running locally
 

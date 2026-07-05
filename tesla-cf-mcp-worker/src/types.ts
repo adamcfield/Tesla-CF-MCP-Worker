@@ -1,9 +1,18 @@
 /** Worker bindings and shared Tesla Fleet API types. */
 
+/** Minimal Cloudflare Workers AI binding shape (avoids depending on the ambient Ai type). */
+export interface WorkersAI {
+  run(model: string, input: Record<string, unknown>): Promise<unknown>;
+}
+
 export interface Env {
   TESLA_KV: KVNamespace;
   /** D1 database for telemetry history, charge sessions and the alert log. */
   DB: D1Database;
+  /** Cloudflare Workers AI (Llama) — powers Ask-Tessa, briefings, coach notes. Optional. */
+  AI?: WorkersAI;
+  /** HMAC secret for signed drive risk certificates (falls back to MCP_AUTH_TOKEN). */
+  CERT_SECRET?: string;
 
   // vars (wrangler.toml)
   TESLA_REGION: "na" | "eu" | "cn";

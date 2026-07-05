@@ -42,3 +42,7 @@ BUDGET_POLL_USD = "9"
 QUIET_HOURS_UTC = "21-3"
 # IANA zone for night-scoring, monthly buckets, DST-aware schedules.
 DEFAULT_TZ = "Asia/Jerusalem"
+
+# Workers AI (Llama, free tier) — powers Ask-Tessa, proactive briefings, coach notes.
+[ai]
+binding = "AI"

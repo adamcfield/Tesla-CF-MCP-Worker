@@ -15,9 +15,11 @@
  * query over charge_sessions / positions so they are always fresh.
  */
 
-import { getChargingHistory } from "./api";
+import { getChargingHistory, getVehicleDrivers } from "./api";
 import { getBudgetStatus } from "./budget";
+import { signDriveCertificate } from "./certificate";
 import { reverseGeocode } from "./geocode";
+import { postedLimitsForSamples } from "./roadlimits";
 import { scoreDrive } from "./scoring";
 import {
   ensureSchema,
@@ -106,6 +108,9 @@ function buildSample(s: LatestState, activity: Activity): PositionSample {
     charger_voltage: num(s.charger_voltage),
     charger_current: num(s.charger_current),
     charge_energy_added: num(s.charge_energy_added),
+    lon_accel: num(s.lon_accel),
+    lat_accel: num(s.lat_accel),
+    brake_pedal: num(s.brake_pedal),
   };
 }
 
@@ -177,10 +182,14 @@ async function openDrive_(env: Env, vin: string, ts: number, s: LatestState): Pr
   const res = await env.DB.prepare(
     `INSERT INTO drives (
        vin, start_ts, status, start_lat, start_lon, start_location_id,
-       start_odometer, start_soc, start_rated_range, start_ideal_range, start_outside_temp
-     ) VALUES (?1,?2,'active',?3,?4,?5,?6,?7,?8,?9,?10)`,
+       start_odometer, start_soc, start_rated_range, start_ideal_range, start_outside_temp,
+       fp_temp_set, fp_seat_heater
+     ) VALUES (?1,?2,'active',?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)`,
   )
-    .bind(vin, ts, lat, lon, locId, num(s.odometer), num(s.soc), num(s.rated_range), num(s.ideal_range), num(s.outside_temp))
+    .bind(
+      vin, ts, lat, lon, locId, num(s.odometer), num(s.soc), num(s.rated_range), num(s.ideal_range), num(s.outside_temp),
+      num(s.cabin_temp_set), num(s.seat_heater_l),
+    )
     .run();
   const id = Number(res.meta.last_row_id ?? 0);
   return { id, vin, start_ts: ts, start_odometer: num(s.odometer) };
@@ -226,14 +235,22 @@ async function closeDrive(env: Env, drive: DriveRow, s: LatestState, ts: number)
     return;
   }
 
-  // Driving-behaviour metrics from the drive's speed/heading samples.
+  // Driving-behaviour metrics from the drive's samples — real IMU (lon/lat
+  // accel) when the telemetry stream provided it, else the Δv/Δt proxy.
   const samplesRs = await env.DB.prepare(
-    `SELECT ts, speed, heading FROM positions WHERE drive_id = ?1 ORDER BY ts ASC`,
+    `SELECT ts, speed, heading, lat, lon, lon_accel, lat_accel
+     FROM positions WHERE drive_id = ?1 ORDER BY ts ASC`,
   )
     .bind(drive.id)
-    .all<{ ts: number; speed: number | null; heading: number | null }>();
+    .all<{ ts: number; speed: number | null; heading: number | null; lat: number | null; lon: number | null; lon_accel: number | null; lat_accel: number | null }>();
+  const behaviorSamples = samplesRs.results ?? [];
   const tzOffsetMin = (await getVehicleTz(env, drive.vin)) ?? 0;
-  const behavior = scoreDrive(samplesRs.results ?? [], { distanceKm, tzOffsetMin });
+  // Posted speed limits per sample (OSM maxspeed, cached) — best-effort.
+  const posted = await postedLimitsForSamples(env, behaviorSamples).catch(() => ({ limits: [], source: "none" as const }));
+  const behavior = scoreDrive(behaviorSamples, {
+    distanceKm, tzOffsetMin,
+    postedLimits: posted.limits, speedLimitSource: posted.source,
+  });
 
   // Place names for the endpoints (best-effort; a named geofence wins in the UI).
   const startPoint = await env.DB.prepare(
@@ -253,7 +270,9 @@ async function closeDrive(env: Env, drive: DriveRow, s: LatestState, ts: number)
        outside_temp_avg = ?18, sample_count = ?19,
        max_accel_ms2 = ?20, max_decel_ms2 = ?21, harsh_accel_count = ?22, harsh_brake_count = ?23,
        harsh_turn_count = ?24, over_limit_frac = ?25, night_frac = ?26, behavior_score = ?27,
-       start_address = ?28, end_address = ?29, max_jerk_ms3 = ?30
+       start_address = ?28, end_address = ?29, max_jerk_ms3 = ?30,
+       over_limit_severity = ?31, speed_limit_source = ?32, score_low = ?33, score_high = ?34,
+       score_confidence = ?35, accel_source = ?36
      WHERE id = ?1`,
   )
     .bind(
@@ -263,6 +282,8 @@ async function closeDrive(env: Env, drive: DriveRow, s: LatestState, ts: number)
       behavior.max_accel_ms2, behavior.max_decel_ms2, behavior.harsh_accel_count, behavior.harsh_brake_count,
       behavior.harsh_turn_count, behavior.over_limit_frac, behavior.night_frac, behavior.behavior_score,
       startAddr, endAddr, behavior.max_jerk_ms3,
+      behavior.over_limit_severity, behavior.speed_limit_source, behavior.score_low, behavior.score_high,
+      behavior.score_confidence, behavior.accel_source,
     )
     .run();
 
@@ -678,6 +699,10 @@ export async function getDriverScores(env: Env, vin: string): Promise<unknown> {
             AVG(night_frac) AS night_frac,
             SUM(behavior_score * COALESCE(distance_km, 0)) AS score_wsum,
             SUM(CASE WHEN behavior_score IS NOT NULL THEN COALESCE(distance_km, 0) ELSE 0 END) AS score_wden,
+            SUM(score_low * COALESCE(distance_km, 0)) AS low_wsum,
+            SUM(score_high * COALESCE(distance_km, 0)) AS high_wsum,
+            AVG(over_limit_severity) AS over_limit_severity,
+            SUM(CASE WHEN accel_source = 'imu' THEN 1 ELSE 0 END) AS imu_drives,
             SUM(sample_count) AS samples
      FROM drives WHERE vin = ?1 AND status = 'complete'
      GROUP BY COALESCE(driver, 'Unassigned')
@@ -690,6 +715,10 @@ export async function getDriverScores(env: Env, vin: string): Promise<unknown> {
     const km = r.km || 0;
     const per100 = (n: number) => (km > 0 ? round((n / km) * 100, 2) : null);
     const samplesPerKm = km > 0 ? (r.samples || 0) / km : 0;
+    const score = r.score_wden > 0 ? Math.round(r.score_wsum / r.score_wden) : null;
+    const imu = (r.imu_drives || 0) > 0;
+    // Confidence: real IMU ⇒ high; else from sampling density.
+    const confidence = imu || samplesPerKm >= 6 ? "high" : samplesPerKm >= 2 ? "medium" : "low";
     return {
       driver: r.driver,
       drives: r.drives,
@@ -703,9 +732,14 @@ export async function getDriverScores(env: Env, vin: string): Promise<unknown> {
       harsh_accels_per_100km: per100(r.harsh_accels || 0),
       harsh_turns_per_100km: per100(r.harsh_turns || 0),
       over_limit_pct: r.over_limit_frac != null ? round(r.over_limit_frac * 100, 1) : null,
+      over_limit_severity_kmh: r.over_limit_severity != null ? round(r.over_limit_severity, 1) : null,
       night_pct: r.night_frac != null ? round(r.night_frac * 100, 1) : null,
-      behavior_score: r.score_wden > 0 ? round(r.score_wsum / r.score_wden, 0) : null,
-      // Harsh-event metrics need dense sampling to be reliable.
+      behavior_score: score,
+      score_low: r.score_wden > 0 && r.low_wsum != null ? Math.round(r.low_wsum / r.score_wden) : score,
+      score_high: r.score_wden > 0 && r.high_wsum != null ? Math.round(r.high_wsum / r.score_wden) : score,
+      score_confidence: confidence,
+      percentile: score != null ? scoreToPercentile(score) : null,
+      accel_source: imu ? "imu" : "derived",
       fidelity: samplesPerKm >= 3 ? "good" : samplesPerKm >= 1 ? "coarse" : "sparse",
     };
   });
@@ -713,8 +747,29 @@ export async function getDriverScores(env: Env, vin: string): Promise<unknown> {
   return {
     vin,
     drivers,
-    note: "Harsh braking/acceleration/cornering are DERIVED from speed samples; they need ~10s (or faster) sampling to be reliable. At the current logging cadence, 'sparse'/'coarse' fidelity means harsh-event counts under-report — avg/max speed, night %, and mileage are always reliable.",
+    baseline: "Percentile is vs a reference safe-driving distribution (higher = safer than that % of drivers).",
+    note: "Harsh events use REAL accelerometer data when Fleet Telemetry streaming is on (accel_source='imu', high confidence); otherwise they're derived from speed samples and under-report at coarse cadence (score_low shows the cadence-corrected worst case). Speed is scored against posted limits when available. Avg/max speed, night %, and mileage are reliable at any cadence.",
   };
+}
+
+/**
+ * Maps a 0–100 behaviour score to a population percentile against a reference
+ * safe-driving distribution (piecewise; a bare 82 becomes "76th percentile").
+ * Values are a defensible stand-in until a real UBI reference set is licensed.
+ */
+export function scoreToPercentile(score: number): number {
+  const table: Array<[number, number]> = [
+    [100, 99], [95, 94], [90, 86], [85, 76], [80, 64], [75, 52], [70, 40], [65, 30], [60, 21], [50, 10], [40, 4], [0, 1],
+  ];
+  for (let i = 0; i < table.length - 1; i++) {
+    const [s1, p1] = table[i]!;
+    const [s2, p2] = table[i + 1]!;
+    if (score >= s2) {
+      const t = s1 === s2 ? 0 : (score - s2) / (s1 - s2);
+      return Math.round(p2 + t * (p1 - p2));
+    }
+  }
+  return 1;
 }
 
 export async function getDrive(env: Env, id: number): Promise<unknown> {
@@ -728,6 +783,61 @@ export async function getDrive(env: Env, id: number): Promise<unknown> {
     .bind(id)
     .all();
   return { drive, path: path.results ?? [] };
+}
+
+/**
+ * Household driver roster: the people the car is SHARED with (from Tesla's
+ * drivers endpoint, by name + key-hash count) merged with anyone already
+ * tagged on drives. Tesla exposes no active-driver-per-trip field, so this
+ * seeds the manual/assisted tagging picker — it does not auto-attribute.
+ */
+export async function getDrivers(env: Env, vin: string): Promise<unknown> {
+  await ensureSchema(env);
+  const roster = await getVehicleDrivers(env, vin);
+  const taggedRs = await env.DB.prepare(
+    `SELECT driver, COUNT(*) AS n FROM drives WHERE vin = ?1 AND driver IS NOT NULL AND status = 'complete' GROUP BY driver`,
+  ).bind(vin).all<{ driver: string; n: number }>();
+  const taggedCounts = new Map((taggedRs.results ?? []).map((r) => [r.driver.toLowerCase(), r.n]));
+
+  const out: Array<Record<string, unknown>> = [];
+  const seen = new Set<string>();
+  for (const d of roster) {
+    const name = [d.driver_first_name, d.driver_last_name].filter(Boolean).join(" ").trim() || `Driver ${d.user_id ?? ""}`.trim();
+    const key = name.toLowerCase();
+    seen.add(key);
+    out.push({
+      name,
+      first_name: d.driver_first_name ?? null,
+      last_name: d.driver_last_name ?? null,
+      user_id: d.user_id ?? null,
+      granular_access: d.granular_access ?? null,
+      pubkey_count: Array.isArray(d.active_pubkeys) ? d.active_pubkeys.length : 0,
+      source: "tesla",
+      drives_tagged: taggedCounts.get(key) ?? 0,
+    });
+  }
+  // Tagged drivers not present in the Tesla roster (free-text names).
+  for (const [key, n] of taggedCounts) {
+    if (seen.has(key)) continue;
+    const original = (taggedRs.results ?? []).find((r) => r.driver.toLowerCase() === key)?.driver ?? key;
+    out.push({ name: original, source: "tagged", drives_tagged: n, pubkey_count: 0 });
+  }
+  return {
+    vin,
+    drivers: out,
+    note: "Roster from Tesla's shared-driver list plus tagged names. Tesla can't report who drove a given trip, so drives are tagged manually/assisted.",
+  };
+}
+
+/** Signs a tamper-evident risk certificate for one drive. */
+export async function getDriveCertificate(env: Env, id: number, issuedTs: number): Promise<unknown> {
+  await ensureSchema(env);
+  const drive = await env.DB.prepare(`SELECT * FROM drives WHERE id = ?1`).bind(id).first<Record<string, unknown>>();
+  if (!drive) return { error: "drive not found" };
+  const path = await env.DB.prepare(
+    `SELECT ts, lat, lon, speed FROM positions WHERE drive_id = ?1 ORDER BY ts ASC`,
+  ).bind(id).all<Record<string, unknown>>();
+  return signDriveCertificate(env, drive, path.results ?? [], issuedTs);
 }
 
 export async function getChargeSessions(env: Env, vin: string, limit = 50): Promise<unknown[]> {
@@ -1237,10 +1347,11 @@ export async function getSuggestedLocations(env: Env, vin: string): Promise<unkn
  */
 export async function suggestDriverForDrive(env: Env, driveId: number, vin: string): Promise<void> {
   const d = await env.DB.prepare(
-    `SELECT start_ts, start_lat, start_lon, start_location_id, driver FROM drives WHERE id = ?1`,
+    `SELECT start_ts, start_lat, start_lon, start_location_id, driver, fp_temp_set, fp_seat_heater
+     FROM drives WHERE id = ?1`,
   )
     .bind(driveId)
-    .first<{ start_ts: number; start_lat: number | null; start_lon: number | null; start_location_id: number | null; driver: string | null }>();
+    .first<{ start_ts: number; start_lat: number | null; start_lon: number | null; start_location_id: number | null; driver: string | null; fp_temp_set: number | null; fp_seat_heater: number | null }>();
   if (!d || d.driver) return; // already tagged — nothing to suggest
 
   const tzMin = (await getVehicleTz(env, vin)) ?? 0;
@@ -1253,26 +1364,38 @@ export async function suggestDriverForDrive(env: Env, driveId: number, vin: stri
   const targetBucket = bucketOf(d.start_ts);
 
   const candidates = await env.DB.prepare(
-    `SELECT driver, start_ts, start_lat, start_lon, start_location_id FROM drives
+    `SELECT driver, start_ts, start_lat, start_lon, start_location_id, fp_temp_set, fp_seat_heater FROM drives
      WHERE vin = ?1 AND status = 'complete' AND driver IS NOT NULL AND id != ?2
      ORDER BY start_ts DESC LIMIT 500`,
   )
     .bind(vin, driveId)
-    .all<{ driver: string; start_ts: number; start_lat: number | null; start_lon: number | null; start_location_id: number | null }>();
+    .all<{ driver: string; start_ts: number; start_lat: number | null; start_lon: number | null; start_location_id: number | null; fp_temp_set: number | null; fp_seat_heater: number | null }>();
 
+  // Weighted voting: same place + same day/hour bucket is the strong signal;
+  // a matching active-driver-profile fingerprint (climate setpoint + seat-heater
+  // habit) adds a corroborating vote — the exposed stand-in for a seat-position
+  // memory, since these fields track with the active driver.
   const votes = new Map<string, number>();
+  const add = (driver: string, w: number) => votes.set(driver, (votes.get(driver) ?? 0) + w);
+  const fpMatch = (a: number | null, b: number | null, tol: number): boolean =>
+    a != null && b != null && Math.abs(a - b) <= tol;
+
   for (const c of candidates.results ?? []) {
     const samePlace =
       (d.start_location_id != null && c.start_location_id === d.start_location_id) ||
       (d.start_lat != null && d.start_lon != null && c.start_lat != null && c.start_lon != null &&
         haversineMeters(d.start_lat, d.start_lon, c.start_lat, c.start_lon) <= 1000);
-    if (!samePlace) continue;
-    if (bucketOf(c.start_ts) !== targetBucket) continue;
-    votes.set(c.driver, (votes.get(c.driver) ?? 0) + 1);
+    let w = 0;
+    if (samePlace && bucketOf(c.start_ts) === targetBucket) w += 1; // place + time
+    // Fingerprint corroboration: driver climate setpoint (±0.5°C) + seat heater.
+    if (fpMatch(d.fp_temp_set, c.fp_temp_set, 0.5)) w += 0.5;
+    if (fpMatch(d.fp_seat_heater, c.fp_seat_heater, 0)) w += 0.3;
+    if (w > 0) add(c.driver, w);
   }
   let best: { driver: string; n: number } | null = null;
   for (const [driver, n] of votes) if (!best || n > best.n) best = { driver, n };
-  if (best && best.n >= 2) {
+  // Require a place+time match's worth of confidence (≥1.5 combined weight).
+  if (best && best.n >= 1.5) {
     await env.DB.prepare(`UPDATE drives SET suggested_driver = ?2 WHERE id = ?1`).bind(driveId, best.driver).run();
   }
 }

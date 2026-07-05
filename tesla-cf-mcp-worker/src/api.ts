@@ -133,6 +133,32 @@ export async function getChargingHistory(env: Env, vin: string): Promise<Chargin
 export const getVehicle = (env: Env, vin: string): Promise<VehicleSummary> =>
   fleetGet<VehicleSummary>(env, `/api/1/vehicles/${vin}`);
 
+/** A driver granted access to the vehicle (Tesla account sharing / added drivers). */
+export interface VehicleDriver {
+  user_id?: number;
+  driver_first_name?: string;
+  driver_last_name?: string;
+  granular_access?: { hide_private?: boolean };
+  active_pubkeys?: string[];
+}
+
+/**
+ * The vehicle's driver roster (GET /api/1/vehicles/{id}/drivers) — the people
+ * with whom the car is shared, by name, plus each driver's active phone/key
+ * public-key hashes. NOTE: this lists who CAN access the car, not who is
+ * currently driving (Tesla exposes no active-driver field), so it seeds the
+ * manual/assisted driver-tagging roster, it doesn't auto-attribute trips. Not
+ * a billed vehicle_data read. Returns [] if unentitled/empty.
+ */
+export async function getVehicleDrivers(env: Env, vin: string): Promise<VehicleDriver[]> {
+  try {
+    const list = await fleetGet<VehicleDriver[]>(env, `/api/1/vehicles/${vin}/drivers`);
+    return Array.isArray(list) ? list : [];
+  } catch {
+    return [];
+  }
+}
+
 /**
  * Billed vehicle_data snapshot. `endpoints` limits the payload (and keeps
  * responses small); location_data must be requested explicitly.

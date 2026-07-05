@@ -305,17 +305,29 @@ you ever want dead-banding. [UNVERIFIED: exact semantics; not needed here.])
 
 | field | interval_seconds | why | worst-case rate |
 |---|---|---|---|
-| `VehicleSpeed` | **1** | harsh-braking Δv/Δt (1 Hz ⇒ braking g = Δkm/h ÷ 3.6 ÷ 9.81 per s) | 3600/driving-hr |
-| `Location` | 5 | drive traces | 720/driving-hr |
+| `LongitudinalAcceleration` | **1** | **REAL braking/accel g-force** — the insurance-grade signal. scoring.ts prefers this over the Δv/Δt proxy (accel_source='imu', high confidence) | 3600/driving-hr |
+| `LateralAcceleration` | **1** | **REAL cornering g** (replaces the heading-rate proxy) | 3600/driving-hr |
+| `VehicleSpeed` | **1** | speed trace + speeding-vs-limit; g-force fallback if IMU absent | 3600/driving-hr |
+| `Location` | 5 | drive traces + posted-limit lookup | 720/driving-hr |
+| `BrakePedalPos` | 2 | braking effort (master-cylinder pressure) | 1800/driving-hr |
+| `DriverSeatBelt` | on-change | seatbelt-unbuckled — a real UBI risk factor | ~few/drive |
+| `Gear` | on-change | drive boundary | ~few/drive |
 | `Soc` | 60 | battery/charge tracking | 60/active-hr |
 | `ACChargingPower` | 30 | AC charge curves | 120/charging-hr |
 | `DetailedChargeState` | 60 | charge session boundaries (on-change) | ~few/session |
-| `InsideTemp` | 300 | climate history | 12/active-hr |
-| `OutsideTemp` | 300 | climate history | 12/active-hr |
-| `TpmsPressureFl/Fr/Rl/Rr` | 300 | tire alerts | ≤12/driving-hr each |
+| `HvacLeftTemperatureRequest` | on-change | driver-profile fingerprint (auto-suggest) | ~few/drive |
+| `SeatHeaterLeft` | on-change | driver-profile fingerprint | ~few/drive |
+| `InsideTemp` / `OutsideTemp` | 300 | climate/efficiency history | 12/active-hr |
+| `TpmsPressureFl/Fr/Rl/Rr` | 300 | tire-leak sentinel | ≤12/driving-hr each |
 
-All names verified against the Worker's `FIELD_MAP` (src/ingest.ts) — every
-one lands in a canonical column.
+All names verified against the official Fleet Telemetry "Available Data" field
+list AND the Worker's `FIELD_MAP` (src/ingest.ts) — every one lands in a
+canonical column. **The two `*Acceleration` fields are what make harsh-event
+scoring insurance-grade** (real IMU g-force instead of derived); at 1 Hz each
+adds ~3,600 signals/driving-hour, so recompute the cost table if you enable
+them (still ≈$1–3/month, well inside the credit — lower `BUDGET_POLL_USD`
+first per §7). Cost note: 4 fields at 1 Hz ≈ 14,400 signals/driving-hour ≈
+$0.096/hr of driving.
 
 ### 5c. Configure via the existing MCP tool (preferred)
 
@@ -328,11 +340,18 @@ Call the Worker's `configure_telemetry` tool with:
   "port": 443,
   "ca": "-----BEGIN CERTIFICATE-----\n<intermediate>\n-----END CERTIFICATE-----\n-----BEGIN CERTIFICATE-----\n<ISRG Root X1>\n-----END CERTIFICATE-----\n",
   "fields": {
+    "LongitudinalAcceleration": { "interval_seconds": 1 },
+    "LateralAcceleration":      { "interval_seconds": 1 },
     "VehicleSpeed":        { "interval_seconds": 1 },
     "Location":            { "interval_seconds": 5 },
+    "BrakePedalPos":       { "interval_seconds": 2 },
+    "DriverSeatBelt":      { "interval_seconds": 60 },
+    "Gear":                { "interval_seconds": 60 },
     "Soc":                 { "interval_seconds": 60 },
     "ACChargingPower":     { "interval_seconds": 30 },
     "DetailedChargeState": { "interval_seconds": 60 },
+    "HvacLeftTemperatureRequest": { "interval_seconds": 120 },
+    "SeatHeaterLeft":      { "interval_seconds": 120 },
     "InsideTemp":          { "interval_seconds": 300 },
     "OutsideTemp":         { "interval_seconds": 300 },
     "TpmsPressureFl":      { "interval_seconds": 300 },

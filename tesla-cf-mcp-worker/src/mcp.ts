@@ -6,8 +6,10 @@
  * (via the OAuth shim in auth.ts).
  */
 
+import { askTessa } from "./ai";
 import * as api from "./api";
 import * as cmd from "./commands";
+import * as forecast from "./forecast";
 import * as rules from "./rules";
 import * as store from "./store";
 import * as telemetry from "./telemetry";
@@ -606,6 +608,70 @@ const TOOLS: Tool[] = [
     handler: (env, a) => tracking.getSuggestedLocations(env, a.vin),
   },
   {
+    name: "list_drivers",
+    description:
+      "Household driver roster: the people the car is SHARED with (from Tesla's drivers endpoint, by name + " +
+      "paired-key count) merged with anyone already tagged on drives. NOTE: Tesla exposes no active-driver-per-trip " +
+      "field, so this seeds manual/assisted tagging — it does not auto-attribute trips. Free.",
+    inputSchema: vinSchema,
+    handler: (env, a) => tracking.getDrivers(env, a.vin),
+  },
+  {
+    name: "get_battery_forecast",
+    description:
+      "Forward projection of battery degradation + mileage against the 8-year / distance / 70%-retention warranty: " +
+      "current health %, %/year slope with r², km/year, and which warranty cap binds first and when. Free — reads logged data.",
+    inputSchema: vinSchema,
+    handler: (env, a) => forecast.getBatteryForecast(env, a.vin),
+  },
+  {
+    name: "get_predicted_range",
+    description:
+      "Predicts a trip's efficiency (Wh/km), energy (kWh) and SoC used from a model fitted on the car's own logged " +
+      "drives (efficiency vs ambient temp, speed, driver). Pass distance_km, temp_c, optional driver + elevation_gain_m. " +
+      "Free — reads logged data.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        ...vinProp,
+        distance_km: { type: "number" },
+        temp_c: { type: "number" },
+        driver: { type: "string" },
+        elevation_gain_m: { type: "number" },
+      },
+      required: ["vin"],
+    },
+    handler: (env, a) =>
+      forecast.predictRange(env, a.vin, {
+        distance_km: a.distance_km, temp_c: a.temp_c, driver: a.driver, elevation_gain_m: a.elevation_gain_m,
+      }),
+  },
+  {
+    name: "get_drive_certificate",
+    description:
+      "Tamper-evident HMAC-SHA256 risk certificate for one drive: the canonical metrics + a hash of the GPS path, " +
+      "signed with a server secret so the data can't be altered after the fact without breaking the signature. " +
+      "Pass the drive id. Free.",
+    inputSchema: {
+      type: "object",
+      properties: { id: { type: "number", description: "Drive id" } },
+      required: ["id"],
+    },
+    handler: (env, a) => tracking.getDriveCertificate(env, a.id, Math.floor(Date.now() / 1000)),
+  },
+  {
+    name: "ask_tessa",
+    description:
+      "Ask a natural-language question about THIS car's data ('how efficient was I this month?', 'is my battery " +
+      "healthy?', 'who drives most safely?'). Answers are grounded in the logged data via Cloudflare Workers AI. Free.",
+    inputSchema: {
+      type: "object",
+      properties: { ...vinProp, question: { type: "string" } },
+      required: ["vin", "question"],
+    },
+    handler: (env, a) => askTessa(env, a.question, a.vin),
+  },
+  {
     name: "get_state_timeline",
     description:
       "Continuous state timeline (driving | charging | online | asleep | offline | updating) with durations. " +
@@ -754,6 +820,11 @@ const READ_TOOLS = new Set([
   "get_efficiency_by_temp",
   "get_tire_pressures",
   "get_suggested_locations",
+  "list_drivers",
+  "get_battery_forecast",
+  "get_predicted_range",
+  "get_drive_certificate",
+  "ask_tessa",
   "list_locations",
   "get_location_stats",
   "list_automations",

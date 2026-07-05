@@ -156,6 +156,33 @@ export const data = {
   tires: (vin, days) => getJson("/data/tires", { vin, days }),
   monthly: (vin, months) => getJson("/data/monthly", { vin, months }),
   suggestedLocations: (vin) => getJson("/data/suggested-locations", { vin }),
+  /** Household driver roster (Tesla-reported + already-tagged). New endpoint — may 404. */
+  drivers: (vin) => getJson("/data/drivers", { vin }),
+  /** Battery degradation forecast + warranty-cliff. New endpoint — may 404. */
+  batteryForecast: (vin) => getJson("/data/battery-forecast", { vin }),
+  /**
+   * Range prediction. With no distance_km, returns {model, ready} so the screen
+   * can show model quality + a form; with params, returns the prediction. New endpoint — may 404.
+   */
+  predictRange: ({ vin, distance_km, temp_c, driver, elevation_gain_m } = {}) =>
+    getJson("/data/predict-range", { vin, distance_km, temp_c, driver, elevation_gain_m }),
+  /** Tamper-evident signed risk certificate for a drive. New endpoint — may 404. */
+  driveCertificate: (id) => getJson("/data/drive-certificate", { id }),
+  /**
+   * Ask-Tessa: natural-language Q&A over the car's data. POSTs to /ai/ask with
+   * the token as a query param (matching the worker's documented query-param
+   * auth). New endpoint — may 404/500/timeout; callers must degrade gracefully.
+   */
+  ask: (question, vin) =>
+    fetch(workerOrigin() + "/ai/ask?" + new URLSearchParams({ token: auth.token }), {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${auth.token}` },
+      body: JSON.stringify({ question, vin }),
+    }).then((r) => {
+      if (r.status === 401) throw new ApiError("Unauthorized — check your access token", 401);
+      if (!r.ok) throw new ApiError(`AI request failed (${r.status})`, r.status);
+      return r.json();
+    }),
   /** Benign metadata write (token-gated POST) — assign/clear a drive's driver. */
   assignDriver: (id, driver) =>
     fetch(workerOrigin() + "/data/assign-driver?" + new URLSearchParams({ id, driver: driver || "", token: auth.token }), { method: "POST" })
