@@ -20,6 +20,16 @@ function money(amount, currency, decimals = 2) {
   const sym = CURRENCY_SYMBOL[currency] ?? (currency ? currency + " " : "€");
   return sym + (decimals === 0 ? fmt0(amount) : fmt2(amount));
 }
+/** Drive endpoint label: a named geofence if the point matched one, else the reverse-geocoded place, else Unknown. */
+function driveEndpoint(d, which, locations) {
+  const id = d[which + "_location_id"];
+  if (id != null) {
+    const l = locations.find((x) => x.id === id);
+    if (l) return l.name;
+  }
+  return d[which + "_address"] || "Unknown";
+}
+
 /** Charge-session location: a geofence name if matched, else the Supercharger site label. */
 function chargeLocName(c, locations) {
   if (c.location_id != null) {
@@ -656,7 +666,7 @@ async function buildEventFeed(locations, driveLimit = 200) {
     events.push({
       ts: d.start_ts,
       type: "drive",
-      title: `${locName(d.start_location_id) || "Unknown"} → ${locName(d.end_location_id) || "Unknown"}`,
+      title: `${driveEndpoint(d, "start", locations)} → ${driveEndpoint(d, "end", locations)}`,
       meta: `${d.distance_km != null ? fmt1(d.distance_km) + " km" : "—"} · ${fmtDurationMin(d.duration_min)}${d.efficiency_wh_km != null ? " · " + fmt0(d.efficiency_wh_km) + " Wh/km" : ""}`,
       raw: d,
     });
@@ -826,7 +836,7 @@ async function renderDrives() {
         ${filtered.map((d) => `
           <div class="tm-table-row" data-action="open-drive" data-id="${d.id}" style="grid-template-columns:150px 1fr 84px 84px 92px 108px 96px;">
             <div style="font-size:12.5px;color:var(--sub);">${fmtDateTime(d.start_ts)}</div>
-            <div class="tm-ellipsis" style="font-size:13.5px;font-weight:500;">${esc(locName(d.start_location_id))} <span style="color:var(--faint);">→</span> ${esc(locName(d.end_location_id))}</div>
+            <div class="tm-ellipsis" style="font-size:13.5px;font-weight:500;">${esc(driveEndpoint(d, "start", locations))} <span style="color:var(--faint);">→</span> ${esc(driveEndpoint(d, "end", locations))}</div>
             <div class="tm-right tm-mono">${d.distance_km != null ? fmt1(d.distance_km) : "—"} km</div>
             <div class="tm-right tm-mono" style="color:var(--sub);">${fmtDurationMin(d.duration_min)}</div>
             <div class="tm-right tm-mono" style="color:var(--sub);">${d.avg_speed != null ? fmt0(d.avg_speed) : "—"} km/h</div>
@@ -852,7 +862,7 @@ async function renderDriveDetail() {
   setContent(`
     <div class="tm-flex-row" style="gap:14px;flex-wrap:wrap;">
       <button class="tm-back-btn" data-action="back-drives">← Drives</button>
-      <div style="font-size:15px;font-weight:600;">${esc(locName(d.start_location_id))} <span style="color:var(--faint);">→</span> ${esc(locName(d.end_location_id))}</div>
+      <div style="font-size:15px;font-weight:600;">${esc(driveEndpoint(d, "start", locations))} <span style="color:var(--faint);">→</span> ${esc(driveEndpoint(d, "end", locations))}</div>
       <div style="font-size:12.5px;color:var(--faint);">${fmtDateTime(d.start_ts)}</div>
       <div class="tm-flex-row" style="margin-left:auto;gap:6px;">
         <span style="font-size:12px;color:var(--sub);">Driver:</span>

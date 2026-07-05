@@ -17,6 +17,7 @@
 
 import { getChargingHistory } from "./api";
 import { getBudgetStatus } from "./budget";
+import { reverseGeocode } from "./geocode";
 import { scoreDrive } from "./scoring";
 import {
   ensureSchema,
@@ -233,6 +234,15 @@ async function closeDrive(env: Env, drive: DriveRow, s: LatestState, ts: number)
   const tzOffsetMin = (await getVehicleTz(env, drive.vin)) ?? 0;
   const behavior = scoreDrive(samplesRs.results ?? [], { distanceKm, tzOffsetMin });
 
+  // Place names for the endpoints (best-effort; a named geofence wins in the UI).
+  const startPoint = await env.DB.prepare(
+    `SELECT start_lat, start_lon FROM drives WHERE id = ?1`,
+  ).bind(drive.id).first<{ start_lat: number | null; start_lon: number | null }>();
+  const startAddr = startPoint?.start_lat != null && startPoint?.start_lon != null
+    ? await reverseGeocode(env, startPoint.start_lat, startPoint.start_lon)
+    : null;
+  const endAddr = lat !== null && lon !== null ? await reverseGeocode(env, lat, lon) : null;
+
   await env.DB.prepare(
     `UPDATE drives SET
        end_ts = ?2, status = 'complete', end_lat = ?3, end_lon = ?4, end_location_id = ?5,
@@ -241,7 +251,8 @@ async function closeDrive(env: Env, drive: DriveRow, s: LatestState, ts: number)
        avg_speed = ?14, max_speed = ?15, avg_power = ?16, max_power = ?17,
        outside_temp_avg = ?18, sample_count = ?19,
        max_accel_ms2 = ?20, max_decel_ms2 = ?21, harsh_accel_count = ?22, harsh_brake_count = ?23,
-       harsh_turn_count = ?24, over_limit_frac = ?25, night_frac = ?26, behavior_score = ?27
+       harsh_turn_count = ?24, over_limit_frac = ?25, night_frac = ?26, behavior_score = ?27,
+       start_address = ?28, end_address = ?29
      WHERE id = ?1`,
   )
     .bind(
@@ -250,6 +261,7 @@ async function closeDrive(env: Env, drive: DriveRow, s: LatestState, ts: number)
       num(agg?.avg_power), num(agg?.max_power), num(agg?.outside_temp_avg), agg?.n ?? 0,
       behavior.max_accel_ms2, behavior.max_decel_ms2, behavior.harsh_accel_count, behavior.harsh_brake_count,
       behavior.harsh_turn_count, behavior.over_limit_frac, behavior.night_frac, behavior.behavior_score,
+      startAddr, endAddr,
     )
     .run();
 }
@@ -574,6 +586,34 @@ export async function getDrives(env: Env, vin: string, limit = 50): Promise<unkn
     .bind(vin, limit)
     .all();
   return rs.results ?? [];
+}
+
+/**
+ * Reverse-geocodes completed drives that don't yet have place names (older
+ * drives from before geocoding existed, or lookups that failed). Rate-limited
+ * to respect Nominatim; the geocode_cache means repeat locations are instant.
+ */
+export async function backfillDriveAddresses(env: Env, vin: string, limit = 40): Promise<Record<string, unknown>> {
+  await ensureSchema(env);
+  const rs = await env.DB.prepare(
+    `SELECT id, start_lat, start_lon, end_lat, end_lon FROM drives
+     WHERE vin = ?1 AND status = 'complete' AND (start_address IS NULL OR end_address IS NULL)
+     ORDER BY start_ts DESC LIMIT ?2`,
+  )
+    .bind(vin, limit)
+    .all<{ id: number; start_lat: number | null; start_lon: number | null; end_lat: number | null; end_lon: number | null }>();
+  let updated = 0;
+  for (const d of rs.results ?? []) {
+    const startAddr = d.start_lat != null && d.start_lon != null ? await reverseGeocode(env, d.start_lat, d.start_lon) : null;
+    const endAddr = d.end_lat != null && d.end_lon != null ? await reverseGeocode(env, d.end_lat, d.end_lon) : null;
+    if (startAddr || endAddr) {
+      await env.DB.prepare(`UPDATE drives SET start_address = COALESCE(?2, start_address), end_address = COALESCE(?3, end_address) WHERE id = ?1`)
+        .bind(d.id, startAddr, endAddr)
+        .run();
+      updated++;
+    }
+  }
+  return { vin, examined: (rs.results ?? []).length, updated };
 }
 
 /** Assign (or clear, with driver=null) the driver of a drive. */

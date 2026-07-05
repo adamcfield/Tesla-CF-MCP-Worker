@@ -48,6 +48,7 @@ import { runCronTick } from "./rules";
 import { getLatest, querySeries } from "./store";
 import {
   backfillChargeHistory,
+  backfillDriveAddresses,
   getBatteryDegradation,
   getChargeCurve,
   getChargeSessions,
@@ -300,6 +301,11 @@ export default {
         const vin = url.searchParams.get("vin");
         if (!vin) return json({ error: "vin query param required" }, 400);
         return json(await backfillChargeHistory(env, vin));
+      }
+      if (path === "/setup/backfill-addresses" && request.method === "POST") {
+        const vin = url.searchParams.get("vin");
+        if (!vin) return json({ error: "vin query param required" }, 400);
+        return json(await backfillDriveAddresses(env, vin));
       }
 
       return new Response("Not found", { status: 404 });

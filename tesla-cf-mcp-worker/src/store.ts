@@ -166,10 +166,21 @@ export async function ensureSchema(env: Env): Promise<void> {
     `CREATE UNIQUE INDEX IF NOT EXISTS idx_charge_sessions_ext ON charge_sessions (external_id) WHERE external_id IS NOT NULL`,
   ).run();
 
+  // Reverse-geocode cache (~110 m grid) so drive endpoints get place names
+  // without re-querying Nominatim for repeat locations.
+  await env.DB.prepare(
+    `CREATE TABLE IF NOT EXISTS geocode_cache (
+       lat_r REAL NOT NULL, lon_r REAL NOT NULL, label TEXT NOT NULL,
+       created_ts INTEGER, PRIMARY KEY (lat_r, lon_r)
+     )`,
+  ).run();
+
   // Per-drive driver attribution + driving-behaviour metrics (insurance-style
   // scoring). Behaviour fields are derived from the drive's position samples
   // at close time; accuracy scales with polling cadence (see tracking.ts).
   await addMissingColumns(env, "drives", {
+    start_address: "TEXT", // reverse-geocoded place label (geofence name wins if matched)
+    end_address: "TEXT",
     driver: "TEXT", // assigned driver label (manual/assisted tagging)
     max_accel_ms2: "REAL", // peak longitudinal acceleration, m/s^2
     max_decel_ms2: "REAL", // peak deceleration (braking), m/s^2 (positive magnitude)
