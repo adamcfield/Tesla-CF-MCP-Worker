@@ -59,8 +59,6 @@ const FIELD_MAP: Record<string, string> = {
   DCChargingEnergyIn: "dc_charge_energy_added",
   ChargeEnergyAdded: "charge_energy_added",
   SoftwareUpdateInstallationPercentComplete: "software_update_pct",
-  SoftwareVersion: "software_version",
-  Version: "software_version",
   InsideTemp: "inside_temp",
   OutsideTemp: "outside_temp",
   TpmsPressureFl: "tpms_fl",
@@ -297,7 +295,6 @@ export async function applyVehicleData(
   put("VehicleSpeed", drive.speed);
   put("GpsHeading", drive.heading);
   put("power", drive.power); // kW; drive_state.power maps 1:1 to the canonical field
-  put("SoftwareVersion", vehicle.car_version); // e.g. "2026.20.3 abc123" — dashboard shows it
   if (typeof drive.latitude === "number" && typeof drive.longitude === "number") {
     fields.Location = { latitude: drive.latitude, longitude: drive.longitude };
   }
