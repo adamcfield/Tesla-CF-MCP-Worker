@@ -819,7 +819,9 @@ const TOOLS: Tool[] = [
     name: "set_location",
     description:
       "Create or update a named location (omit id to create). radius_m defaults to 150; cost_per_kwh (optional) " +
-      "prices charge sessions that start inside it. Drives and charges are tagged with the nearest containing location.",
+      "prices charge sessions that start inside it. Drives and charges are tagged with the nearest containing location. " +
+      "drivers (optional) tags which household driver(s) this place belongs to (e.g. \"Home\" tagged to everyone, " +
+      "\"Work\" tagged to just one) — omit on an update to leave existing tags untouched, pass [] to clear them.",
     inputSchema: {
       type: "object",
       properties: {
@@ -829,6 +831,7 @@ const TOOLS: Tool[] = [
         longitude: { type: "number" },
         radius_m: { type: "number", default: 150 },
         cost_per_kwh: { type: "number", description: "Price per kWh at this location (same currency as reports)" },
+        drivers: { type: "array", items: { type: "string" }, description: "Driver name(s) this location applies to; omit to leave as-is on update" },
       },
       required: ["name", "latitude", "longitude"],
     },
@@ -840,6 +843,7 @@ const TOOLS: Tool[] = [
         lon: a.longitude,
         radius_m: a.radius_m,
         cost_per_kwh: a.cost_per_kwh,
+        drivers: a.drivers,
       }),
   },
   {

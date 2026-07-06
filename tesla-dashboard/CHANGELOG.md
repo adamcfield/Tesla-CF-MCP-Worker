@@ -9,6 +9,30 @@ feature or screen, the **patch** version for fixes/tweaks/copy changes, and the
 configured. See `CLAUDE.md` at the repo root for the policy on keeping this file
 and `APP_VERSION` (in `app.js`) in sync.
 
+## 1.6.0 — 2026-07-06
+
+Places: adding one is now a popup instead of always-on-page clutter, and a
+place can be tagged to whichever household driver(s) it belongs to.
+
+- "Add a place" (frequent stop or address search) is now a modal opened via
+  a small "+ Add a place" button, instead of two cards permanently taking up
+  space on the Places screen. Selecting a spot shows a map pin to confirm
+  the location before saving (previously just raw lat/lon numbers).
+- New: tag a place with which driver(s) it's for — e.g. "Home" tagged to
+  everyone in the household, "Work" tagged to just one — at save time, or
+  later via "edit tags" on the place-detail page. Untagged (the default,
+  and every location saved before this change) means shared/no restriction.
+  Tags show as small pills on the saved-places list and detail page.
+  Backend: new `locations.drivers` column (JSON array, nullable — omitted
+  on an edit leaves existing tags untouched, an explicit empty array clears
+  them); `set_location` MCP tool and `/data/save-location` gain a `drivers`
+  param; `/data/save-location` also now accepts `id` so it doubles as the
+  edit route.
+- Confirmed reverse-geocoding already uses Nominatim, not GovMap — GovMap's
+  reverse endpoint only returns cadastral parcels, not human addresses, so
+  Nominatim was already the right choice for that direction (forward
+  geocoding, used by the address search above, is the one GovMap is good at).
+
 ## 1.5.1 — 2026-07-06
 
 Make the save-location failure reason actually visible, and clarify what
