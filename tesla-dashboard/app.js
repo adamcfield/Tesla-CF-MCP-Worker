@@ -2,6 +2,11 @@ import { auth, data, mcp, verifyToken, exportUrl, ApiError } from "./api.js";
 import { svgLineChart, svgBarChart, svgDonut, svgSplitBar, svgDriveChart } from "./charts.js";
 import { destroyMaps, renderPointMap, renderRouteMap, renderLifetimeMap, createReplayMarker, invalidateMaps } from "./map.js";
 
+// Bump on every change to this dashboard (UI, features, or the /data/*
+// endpoints it depends on) and add a matching entry to CHANGELOG.md — see
+// the versioning policy in the repo's CLAUDE.md. Shown in the sidebar footer.
+const APP_VERSION = "1.1.0";
+
 const root = document.getElementById("app");
 let shellBound = false; // guards one-time attach of the root click handler + sync timer
 
@@ -187,6 +192,7 @@ const state = {
   vehicleData: null, // last on-demand get_vehicle_data snapshot
   driveFilter: 1, // 0=7d, 1=30d, 2=all
   driverFilter: "__all", // "__all" | "__none" (unassigned) | driver name
+  mediaDriverFilter: null, // selected driver chip on the Media screen's per-driver breakdown
   openDriveId: null,
   openChargeId: null,
   openPlaceId: null,
@@ -202,6 +208,7 @@ const state = {
 const NAV = [
   { label: "", items: [["ask", "✦ Ask Tessa"], ["ov", "Overview"], ["tl", "Timeline"], ["st", "Statistics"]] },
   { label: "Driving", items: [["dr", "Drives"], ["dv", "Drivers"], ["pl", "Places"], ["map", "Lifetime map"]] },
+  { label: "Media", items: [["md", "♪ Media"]] },
   { label: "Charging", items: [["ch", "Charges"], ["cs", "Charging stats"]] },
   { label: "Battery", items: [["bh", "Battery health"], ["pr", "Predictions"], ["vd", "Vampire drain"]] },
 ];
@@ -215,6 +222,7 @@ const TITLES = {
   dv: ["Drivers", "behaviour & risk scoring"],
   pl: ["Places", "saved locations & suggestions"],
   map: ["Lifetime map", ""],
+  md: ["Media", "most played, from the car's infotainment system"],
   ch: ["Charges", ""],
   cs: ["Charging stats", "lifetime"],
   bh: ["Battery health", ""],
@@ -419,6 +427,7 @@ function renderShell() {
             VIN ${esc(auth.vin.slice(-6))}
             &nbsp;·&nbsp;<button data-action="logout" class="tm-link-btn">disconnect</button>
           </div>
+          <div class="tm-sidemeta" style="padding-top:0;" title="See CHANGELOG.md">v${esc(APP_VERSION)}</div>
         </div>
       </aside>
       <div class="tm-nav-backdrop" data-action="nav-close"></div>
@@ -519,6 +528,11 @@ function onRootClick(e) {
   } else if (action === "driver-filter") {
     state.driverFilter = t.dataset.driver;
     renderDrives();
+  } else if (action === "media-driver-filter") {
+    state.mediaDriverFilter = t.dataset.driver;
+    const byDriver = state.cache.media_by_driver;
+    const target = document.getElementById("tm-media-by-driver");
+    if (byDriver?.drivers && target) target.innerHTML = mediaByDriverHtml(byDriver.drivers);
   } else if (action === "edit-driver") {
     if (!t.querySelector(".tm-driver-edit")) beginDriverEdit(t, Number(t.dataset.id));
   } else if (action === "open-place") {
@@ -691,6 +705,8 @@ function skeletonHtml(screen) {
       return cards3;
     case "map":
       return `<div class="tm-flex-row" style="gap:8px;">${skel("height:24px;width:120px;border-radius:999px;").repeat(3)}</div>${mapCard(560)}`;
+    case "md":
+      return `<div class="tm-card tm-card-pad-lg tm-flex-row" style="gap:16px;">${skel("height:56px;width:56px;border-radius:10px;")}${skel("height:16px;width:40%;")}</div>${metrics}${table(8)}`;
     case "bh":
       return `<div class="tm-grid-3col"><div class="tm-card tm-card-pad-lg" style="display:flex;align-items:center;justify-content:center;">${skel("height:132px;width:132px;border-radius:50%;")}</div>${metric.repeat(2)}</div>${chart}`;
     case "cs":
@@ -721,6 +737,7 @@ async function showScreen() {
       case "dv": await renderDrivers(); break;
       case "pl": await renderPlaces(); break;
       case "map": await renderLifetimeMapScreen(); break;
+      case "md": await renderMedia(); break;
       case "ch": await renderCharges(); break;
       case "cs": await renderChargingStats(); break;
       case "bh": await renderBatteryHealth(); break;
@@ -1496,7 +1513,7 @@ async function renderDrives() {
 async function renderDriveDetail() {
   const detail = await data.drive(state.openDriveId);
   if (detail.error) return setContent(errorHtml(detail.error));
-  const { drive: d, path } = detail;
+  const { drive: d, path, media = [] } = detail;
   const locations = await safe(cached("locations", () => data.locations()), []);
   const roster = await loadDriverRoster();
   const locName = (id) => (id == null ? "Unknown" : locations.find((l) => l.id === id)?.name || "Unknown");
@@ -1555,8 +1572,9 @@ async function renderDriveDetail() {
   const totalSec = Math.max(1, lastTs - t0);
   const totalMin = totalSec / 60;
   const avgPower = powSeries.length ? powSeries.reduce((s, p) => s + p[1], 0) / powSeries.length : null;
+  const trackMarkers = media.map((m) => ({ t: (m.ts - t0) / 60, title: m.title, artist: m.artist }));
   const chart = speedPts.length > 1
-    ? svgDriveChart({ speedPts, elevPts, events, durationMin: totalMin })
+    ? svgDriveChart({ speedPts, elevPts, events, tracks: trackMarkers, durationMin: totalMin })
     : { html: "", plot: null };
 
   const routePlaceholder = `
@@ -1621,6 +1639,7 @@ async function renderDriveDetail() {
           <span><i style="background:var(--bad);"></i>hard brake</span>
           <span><i style="background:var(--warn);"></i>hard accel</span>
           <span><i class="tm-dash"></i>elevation</span>
+          ${trackMarkers.length ? `<span><i style="background:#8A63D2;"></i>♪ track change</span>` : ""}
         </div>
         <div style="margin-left:auto;font-size:11.5px;color:var(--faint);">${d.outside_temp_avg != null ? `outside ${fmt1(d.outside_temp_avg)} °C` : "Speed km/h · tap chart to scrub"}</div>
       </div>
@@ -1975,6 +1994,161 @@ async function renderLifetimeMapScreen() {
     }));
     requestAnimationFrame(() => renderLifetimeMap(document.getElementById("tm-lifetime-map"), paths.filter((p) => p.length > 1)));
   }
+}
+
+// ---------------------------------------------------------------------------
+// Media — "most played" from Fleet Telemetry's MediaNowPlaying* fields
+// ---------------------------------------------------------------------------
+
+// Tesla exposes no cover art at all — this looks it up from Apple's free,
+// unauthenticated iTunes Search API using the track/artist TEXT the car does
+// report, purely for visual polish. Never persisted (in-memory only, one
+// lookup per distinct title+artist per session); silently absent if the
+// lookup fails or the environment blocks the request — same "enhance, don't
+// depend on" posture as the rest of the app's optional network calls.
+const COVER_ART_CACHE = new Map();
+function fetchCoverArt(title, artist) {
+  const key = `${title}|||${artist || ""}`;
+  if (COVER_ART_CACHE.has(key)) return COVER_ART_CACHE.get(key);
+  const p = (async () => {
+    try {
+      const term = encodeURIComponent([title, artist].filter(Boolean).join(" "));
+      const res = await fetch(`https://itunes.apple.com/search?term=${term}&media=music&limit=1`);
+      if (!res.ok) return null;
+      const j = await res.json();
+      return j?.results?.[0]?.artworkUrl100 || null;
+    } catch { return null; }
+  })();
+  COVER_ART_CACHE.set(key, p);
+  return p;
+}
+/** Fills a `.tm-media-cover` placeholder once the (async, non-blocking) art lookup resolves. */
+function loadCoverInto(elId, title, artist) {
+  if (!title) return;
+  fetchCoverArt(title, artist).then((url) => {
+    if (!url) return;
+    const el = document.getElementById(elId);
+    if (el) el.innerHTML = `<img src="${esc(url)}" alt="" loading="lazy">`;
+  });
+}
+
+function nowPlayingCard(latest) {
+  const title = latest?.media_title, artist = latest?.media_artist, album = latest?.media_album;
+  const station = latest?.media_station, source = latest?.media_source, status = latest?.media_status;
+  const volume = latest?.media_volume;
+  if (!title && !station) {
+    return `<div class="tm-card tm-card-pad-lg"><div class="tm-empty" style="padding:10px 0;">
+      <div class="tm-empty-icon">♪</div>
+      <div class="tm-empty-title">Nothing playing right now</div>
+      <div>Shows up here the moment the car streams a Media* field and something's on.</div>
+    </div></div>`;
+  }
+  const playing = typeof status === "string" && /playing/i.test(status);
+  return `
+    <div class="tm-card tm-card-pad-lg tm-flex-row" style="gap:16px;align-items:center;">
+      <div class="tm-media-cover tm-media-cover-lg" id="tm-np-cover">♪</div>
+      <div style="min-width:0;flex:1;">
+        <div class="tm-flex-row" style="gap:8px;">
+          <span class="tm-pill ${playing ? "tm-pill-good" : "tm-pill-chip"}">${playing ? "▶ Playing" : esc(status || "Now playing")}</span>
+          ${source ? `<span class="tm-pill tm-pill-chip">${esc(source)}</span>` : ""}
+        </div>
+        <div class="tm-ellipsis" style="font-size:17px;font-weight:600;margin-top:8px;">${esc(title || station || "—")}</div>
+        <div class="tm-ellipsis" style="font-size:13px;color:var(--sub);margin-top:2px;">${esc([artist, album].filter(Boolean).join(" · ") || (station ? "Radio" : ""))}</div>
+      </div>
+      ${volume != null ? `<div style="text-align:right;flex:none;"><div class="tm-readout-label">Volume</div><div class="tm-readout-value">${fmt0(volume)}</div></div>` : ""}
+    </div>`;
+}
+
+/** Ranked list row for a leaderboard (tracks get cover art; artists/sources/stations don't). */
+function mediaListHtml(rows, key, opts = {}) {
+  if (!rows || !rows.length) return miniEmptyHtml("Nothing yet");
+  return `<div class="tm-flex-col" style="gap:0;">${rows.map((r, i) => {
+    const coverId = opts.cover ? `tm-cover-${key}-${i}` : null;
+    return `
+    <div class="tm-media-row">
+      <span class="tm-media-rank">${i + 1}</span>
+      ${coverId ? `<div class="tm-media-cover" id="${coverId}">♪</div>` : ""}
+      <div class="tm-ellipsis" style="flex:1;min-width:0;font-size:13px;font-weight:500;">${esc(r[key])}</div>
+      <span class="tm-mono" style="font-size:12px;color:var(--sub);white-space:nowrap;">${r.plays} play${r.plays === 1 ? "" : "s"}</span>
+      ${r.minutes != null ? `<span class="tm-mono tm-right" style="font-size:12px;color:var(--faint);width:60px;">${fmt0(r.minutes)} min</span>` : ""}
+    </div>`;
+  }).join("")}</div>`;
+}
+
+async function renderMedia() {
+  const [stats, latest] = await Promise.all([
+    safe(cached("media", () => data.media(vin(), 90)), null),
+    safe(cached("latest", () => data.latest(vin())), null),
+  ]);
+
+  if (!stats || stats.has_data === false) {
+    return setContent(emptyHtml(
+      "No media data yet",
+      stats?.note || "Stream MediaNowPlayingTitle/MediaNowPlayingArtist/MediaPlaybackSource via configure_telemetry to start tracking what's played in the car.",
+    ));
+  }
+
+  setContent(`
+    ${nowPlayingCard(latest)}
+    <div class="tm-grid-metrics">
+      <div class="tm-card tm-card-pad-metric"><div class="tm-stat-label">Plays · ${stats.days} days</div><div class="tm-stat-value">${fmt0(stats.total_plays)}</div></div>
+      <div class="tm-card tm-card-pad-metric"><div class="tm-stat-label">Listening time</div><div class="tm-stat-value">${fmt1(stats.total_listening_hours)} <span class="tm-stat-unit">h</span></div></div>
+      <div class="tm-card tm-card-pad-metric"><div class="tm-stat-label">Distinct tracks</div><div class="tm-stat-value">${fmt0(stats.top_tracks.length)}</div></div>
+      <div class="tm-card tm-card-pad-metric"><div class="tm-stat-label">Distinct artists</div><div class="tm-stat-value">${fmt0(stats.top_artists.length)}</div></div>
+    </div>
+    <div class="tm-card tm-card-pad">
+      <div class="tm-card-head"><div class="tm-card-head-title">Most played tracks</div><div class="tm-card-head-sub">by play count · last ${stats.days} days</div></div>
+      ${mediaListHtml(stats.top_tracks, "title", { cover: true })}
+    </div>
+    <div class="tm-grid-2">
+      <div class="tm-card tm-card-pad">
+        <div class="tm-card-head"><div class="tm-card-head-title">Top artists</div></div>
+        ${mediaListHtml(stats.top_artists, "artist")}
+      </div>
+      <div class="tm-card tm-card-pad">
+        <div class="tm-card-head"><div class="tm-card-head-title">Top sources</div></div>
+        ${mediaListHtml(stats.top_sources, "source")}
+      </div>
+    </div>
+    ${stats.top_stations.length ? `
+    <div class="tm-card tm-card-pad">
+      <div class="tm-card-head"><div class="tm-card-head-title">Top stations</div></div>
+      ${mediaListHtml(stats.top_stations, "station")}
+    </div>` : ""}
+    <div id="tm-media-by-driver"></div>
+  `);
+
+  // Cover art loads in after first paint — an external lookup must never block render.
+  if (latest?.media_title) loadCoverInto("tm-np-cover", latest.media_title, latest.media_artist);
+  stats.top_tracks.forEach((r, i) => loadCoverInto(`tm-cover-title-${i}`, r.title, null));
+
+  renderMediaByDriver();
+}
+
+/** Fills #tm-media-by-driver in place once the per-driver breakdown loads (skips silently if there's nothing to add). */
+async function renderMediaByDriver() {
+  const byDriver = await safe(cached("media_by_driver", () => data.mediaByDriver(vin(), 90)), null);
+  const target = document.getElementById("tm-media-by-driver"); // re-check: user may have navigated away while this loaded
+  if (!target || !byDriver || byDriver.has_data === false || !byDriver.drivers?.length) return;
+  if (!state.mediaDriverFilter || !byDriver.drivers.some((d) => d.driver === state.mediaDriverFilter)) {
+    state.mediaDriverFilter = byDriver.drivers[0].driver;
+  }
+  target.innerHTML = mediaByDriverHtml(byDriver.drivers);
+}
+
+function mediaByDriverHtml(drivers) {
+  const active = drivers.find((d) => d.driver === state.mediaDriverFilter) || drivers[0];
+  return `
+    <div class="tm-card tm-card-pad">
+      <div class="tm-card-head"><div class="tm-card-head-title">Most played by driver</div><div class="tm-card-head-sub">who listens to what</div></div>
+      <div class="tm-flex-row" style="gap:8px;flex-wrap:wrap;margin-bottom:14px;">
+        ${drivers.map((d) => `<button class="tm-chip-btn ${d.driver === active.driver ? "active" : ""}" data-action="media-driver-filter" data-driver="${esc(d.driver)}">${esc(d.driver)}<span class="n">${d.total_plays}</span></button>`).join("")}
+      </div>
+      <div class="tm-grid-2">
+        <div><div class="tm-stat-label" style="margin-bottom:8px;">Top tracks</div>${mediaListHtml(active.top_tracks, "title")}</div>
+        <div><div class="tm-stat-label" style="margin-bottom:8px;">Top artists</div>${mediaListHtml(active.top_artists, "artist")}</div>
+      </div>
+    </div>`;
 }
 
 // ---------------------------------------------------------------------------

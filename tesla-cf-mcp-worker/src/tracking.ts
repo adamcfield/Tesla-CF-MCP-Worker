@@ -971,7 +971,9 @@ export async function getDrive(env: Env, id: number): Promise<unknown> {
   )
     .bind(id)
     .all();
-  return { drive, path: path.results ?? [] };
+  const d = drive as { vin: string; start_ts: number; end_ts: number | null };
+  const media = d.end_ts != null ? await mediaTrackChanges(env, d.vin, d.start_ts, d.end_ts).catch(() => []) : [];
+  return { drive, path: path.results ?? [], media };
 }
 
 /**
@@ -1351,6 +1353,203 @@ export async function getEfficiencyByTemp(env: Env, vin: string): Promise<unknow
       drives: r.drives,
       distance_km: round(r.distance_km, 1),
     })),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Media — "most played" from Fleet Telemetry's MediaNowPlaying* fields
+// ---------------------------------------------------------------------------
+
+/**
+ * Groups a media field's (title/artist/source/station) generic EAV history
+ * into "plays": a play starts whenever the value changes from the previous
+ * sample, and runs until the next change (or now, for whatever's still
+ * playing) — so repeated identical samples of the same track don't inflate
+ * the count. Requires Fleet Telemetry streaming to have been configured with
+ * the Media* fields (see configure_telemetry) — this is closed-form on
+ * whatever's already in telemetry_events, no new collection.
+ */
+async function mediaLeaderboard(
+  env: Env,
+  vin: string,
+  field: string,
+  sinceTs: number,
+  nowTs: number,
+): Promise<{ name: string; plays: number; seconds: number }[]> {
+  const rs = await env.DB.prepare(
+    `WITH raw AS (
+       SELECT ts, value_text AS v, LAG(value_text) OVER (ORDER BY ts) AS prev_v
+       FROM telemetry_events
+       WHERE vin = ?1 AND field = ?2 AND ts >= ?3 AND value_text IS NOT NULL AND value_text != ''
+     ),
+     starts AS (
+       SELECT ts, v FROM raw WHERE prev_v IS NULL OR prev_v != v
+     ),
+     spans AS (
+       SELECT v, ts, COALESCE(LEAD(ts) OVER (ORDER BY ts), ?4) AS end_ts FROM starts
+     )
+     -- Cap each span at 10 min: an open-ended "still playing" span otherwise
+     -- runs to wall-clock "now", so a car idle for days since its last sample
+     -- would count that whole gap as listening time for whatever was last playing.
+     SELECT v AS name, COUNT(*) AS plays, SUM(MAX(0, MIN(end_ts - ts, 600))) AS seconds
+     FROM spans GROUP BY v ORDER BY plays DESC`,
+  )
+    .bind(vin, field, sinceTs, nowTs)
+    .all<{ name: string; plays: number; seconds: number }>();
+  return rs.results ?? [];
+}
+
+/**
+ * Ordered track-change events within a time window (a drive's start/end) —
+ * for marking "what was playing" on the drive-detail chart. Unlike
+ * mediaLeaderboard this returns the raw sequence, not an aggregated
+ * leaderboard, and best-effort attaches whichever artist value was current
+ * as of each title change (a second field, sampled independently, so it's a
+ * nearest-preceding-value join rather than a guaranteed exact pairing).
+ */
+export async function mediaTrackChanges(
+  env: Env,
+  vin: string,
+  sinceTs: number,
+  untilTs: number,
+): Promise<{ ts: number; title: string; artist: string | null }[]> {
+  await ensureSchema(env);
+  const titleRows = await env.DB.prepare(
+    `WITH raw AS (
+       SELECT ts, value_text AS v, LAG(value_text) OVER (ORDER BY ts) AS prev_v
+       FROM telemetry_events
+       WHERE vin = ?1 AND field = 'media_title' AND ts BETWEEN ?2 AND ?3
+     )
+     SELECT ts, v AS title FROM raw
+     WHERE (prev_v IS NULL OR prev_v != v) AND v IS NOT NULL AND v != ''
+     ORDER BY ts ASC`,
+  )
+    .bind(vin, sinceTs, untilTs)
+    .all<{ ts: number; title: string }>();
+  const titles = titleRows.results ?? [];
+  if (!titles.length) return [];
+
+  const artistRows = await env.DB.prepare(
+    `SELECT ts, value_text AS artist FROM telemetry_events
+     WHERE vin = ?1 AND field = 'media_artist' AND ts BETWEEN ?2 AND ?3
+     ORDER BY ts ASC`,
+  )
+    .bind(vin, sinceTs, untilTs)
+    .all<{ ts: number; artist: string | null }>();
+  const artists = artistRows.results ?? [];
+  let ai = 0;
+  let currentArtist: string | null = null;
+  const artistAt = (ts: number): string | null => {
+    while (ai < artists.length && artists[ai]!.ts <= ts) { currentArtist = artists[ai]!.artist; ai++; }
+    return currentArtist;
+  };
+  return titles.map((r) => ({ ts: r.ts, title: r.title, artist: artistAt(r.ts) }));
+}
+
+/**
+ * Same value-change play-counting as mediaLeaderboard, but attributed to
+ * whichever driver was assigned to the drive each play fell inside (a plain
+ * LEFT JOIN on time range — plays outside any drive, or inside an
+ * unassigned one, land in "Unassigned"). No duration/seconds here: a
+ * per-driver breakdown is about WHO listens to WHAT, and play count alone
+ * answers that honestly without the span-capping complexity of the overall
+ * leaderboard.
+ */
+async function mediaLeaderboardByDriver(
+  env: Env,
+  vin: string,
+  field: string,
+  sinceTs: number,
+): Promise<{ driver: string; name: string; plays: number }[]> {
+  const rs = await env.DB.prepare(
+    `WITH raw AS (
+       SELECT ts, value_text AS v, LAG(value_text) OVER (ORDER BY ts) AS prev_v
+       FROM telemetry_events
+       WHERE vin = ?1 AND field = ?2 AND ts >= ?3 AND value_text IS NOT NULL AND value_text != ''
+     ),
+     starts AS (
+       SELECT ts, v FROM raw WHERE prev_v IS NULL OR prev_v != v
+     )
+     SELECT COALESCE(d.driver, 'Unassigned') AS driver, s.v AS name, COUNT(*) AS plays
+     FROM starts s
+     LEFT JOIN drives d ON d.vin = ?1 AND d.status = 'complete' AND s.ts BETWEEN d.start_ts AND d.end_ts
+     GROUP BY driver, name
+     ORDER BY driver ASC, plays DESC`,
+  )
+    .bind(vin, field, sinceTs)
+    .all<{ driver: string; name: string; plays: number }>();
+  return rs.results ?? [];
+}
+
+/** "Most played" leaderboards broken down per assigned driver, over the trailing `days`. */
+export async function getMediaStatsByDriver(env: Env, vin: string, days = 90): Promise<unknown> {
+  await ensureSchema(env);
+  const sinceTs = Math.floor(Date.now() / 1000) - days * 86400;
+  const [titleRows, artistRows, sourceRows] = await Promise.all([
+    mediaLeaderboardByDriver(env, vin, "media_title", sinceTs),
+    mediaLeaderboardByDriver(env, vin, "media_artist", sinceTs),
+    mediaLeaderboardByDriver(env, vin, "media_source", sinceTs),
+  ]);
+  if (!titleRows.length && !artistRows.length && !sourceRows.length) {
+    return {
+      vin, days, has_data: false,
+      note: "No media telemetry recorded yet — see get_media_stats. Per-driver breakdown also needs those drives to have an assigned driver (Drives page).",
+    };
+  }
+  const driverNames = new Set<string>();
+  for (const r of [...titleRows, ...artistRows, ...sourceRows]) driverNames.add(r.driver);
+  const forDriver = (rows: typeof titleRows, driver: string, key: string, limit: number) =>
+    rows.filter((r) => r.driver === driver).slice(0, limit).map((r) => ({ [key]: r.name, plays: r.plays }));
+
+  return {
+    vin,
+    days,
+    has_data: true,
+    drivers: [...driverNames].sort((a, b) => a.localeCompare(b)).map((driver) => ({
+      driver,
+      total_plays: titleRows.filter((r) => r.driver === driver).reduce((s, r) => s + r.plays, 0),
+      top_tracks: forDriver(titleRows, driver, "title", 10),
+      top_artists: forDriver(artistRows, driver, "artist", 10),
+      top_sources: forDriver(sourceRows, driver, "source", 5),
+    })),
+  };
+}
+
+/** "Most played" leaderboards (tracks/artists/sources/stations) over the trailing `days`. */
+export async function getMediaStats(env: Env, vin: string, days = 90): Promise<unknown> {
+  await ensureSchema(env);
+  const nowTs = Math.floor(Date.now() / 1000);
+  const sinceTs = nowTs - days * 86400;
+  const [tracks, artists, sources, stations] = await Promise.all([
+    mediaLeaderboard(env, vin, "media_title", sinceTs, nowTs),
+    mediaLeaderboard(env, vin, "media_artist", sinceTs, nowTs),
+    mediaLeaderboard(env, vin, "media_source", sinceTs, nowTs),
+    mediaLeaderboard(env, vin, "media_station", sinceTs, nowTs),
+  ]);
+
+  if (!tracks.length && !artists.length && !sources.length && !stations.length) {
+    return {
+      vin, days, has_data: false,
+      note: "No media telemetry recorded yet. Stream MediaNowPlayingTitle, MediaNowPlayingArtist, " +
+        "MediaNowPlayingStation and MediaPlaybackSource via configure_telemetry to start tracking what's played.",
+    };
+  }
+
+  const totalPlays = tracks.reduce((s, r) => s + r.plays, 0);
+  const totalSeconds = tracks.reduce((s, r) => s + (r.seconds || 0), 0);
+  const top = (rows: { name: string; plays: number; seconds: number }[], key: string, limit: number) =>
+    rows.slice(0, limit).map((r) => ({ [key]: r.name, plays: r.plays, minutes: round(r.seconds / 60, 0) }));
+
+  return {
+    vin,
+    days,
+    has_data: true,
+    total_plays: totalPlays,
+    total_listening_hours: round(totalSeconds / 3600, 1),
+    top_tracks: top(tracks, "title", 15),
+    top_artists: top(artists, "artist", 15),
+    top_sources: top(sources, "source", 10),
+    top_stations: top(stations, "station", 10),
   };
 }
 

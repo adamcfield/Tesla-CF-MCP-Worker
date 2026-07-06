@@ -77,6 +77,8 @@ import {
   getDrives,
   getEfficiencyByTemp,
   getLocationStats,
+  getMediaStats,
+  getMediaStatsByDriver,
   getMonthlyReport,
   getStateTimeline,
   getSuggestedLocations,
@@ -283,6 +285,10 @@ async function handleData(url: URL, env: Env): Promise<Response> {
       return json(await getMonthlyReport(env, vin, numParam("months", 12)));
     case "/data/suggested-locations":
       return json(await getSuggestedLocations(env, vin));
+    case "/data/media":
+      return json(await getMediaStats(env, vin, numParam("days", 90)));
+    case "/data/media-by-driver":
+      return json(await getMediaStatsByDriver(env, vin, numParam("days", 90)));
     case "/data/similar-drives": {
       const nOpt = (name: string): number | undefined => {
         const raw = q.get(name);

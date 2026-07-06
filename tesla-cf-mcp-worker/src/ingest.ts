@@ -100,6 +100,160 @@ const FIELD_MAP: Record<string, string> = {
   SeatHeaterLeft: "seat_heater_l",
   LocatedAtHome: "at_home",
   LocatedAtWork: "at_work",
+  // --- Media/infotainment. Deliberately NOT added to POSITION_COLUMNS: these
+  // are state changes, not per-sample telemetry, so they belong in the
+  // generic EAV history (telemetry_events) — which getMediaStats (tracking.ts)
+  // mines for "now playing" transitions to build a most-played leaderboard —
+  // rather than bloating the highest-row-count table in the DB.
+  MediaNowPlayingTitle: "media_title",
+  MediaNowPlayingArtist: "media_artist",
+  MediaNowPlayingAlbum: "media_album",
+  MediaNowPlayingStation: "media_station",
+  MediaPlaybackSource: "media_source",
+  MediaPlaybackStatus: "media_status",
+  MediaAudioVolume: "media_volume",
+
+  // ---------------------------------------------------------------------
+  // "Track everything (reasonable)" pass — verified against the full Fleet
+  // Telemetry field list. Every one of these is EAV-only (never added to
+  // POSITION_COLUMNS), so mapping them costs nothing until a field is
+  // actually opted into streaming via configure_telemetry, and once
+  // captured they're covered by the existing RETENTION_DAYS prune same as
+  // any other telemetry_events row. No aggregation/UI built for most of
+  // these yet — the point is to start the historical record now and decide
+  // what to build on top of it later.
+  //
+  // Deliberately EXCLUDED (not mapped at all):
+  //   - The ~28 per-corner powertrain diagnostic fields (DiAxleSpeed*,
+  //     DiHeatsinkT*, DiInverterT*, DiMotorCurrent*, DiStatorTemp*,
+  //     DiTorque*, DiVBat*) — service-shop-only signals with no
+  //     interpretable meaning for a driver dashboard.
+  //   - Semi-truck-only and Cybertruck-only fields (Semitruck*, Tonneau*,
+  //     Powershare* — Powershare is a Cybertruck feature) — wrong vehicle
+  //     class for this deployment.
+  //   - RouteLastUpdated — the CSV itself documents it as broken/unreliable.
+  //   - Static vehicle-configuration/display-preference fields (ExteriorColor,
+  //     WheelType, Trim, RoofColor, VehicleName, Setting*, etc.) — these
+  //     don't change over time, so there's nothing to "track" about them.
+
+  // --- Climate / comfort habits (also strengthens the driver-fingerprint
+  // classifier in suggestDriverForDrive, the same idea as SeatHeaterLeft).
+  AutoSeatClimateLeft: "auto_seat_climate_l",
+  AutoSeatClimateRight: "auto_seat_climate_r",
+  CabinOverheatProtectionMode: "cop_mode",
+  CabinOverheatProtectionTemperatureLimit: "cop_temp_limit",
+  ClimateKeeperMode: "climate_keeper_mode",
+  ClimateSeatCoolingFrontLeft: "seat_cool_fl",
+  ClimateSeatCoolingFrontRight: "seat_cool_fr",
+  DefrostForPreconditioning: "defrost_precon",
+  DefrostMode: "defrost_mode",
+  HvacACEnabled: "hvac_ac_on",
+  HvacAutoMode: "hvac_auto_mode",
+  HvacFanSpeed: "hvac_fan_speed",
+  HvacFanStatus: "hvac_fan_status",
+  HvacPower: "hvac_power",
+  HvacRightTemperatureRequest: "cabin_temp_set_r",
+  HvacSteeringWheelHeatAuto: "steering_heat_auto",
+  HvacSteeringWheelHeatLevel: "steering_heat_level",
+  RearDefrostEnabled: "rear_defrost",
+  RearDisplayHvacEnabled: "rear_display_hvac",
+  SeatHeaterRearCenter: "seat_heater_rear_c",
+  SeatHeaterRearLeft: "seat_heater_rear_l",
+  SeatHeaterRearRight: "seat_heater_rear_r",
+  SeatHeaterRight: "seat_heater_r",
+  SeatVentEnabled: "seat_vent",
+  WiperHeatEnabled: "wiper_heat",
+
+  // --- Safety / ADAS feature adoption + FSD mileage.
+  AutomaticBlindSpotCamera: "blind_spot_cam",
+  BlindSpotCollisionWarningChime: "blind_spot_chime",
+  EmergencyLaneDepartureAvoidance: "emerg_lane_keep",
+  // Together these give "% of miles driven on FSD" once both are streamed.
+  MilesSinceReset: "miles_since_reset",
+  SelfDrivingMilesSinceReset: "fsd_miles_since_reset",
+  // CSV notes this field is mislabeled on some platforms (reports the 2nd-row
+  // center belt instead) — captured as-is, caveat preserved in the name.
+  PassengerSeatBelt: "pass_seatbelt_unbuckled_unreliable",
+  PinToDriveEnabled: "pin_to_drive",
+  SpeedLimitWarning: "speed_limit_warning",
+
+  // --- Battery pack diagnostics (beyond the simple degradation % already
+  // derived) — brick/module imbalance is an early cell-health signal.
+  BMSState: "bms_state",
+  BatteryHeaterOn: "battery_heater_on",
+  BmsFullchargecomplete: "bms_full_charge",
+  BrickVoltageMax: "brick_v_max",
+  BrickVoltageMin: "brick_v_min",
+  NumBrickVoltageMax: "brick_v_max_num",
+  NumBrickVoltageMin: "brick_v_min_num",
+  ModuleTempMax: "module_temp_max",
+  ModuleTempMin: "module_temp_min",
+  NumModuleTempMax: "module_temp_max_num",
+  NumModuleTempMin: "module_temp_min_num",
+  NotEnoughPowerToHeat: "not_enough_power_to_heat",
+  PackCurrent: "pack_current",
+  PackVoltage: "pack_voltage",
+  IsolationResistance: "isolation_resistance",
+
+  // --- Charging behaviour/scheduling (beyond the session curve already tracked).
+  ChargeEnableRequest: "charge_enable_req",
+  ChargePortColdWeatherMode: "charge_port_cold",
+  ChargePortDoorOpen: "charge_port_door_open",
+  ChargePortLatch: "charge_port_latch",
+  ChargeRateMilePerHour: "charge_rate_mph", // stays imperial (mi/h) — not a distance/speed field toMetric() converts
+  ChargerPhases: "charger_phases",
+  ChargingCableType: "charge_cable_type",
+  EstimatedHoursToChargeTermination: "hours_to_charge_term",
+  ExpectedEnergyPercentAtTripArrival: "trip_arrival_pct",
+  FastChargerPresent: "fast_charger_present",
+  FastChargerType: "fast_charger_type",
+  PreconditioningEnabled: "preconditioning",
+  ScheduledChargingMode: "sched_charge_mode",
+  ScheduledChargingPending: "sched_charge_pending",
+  ScheduledChargingStartTime: "sched_charge_start",
+  SuperchargerSessionTripPlanner: "supercharger_trip_planner",
+  TimeToFullCharge: "time_to_full_charge",
+
+  // --- Navigation (active-route intent, distinct from where you actually
+  // parked — a future "top destinations by nav intent" could pair with the
+  // existing geofence-visit-based Suggested Places).
+  DestinationLocation: "nav_destination_location",
+  DestinationName: "nav_destination_name",
+  OriginLocation: "nav_origin_location",
+  MilesToArrival: "nav_miles_to_arrival",
+  MinutesToArrival: "nav_minutes_to_arrival",
+  RouteTrafficMinutesDelay: "nav_traffic_delay_min",
+  // Google-polyline-encoded (base64) active route shape — captured raw;
+  // decoding it into a drawable path is a future exercise, not done here.
+  RouteLine: "nav_route_polyline",
+  GpsState: "gps_lock",
+  LocatedAtFavorite: "at_favorite", // pairs with the existing at_home/at_work fingerprint fields
+
+  // --- Vehicle state / security & access (valet/guest mode, PIN, key count —
+  // meaningful for a shared-household car, same theme as driver assignment).
+  CenterDisplay: "center_display",
+  FpWindow: "window_fp",
+  RdWindow: "window_rd",
+  RpWindow: "window_rp",
+  GuestModeEnabled: "guest_mode",
+  GuestModeMobileAccessState: "guest_mode_access",
+  HomelinkDeviceCount: "homelink_count",
+  HomelinkNearby: "homelink_nearby",
+  LightsHighBeams: "high_beams",
+  PairedPhoneKeyAndKeyFobQty: "paired_keys_count",
+  RemoteStartEnabled: "remote_start",
+  ServiceMode: "service_mode",
+  SpeedLimitMode: "speed_limit_mode_on",
+  ValetModeEnabled: "valet_mode",
+  Hvil: "hvil_status", // high-voltage interlock — fault-relevant, unlike the excluded per-motor diagnostics
+
+  // --- Tire pressure staleness/warnings (complements the existing TPMS pressure fields).
+  TpmsHardWarnings: "tpms_hard_warning",
+  TpmsSoftWarnings: "tpms_soft_warning",
+  TpmsLastSeenPressureTimeFl: "tpms_seen_fl",
+  TpmsLastSeenPressureTimeFr: "tpms_seen_fr",
+  TpmsLastSeenPressureTimeRl: "tpms_seen_rl",
+  TpmsLastSeenPressureTimeRr: "tpms_seen_rr",
 };
 
 /** Canonical fields that live only on `current` for derivation — never stored to EAV. */
