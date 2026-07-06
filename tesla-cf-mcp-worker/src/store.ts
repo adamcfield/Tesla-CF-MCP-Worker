@@ -184,8 +184,9 @@ export async function ensureSchema(env: Env): Promise<void> {
   await addMissingColumns(env, "drives", {
     start_address: "TEXT", // reverse-geocoded place label (geofence name wins if matched)
     end_address: "TEXT",
-    driver: "TEXT", // assigned driver label (manual/assisted tagging)
-    suggested_driver: "TEXT", // auto-suggested from geofence + time-of-day history
+    driver: "TEXT", // assigned driver label (manual tagging, or system auto-assigned — see driver_source)
+    suggested_driver: "TEXT", // auto-suggested from geofence + time-of-day history, needs human confirmation
+    driver_source: "TEXT", // 'auto' (system-assigned, high confidence) | 'manual' (human tagged/confirmed) | NULL (unassigned)
     max_accel_ms2: "REAL", // peak longitudinal acceleration, m/s^2
     max_decel_ms2: "REAL", // peak deceleration (braking), m/s^2 (positive magnitude)
     max_jerk_ms3: "REAL", // peak |Δaccel/Δt| — smoothness signal usable even at coarse cadence

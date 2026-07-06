@@ -1374,7 +1374,12 @@ function syntheticBadgeHtml() {
 
 /** Driver cell body: assigned name, or the classifier's guess (muted, "?"-suffixed), or —. */
 function driverCellHtml(d) {
-  if (d.driver) return esc(d.driver);
+  if (d.driver) {
+    const auto = d.driver_source === "auto"
+      ? `<span class="tm-pill tm-pill-chip" style="font-size:9.5px;padding:1px 6px;margin-left:5px;vertical-align:1px;" title="Assigned automatically from place, time and climate-profile patterns — click to correct it if it's wrong.">auto</span>`
+      : "";
+    return esc(d.driver) + auto;
+  }
   if (d.suggested_driver) return `<span class="tm-driver-suggested">${esc(d.suggested_driver)}?</span>`;
   return `<span style="color:var(--faint);">—</span>`;
 }
@@ -1584,7 +1589,7 @@ async function renderDriveDetail() {
     ${(() => {
       const quickNames = [...new Set(roster.map(rosterName).filter(Boolean))].sort((a, b) => a.localeCompare(b)).filter((n) => n !== (d.driver || ""));
       return quickNames.length ? `<div class="tm-flex-row" style="gap:8px;align-items:baseline;flex-wrap:wrap;">
-        <span style="font-size:12px;color:var(--sub);">Quick assign:</span>
+        <span style="font-size:12px;color:var(--sub);">${d.driver ? "Not right? Reassign to:" : "Or assign to:"}</span>
         <div class="tm-quick-assign" style="margin-top:0;">${quickNames.map((n) => `<button type="button" class="tm-quick-chip" data-action="quick-assign" data-id="${d.id}" data-driver="${esc(n)}">${esc(n)}</button>`).join("")}</div>
       </div>` : "";
     })()}
@@ -1765,9 +1770,11 @@ async function renderDrivers() {
   setContent(`
     <div class="tm-card tm-card-pad" style="background:color-mix(in oklab, var(--accent) 5%, var(--card));">
       <div style="font-size:13px;color:var(--sub);line-height:1.5;">
-        <b>How this works.</b> Tesla exposes no way to know <i>who</i> is driving, so assign each trip to a driver on the
-        <b>Drives</b> page — then their profile aggregates here. Speed, speeding %, night-driving and mileage are always
-        reliable; <b>harsh braking / acceleration / g-force need ~1-second sampling</b> to be meaningful, so at the current
+        <b>How this works.</b> Tesla exposes no way to know <i>who</i> is driving, so the system infers it from place,
+        time-of-day and climate-profile patterns — confidently-matched trips are tagged automatically
+        (<span class="tm-pill tm-pill-chip" style="font-size:9.5px;padding:1px 6px;">auto</span>), weaker matches are
+        left as a one-tap suggestion on the <b>Drives</b> page, and you can always correct either one. Speed, speeding %,
+        night-driving and mileage are always reliable; <b>harsh braking / acceleration / g-force need ~1-second sampling</b> to be meaningful, so at the current
         logging cadence those show as low-fidelity. ${hasScores ? "" : "No behaviour scores yet — they populate as multi-sample drives accumulate."}
       </div>
       ${baselineNote ? `<div style="font-size:12px;color:var(--faint);line-height:1.5;margin-top:10px;border-top:1px solid var(--line2);padding-top:10px;"><b>Baseline.</b> ${esc(baselineNote)}</div>` : ""}
@@ -2283,7 +2290,7 @@ function rosterHintHtml(roster) {
   </div>`;
 }
 
-const DRIVER_MANUAL_NOTE = "Tesla can't auto-detect who drove — assignment is manual/assisted.";
+const DRIVER_MANUAL_NOTE = "Tesla exposes no way to know who's driving — the system assigns a driver itself when confident (place/time/climate patterns), otherwise it suggests one for you to confirm. You can always correct it below.";
 
 // --- Claims-grade drive report: risk certificate + printable report ---------
 

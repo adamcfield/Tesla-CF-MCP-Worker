@@ -843,11 +843,17 @@ export async function backfillChargeAddresses(env: Env, vin: string, limit = 40)
   return { vin, examined: (rs.results ?? []).length, updated };
 }
 
-/** Assign (or clear, with driver=null) the driver of a drive. */
+/**
+ * Assign (or clear, with driver=null) the driver of a drive. This is always a
+ * HUMAN action (the dashboard's manual input/quick-assign, or the set_driver
+ * MCP tool) — tagged driver_source='manual' so it's visually distinct from,
+ * and always overrides, a system auto-assignment (see suggestDriverForDrive).
+ */
 export async function setDriveDriver(env: Env, id: number, driver: string | null): Promise<{ updated: boolean }> {
   await ensureSchema(env);
-  const res = await env.DB.prepare(`UPDATE drives SET driver = ?2 WHERE id = ?1`)
-    .bind(id, driver && driver.trim() ? driver.trim() : null)
+  const clean = driver && driver.trim() ? driver.trim() : null;
+  const res = await env.DB.prepare(`UPDATE drives SET driver = ?2, driver_source = ?3 WHERE id = ?1`)
+    .bind(id, clean, clean ? "manual" : null)
     .run();
   return { updated: (res.meta.changes ?? 0) > 0 };
 }
@@ -1532,12 +1538,28 @@ export async function getSuggestedLocations(env: Env, vin: string): Promise<unkn
 // Driver auto-suggestion
 // ---------------------------------------------------------------------------
 
+/** Independent same-place+same-time-bucket historical drives required before the system trusts itself to auto-assign without asking. */
+const AUTO_ASSIGN_MIN_MATCHES = 3;
+/** ...and the winner must clear the runner-up by this much combined weight — otherwise it's ambiguous, ask instead. */
+const AUTO_ASSIGN_MIN_MARGIN = 1.5;
+
 /**
- * Suggests a driver for a just-closed drive from tagged history: drives that
- * started in the same geofence (or ~1 km grid cell) in the same hour-of-week
- * bucket (weekday/weekend × 3-hour block). The most frequent tagged driver
- * with ≥2 supporting drives wins. Stored in suggested_driver — the UI shows
- * it as a one-tap confirmation, never silently promotes it to `driver`.
+ * Infers a driver for a just-closed drive from tagged history — Tesla exposes
+ * no actual "who's driving" field, so this leans on the next-best signals:
+ * place + time-of-week (weekday/weekend × 3-hour block) match against each
+ * driver's own history, corroborated by two fields that track with the
+ * active driver profile (driver-side climate setpoint, seat-heater habit —
+ * a stand-in for seat-position memory).
+ *
+ * Two-tier outcome:
+ *   - CONFIDENT (≥3 independent supporting drives, clearly ahead of any other
+ *     candidate): the system assigns `driver` itself, tagged driver_source =
+ *     'auto' — no human action needed. Still just as correctable as a manual
+ *     tag (setDriveDriver always overrides it and flips the tag to 'manual').
+ *   - WEAKER (some signal, but too thin or ambiguous to trust unsupervised):
+ *     falls back to today's behaviour — stored in suggested_driver as a
+ *     one-tap confirmation, never silently written to `driver`.
+ *   - Otherwise: nothing (not enough signal to say anything useful).
  */
 export async function suggestDriverForDrive(env: Env, driveId: number, vin: string): Promise<void> {
   const d = await env.DB.prepare(
@@ -1568,9 +1590,16 @@ export async function suggestDriverForDrive(env: Env, driveId: number, vin: stri
   // Weighted voting: same place + same day/hour bucket is the strong signal;
   // a matching active-driver-profile fingerprint (climate setpoint + seat-heater
   // habit) adds a corroborating vote — the exposed stand-in for a seat-position
-  // memory, since these fields track with the active driver.
-  const votes = new Map<string, number>();
-  const add = (driver: string, w: number) => votes.set(driver, (votes.get(driver) ?? 0) + w);
+  // memory, since these fields track with the active driver. `matches` counts
+  // only the strong place+time signal (not fingerprint-only), so a single
+  // suspiciously-perfect fingerprint match can't alone clear the auto-assign bar.
+  const votes = new Map<string, { weight: number; matches: number }>();
+  const add = (driver: string, w: number, isPlaceTimeMatch: boolean) => {
+    const cur = votes.get(driver) ?? { weight: 0, matches: 0 };
+    cur.weight += w;
+    if (isPlaceTimeMatch) cur.matches += 1;
+    votes.set(driver, cur);
+  };
   const fpMatch = (a: number | null, b: number | null, tol: number): boolean =>
     a != null && b != null && Math.abs(a - b) <= tol;
 
@@ -1579,17 +1608,29 @@ export async function suggestDriverForDrive(env: Env, driveId: number, vin: stri
       (d.start_location_id != null && c.start_location_id === d.start_location_id) ||
       (d.start_lat != null && d.start_lon != null && c.start_lat != null && c.start_lon != null &&
         haversineMeters(d.start_lat, d.start_lon, c.start_lat, c.start_lon) <= 1000);
+    const placeTimeMatch = samePlace && bucketOf(c.start_ts) === targetBucket;
     let w = 0;
-    if (samePlace && bucketOf(c.start_ts) === targetBucket) w += 1; // place + time
+    if (placeTimeMatch) w += 1; // place + time
     // Fingerprint corroboration: driver climate setpoint (±0.5°C) + seat heater.
     if (fpMatch(d.fp_temp_set, c.fp_temp_set, 0.5)) w += 0.5;
     if (fpMatch(d.fp_seat_heater, c.fp_seat_heater, 0)) w += 0.3;
-    if (w > 0) add(c.driver, w);
+    if (w > 0) add(c.driver, w, placeTimeMatch);
   }
-  let best: { driver: string; n: number } | null = null;
-  for (const [driver, n] of votes) if (!best || n > best.n) best = { driver, n };
-  // Require a place+time match's worth of confidence (≥1.5 combined weight).
-  if (best && best.n >= 1.5) {
+  let best: { driver: string; weight: number; matches: number } | null = null;
+  let runnerUp: { driver: string; weight: number; matches: number } | null = null;
+  for (const [driver, v] of votes) {
+    if (!best || v.weight > best.weight) { runnerUp = best; best = { driver, ...v }; }
+    else if (!runnerUp || v.weight > runnerUp.weight) runnerUp = { driver, ...v };
+  }
+  if (!best) return; // no signal at all
+
+  const confidentAuto =
+    best.matches >= AUTO_ASSIGN_MIN_MATCHES &&
+    (!runnerUp || best.weight - runnerUp.weight >= AUTO_ASSIGN_MIN_MARGIN);
+  if (confidentAuto) {
+    await env.DB.prepare(`UPDATE drives SET driver = ?2, driver_source = 'auto' WHERE id = ?1`).bind(driveId, best.driver).run();
+  } else if (best.weight >= 1.5) {
+    // Require a place+time match's worth of confidence (≥1.5 combined weight).
     await env.DB.prepare(`UPDATE drives SET suggested_driver = ?2 WHERE id = ?1`).bind(driveId, best.driver).run();
   }
 }
