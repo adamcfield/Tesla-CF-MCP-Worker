@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { recordSpend, getBudgetStatus, getBudgetForecast, forceBudgetCeiling } from "../src/budget";
+import { recordSpend, getBudgetStatus, getBudgetForecast, forceBudgetCeiling, getBudgetCallLog } from "../src/budget";
 import { pollOnce, inQuietHours } from "../src/poll";
 import { resetSchemaCacheForTests } from "../src/store";
 import { FakeD1 } from "./helpers/d1";
@@ -198,6 +198,52 @@ describe("pollOnce budget gate", () => {
     expect(r.polled).toBe(false);
     expect(r.active).toBe(false);
     expect(vehicleDataCalls).toBe(0); // the billed endpoint was never touched
+  });
+});
+
+describe("getBudgetCallLog — spend breakdown by day/kind", () => {
+  it("returns empty entries with nothing spent yet", async () => {
+    const env = makeEnv();
+    const log = await getBudgetCallLog(env, 30);
+    expect(log.entries).toEqual([]);
+    expect(log.by_kind).toEqual([]);
+    expect(log.total_cost_usd).toBe(0);
+  });
+
+  it("buckets spend by (day, kind), not one row per call", async () => {
+    const env = makeEnv();
+    await recordSpend(env, "vehicle_data", 2); // 2 × $0.002 = $0.004
+    await recordSpend(env, "vehicle_data", 3); // same day/kind — folds into the same row
+    await recordSpend(env, "wake", 1); // $0.02
+    const log = await getBudgetCallLog(env, 30);
+    expect(log.entries).toHaveLength(2); // one row for vehicle_data, one for wake — not 3
+    const vd = log.entries.find((e) => e.kind === "vehicle_data")!;
+    expect(vd.count).toBe(5);
+    expect(vd.cost_usd).toBeCloseTo(0.01, 2);
+    const wake = log.entries.find((e) => e.kind === "wake")!;
+    expect(wake.count).toBe(1);
+    expect(wake.cost_usd).toBeCloseTo(0.02, 2);
+  });
+
+  it("aggregates a by_kind summary across the whole window, sorted by cost descending", async () => {
+    const env = makeEnv();
+    await recordSpend(env, "wake", 1); // $0.02
+    await recordSpend(env, "vehicle_data", 100); // $0.20 — costs more than the wake
+    const log = await getBudgetCallLog(env, 30);
+    expect(log.by_kind[0].kind).toBe("vehicle_data");
+    expect(log.by_kind[0].cost_usd).toBeCloseTo(0.2, 2);
+    expect(log.total_cost_usd).toBeCloseTo(0.22, 2);
+  });
+
+  it("excludes spend recorded before the requested window", async () => {
+    const env = makeEnv();
+    await recordSpend(env, "vehicle_data", 1); // ensures api_spend_calls exists, and today — inside the window
+    const oldDay = "2020-01-01";
+    await env.DB.prepare(
+      `INSERT INTO api_spend_calls (day, kind, count, micro) VALUES (?1, 'vehicle_data', 1, 2000)`,
+    ).bind(oldDay).run();
+    const log = await getBudgetCallLog(env, 7);
+    expect(log.entries.every((e) => e.day !== oldDay)).toBe(true);
   });
 });
 

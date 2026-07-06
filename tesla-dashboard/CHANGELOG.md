@@ -9,6 +9,23 @@ feature or screen, the **patch** version for fixes/tweaks/copy changes, and the
 configured. See `CLAUDE.md` at the repo root for the policy on keeping this file
 and `APP_VERSION` (in `app.js`) in sync.
 
+## 1.4.0 — 2026-07-06
+
+API usage drill-down, and decluttering the Overview page.
+
+- Removed the "Tesla API spend" card from Overview — it was duplicated with
+  the always-visible sidebar widget.
+- The sidebar spend widget is now clickable → a new "API usage" screen
+  (reachable only via the widget, not cluttering the main nav): month-to-date
+  spend + forecast, daily rate, projected month-end total, a cost breakdown
+  by call kind (vehicle data reads / commands / wakes / telemetry signals),
+  and a per-day table of what was actually spent on what.
+- Backend: spend is now also bucketed by (day, call kind) in a new
+  `api_spend_calls` table — one row per day/kind (not per HTTP call, which
+  for telemetry signals would be thousands/day) — so the breakdown is
+  answerable without an unbounded raw call log. New `GET /data/budget-calls`
+  endpoint and `get_api_call_log` MCP tool (read-scope, account-wide).
+
 ## 1.3.0 — 2026-07-06
 
 Sentry Mode event log — "fully utilize" the telemetry rather than just the
