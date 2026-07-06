@@ -148,7 +148,7 @@ function monthLabel(ts) {
 
 const state = {
   screen: "ov",
-  theme: localStorage.getItem("tm_theme") || "light",
+  theme: localStorage.getItem("tm_theme") || ((window.matchMedia && matchMedia("(prefers-color-scheme: dark)").matches) ? "dark" : "light"),
   vehicle: null, // { vin, display_name, state }
   vehicleData: null, // last on-demand get_vehicle_data snapshot
   driveFilter: 1, // 0=7d, 1=30d, 2=all
@@ -305,6 +305,7 @@ async function renderApp() {
 
 function renderShell() {
   destroyMaps();
+  document.querySelector('meta[name="theme-color"]')?.setAttribute("content", state.theme === "dark" ? "#0E0F12" : "#F5F6F8");
   // Vehicle identity/state can't be fetched cross-origin (list_vehicles is an
   // MCP tool call — see verifyToken's comment in api.js), so it only becomes
   // known if "Load live data" has been used on the Overview screen.
@@ -409,6 +410,7 @@ function onRootClick(e) {
     state.theme = t.dataset.theme;
     localStorage.setItem("tm_theme", state.theme);
     document.querySelector("[data-tm-root]")?.setAttribute("data-theme", state.theme);
+    document.querySelector('meta[name="theme-color"]')?.setAttribute("content", state.theme === "dark" ? "#0E0F12" : "#F5F6F8");
     document.querySelectorAll(".tm-segbtn").forEach((b) => b.classList.toggle("active", b.dataset.theme === state.theme));
     showScreen(); // maps must rebuild on the theme-matched basemap (data is cached, so this is instant)
   } else if (action === "refresh") {
