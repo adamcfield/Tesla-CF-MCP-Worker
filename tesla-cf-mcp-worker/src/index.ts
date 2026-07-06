@@ -85,6 +85,7 @@ import {
   getVampireDrain,
   listLocations,
   setDriveDriver,
+  setLocation,
 } from "./tracking";
 import { Env } from "./types";
 
@@ -396,6 +397,23 @@ export default {
         const id = Number(url.searchParams.get("id"));
         if (!Number.isFinite(id)) return json({ error: "id query param required" }, 400);
         return json(await setDriveDriver(env, id, url.searchParams.get("driver")));
+      }
+
+      // --- name a place (benign metadata write, same trust boundary as
+      // assign-driver above: read scope suffices, and it can't touch the
+      // vehicle). Lets the dashboard turn a "suggested place" — a frequent
+      // stop it already detected — into a saved geofence in one step, instead
+      // of requiring a separate MCP tool call.
+      if (path === "/data/save-location" && request.method === "POST") {
+        if (scope === null) return json({ error: "unauthorized" }, 401);
+        const name = url.searchParams.get("name")?.trim().slice(0, 120);
+        const lat = Number(url.searchParams.get("lat"));
+        const lon = Number(url.searchParams.get("lon"));
+        if (!name) return json({ error: "name query param required" }, 400);
+        if (!Number.isFinite(lat) || !Number.isFinite(lon)) return json({ error: "lat/lon query params required" }, 400);
+        const radiusParam = url.searchParams.get("radius_m");
+        const radius_m = radiusParam != null && radiusParam !== "" ? Number(radiusParam) : undefined;
+        return json(await setLocation(env, { name, lat, lon, radius_m: Number.isFinite(radius_m as number) ? radius_m : undefined }));
       }
 
       // --- data exports (CSV/GPX downloads; read scope) -------------------

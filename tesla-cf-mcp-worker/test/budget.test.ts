@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { recordSpend, getBudgetStatus, forceBudgetCeiling } from "../src/budget";
+import { recordSpend, getBudgetStatus, getBudgetForecast, forceBudgetCeiling } from "../src/budget";
 import { pollOnce, inQuietHours } from "../src/poll";
 import { resetSchemaCacheForTests } from "../src/store";
 import { FakeD1 } from "./helpers/d1";
@@ -86,6 +86,62 @@ describe("spend accounting", () => {
     const s = await getBudgetStatus(env);
     expect(s.spent_micro).toBe(700_000);
     expect(s.spent_usd).toBeCloseTo(0.7, 2);
+  });
+});
+
+describe("getBudgetForecast — month-end spend projection", () => {
+  it("reports insufficient_data with no spend logged yet this month", async () => {
+    const env = makeEnv();
+    const f = await getBudgetForecast(env);
+    expect(f.method).toBe("insufficient_data");
+    expect(f.daily_rate_usd).toBe(0);
+    expect(f.projected_month_usd).toBe(0);
+    expect(f.projected_over_budget).toBe(false);
+    expect(f.budget_exhausted_in_days).toBeNull();
+    expect(f.days_in_month).toBeGreaterThanOrEqual(28);
+    expect(f.days_elapsed + f.days_remaining).toBe(f.days_in_month);
+  });
+
+  it("falls back to a flat average-rate projection with only today's spend logged", async () => {
+    const env = makeEnv();
+    await recordSpend(env, "vehicle_data", 100); // $0.20 today
+    const f = await getBudgetForecast(env);
+    expect(f.method).toBe("average");
+    expect(f.daily_rate_usd).toBeGreaterThan(0);
+    expect(f.projected_month_usd).toBeGreaterThanOrEqual(0.2);
+  });
+
+  it("regresses a multi-day spend series and flags an over-budget projection", async () => {
+    const env = makeEnv();
+    await recordSpend(env, "vehicle_data", 1); // ensures api_spend_daily exists
+    const month = `${new Date().getUTCFullYear()}-${String(new Date().getUTCMonth() + 1).padStart(2, "0")}`;
+    // Seed two distinct earlier days with a clearly accelerating daily spend
+    // ($1 then $2) so the regression has an unambiguous positive slope. Mirror
+    // each day-bucket insert into the monthly total too — recordSpend always
+    // keeps the two ledgers in lockstep, and getBudgetStatus's spent_micro
+    // (used for the exhausted-in-N-days math) reads only the monthly table.
+    for (const [day, micro] of [[`${month}-01`, 1_000_000], [`${month}-02`, 2_000_000]] as const) {
+      await env.DB.prepare(
+        `INSERT INTO api_spend_daily (day, micro) VALUES (?1, ?2) ON CONFLICT(day) DO UPDATE SET micro = micro + excluded.micro`,
+      ).bind(day, micro).run();
+      await env.DB.prepare(
+        `INSERT INTO api_spend (month, micro) VALUES (?1, ?2) ON CONFLICT(month) DO UPDATE SET micro = micro + excluded.micro`,
+      ).bind(month, micro).run();
+    }
+    const f = await getBudgetForecast(env);
+    expect(f.method).toBe("regression");
+    expect(f.daily_rate_usd).toBeGreaterThan(0);
+    // At ~$1-2/day the $9 default poll budget is blown well before month-end.
+    expect(f.projected_over_budget).toBe(true);
+    expect(f.budget_exhausted_in_days).not.toBeNull();
+    expect(f.budget_exhausted_in_days!).toBeGreaterThan(0);
+  });
+
+  it("never projects below what's already been spent (a late-month slowdown can't erase past spend)", async () => {
+    const env = makeEnv();
+    await recordSpend(env, "vehicle_data", 4000); // $8 spent today alone
+    const f = await getBudgetForecast(env);
+    expect(f.projected_month_usd).toBeGreaterThanOrEqual(8);
   });
 });
 

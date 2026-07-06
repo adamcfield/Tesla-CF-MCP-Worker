@@ -529,6 +529,35 @@ function onRootClick(e) {
     state.openPlaceId = null;
     pushHistory();
     renderPlaces();
+  } else if (action === "save-suggested-location") {
+    const input = document.getElementById(t.dataset.input);
+    const name = input ? input.value.trim() : "";
+    if (!name) { input?.focus(); return; }
+    const lat = Number(t.dataset.lat), lon = Number(t.dataset.lon);
+    t.disabled = true;
+    t.textContent = "Saving…";
+    data.saveLocation({ name, lat, lon }).then(() => {
+      delete state.cache.locations;
+      delete state.cache.suggested_locations;
+      t.textContent = "Saved ✓";
+      setTimeout(() => { if (state.screen === "pl") renderPlaces(); }, 700);
+    }).catch(() => {
+      t.disabled = false;
+      t.textContent = "Failed";
+    });
+  } else if (action === "quick-assign") {
+    // One-tap self-assign: reuses the same assign-driver write the manual
+    // input/Save flow already uses, just skipping the typing.
+    const id = Number(t.dataset.id);
+    const name = t.dataset.driver || "";
+    t.disabled = true;
+    data.assignDriver(id, name).then(() => {
+      delete state.cache.all_drives;
+      showScreen();
+    }).catch(() => {
+      t.disabled = false;
+      t.textContent = "Failed";
+    });
   } else if (action === "open-drive") {
     // Opening a drive is a navigation into the Drives section — keep the left-nav
     // highlight + header in sync (the detail can be reached from Overview/Timeline too).
@@ -758,11 +787,28 @@ async function loadLiveVehicleData() {
   await renderOverview();
 }
 
-/** Tesla API spend card: month-to-date vs the free-tier poll cap, with a bar. */
+/** Month-end forecast line shared by budgetCard() and sideBudgetHtml(). */
+function budgetForecastNote(b, compact) {
+  const f = b.forecast;
+  if (!f || f.method === "insufficient_data") return "";
+  const overBudget = f.projected_over_budget === true;
+  const warn = overBudget || f.budget_exhausted_in_days != null;
+  const text = f.budget_exhausted_in_days != null
+    ? `At this rate, runs out in ~${fmt1(f.budget_exhausted_in_days)} day${f.budget_exhausted_in_days === 1 ? "" : "s"} — before month-end`
+    : overBudget
+      ? `Projected ≈ $${fmt2(f.projected_month_usd)} by month-end — over the $${fmt0(b.poll_budget_usd)} cap`
+      : `On track — projected ≈ $${fmt2(f.projected_month_usd)} by month-end`;
+  return compact
+    ? `<div style="font-size:10.5px;color:${warn ? "var(--warn)" : "var(--faint)"};margin-top:3px;">${esc(text)}</div>`
+    : `<div class="tm-stat-note" style="${warn ? "color:var(--warn);" : ""}">${esc(text)}</div>`;
+}
+
+/** Tesla API spend card: month-to-date vs the free-tier poll cap, with a bar + month-end forecast. */
 function budgetCard(b) {
   if (!b || typeof b !== "object") return "";
   const pct = b.poll_budget_usd > 0 ? Math.min(100, (b.spent_usd / b.poll_budget_usd) * 100) : 0;
-  const color = !b.poll_allowed ? "var(--warn)" : "var(--good)";
+  const atRisk = !b.poll_allowed || b.forecast?.projected_over_budget === true || b.forecast?.budget_exhausted_in_days != null;
+  const color = atRisk ? "var(--warn)" : "var(--good)";
   const note = !b.poll_allowed ? "polling paused — resumes on the 1st" : "of free-tier cap · never charged";
   return `
     <div class="tm-card tm-card-pad-metric">
@@ -772,22 +818,25 @@ function budgetCard(b) {
         <div style="position:absolute;inset:0 auto 0 0;width:${pct.toFixed(1)}%;background:${color};border-radius:999px;"></div>
       </div>
       <div class="tm-stat-note">${esc(note)}</div>
+      ${budgetForecastNote(b, false)}
     </div>`;
 }
 
-/** Compact Tesla API spend for the sidebar (calls + $ spend, above the theme toggle). */
+/** Compact Tesla API spend for the sidebar (calls + $ spend + a one-line forecast, above the theme toggle). */
 function sideBudgetHtml(b) {
   if (!b || typeof b !== "object") return "";
   const cap = b.poll_budget_usd > 0 ? b.poll_budget_usd : null;
   const pct = cap ? Math.min(100, (b.spent_usd / cap) * 100) : 0;
-  const color = b.poll_allowed === false ? "var(--warn)" : "var(--good)";
+  const atRisk = b.poll_allowed === false || b.forecast?.projected_over_budget === true || b.forecast?.budget_exhausted_in_days != null;
+  const color = atRisk ? "var(--warn)" : "var(--good)";
   const calls = [b.reads, b.billed_reads, b.count, b.calls].find((v) => typeof v === "number");
   return `
     <div class="tm-sidebudget-top">
       <span>Tesla API${calls != null ? ` · ${fmt0(calls)} calls` : ""}</span>
       <span class="tm-mono">$${fmt2(b.spent_usd)}${cap ? ` <span style="color:var(--faint);">/ ${fmt0(cap)}</span>` : ""}</span>
     </div>
-    ${cap ? `<div class="tm-sidebudget-bar"><div style="width:${pct.toFixed(1)}%;background:${color};"></div></div>` : ""}`;
+    ${cap ? `<div class="tm-sidebudget-bar"><div style="width:${pct.toFixed(1)}%;background:${color};"></div></div>` : ""}
+    ${budgetForecastNote(b, true)}`;
 }
 function updateSideBudget(b) {
   if (b) state.apiBudget = b;
@@ -999,6 +1048,7 @@ async function renderOverview() {
         <div class="tm-stat-label">Avg efficiency</div>
         <div class="tm-stat-value">${summary?.avg_efficiency_wh_km != null ? fmt0(summary.avg_efficiency_wh_km) : "—"} <span class="tm-stat-unit">Wh/km</span></div>
       </div>
+      ${budgetCard(summary?.api_budget)}
     </div>
 
     <div class="tm-grid-2">
@@ -1334,8 +1384,19 @@ function beginDriverEdit(cell, id) {
   const drives = state.cache.all_drives || [];
   const row = drives.find((d) => d.id === id);
   const current = row?.driver || "";
-  cell.innerHTML = `<input class="tm-driver-edit" list="tm-driver-names" value="${esc(current)}" placeholder="${esc(row?.suggested_driver ? row.suggested_driver + "?" : "driver…")}" autocomplete="off">`;
+  // Roster chips let a driver self-assign in one tap instead of typing their
+  // own name — reuses whatever roster renderDrives() already loaded.
+  const roster = state.cache.drivers_roster?.drivers || knownDrivers(drives).map((name) => ({ name, source: "tagged" }));
+  const quickNames = [...new Set(roster.map(rosterName).filter(Boolean))].sort((a, b) => a.localeCompare(b)).filter((n) => n !== current);
+  cell.innerHTML = `
+    <input class="tm-driver-edit" list="tm-driver-names" value="${esc(current)}" placeholder="${esc(row?.suggested_driver ? row.suggested_driver + "?" : "driver…")}" autocomplete="off">
+    ${quickNames.length ? `<div class="tm-quick-assign">${quickNames.map((n) => `<button type="button" class="tm-quick-chip" data-action="quick-assign" data-id="${id}" data-driver="${esc(n)}">${esc(n)}</button>`).join("")}</div>` : ""}
+  `;
   const input = cell.querySelector("input");
+  // A click on a quick chip would otherwise blur the input first (finishing
+  // the edit with whatever was typed) before the chip's own click fires —
+  // keep focus on the input so only the chip's quick-assign action runs.
+  cell.querySelector(".tm-quick-assign")?.addEventListener("mousedown", (e) => e.preventDefault());
   let done = false;
   const finish = (save) => {
     if (done) return;
@@ -1520,6 +1581,13 @@ async function renderDriveDetail() {
         <button class="tm-chip-btn" style="padding:5px 12px;" data-action="save-driver" data-id="${d.id}">Save</button>
       </div>
     </div>
+    ${(() => {
+      const quickNames = [...new Set(roster.map(rosterName).filter(Boolean))].sort((a, b) => a.localeCompare(b)).filter((n) => n !== (d.driver || ""));
+      return quickNames.length ? `<div class="tm-flex-row" style="gap:8px;align-items:baseline;flex-wrap:wrap;">
+        <span style="font-size:12px;color:var(--sub);">Quick assign:</span>
+        <div class="tm-quick-assign" style="margin-top:0;">${quickNames.map((n) => `<button type="button" class="tm-quick-chip" data-action="quick-assign" data-id="${d.id}" data-driver="${esc(n)}">${esc(n)}</button>`).join("")}</div>
+      </div>` : "";
+    })()}
     ${rosterHintHtml(roster)}
     <div style="font-size:12px;color:var(--faint);">${esc(DRIVER_MANUAL_NOTE)}${!d.driver && d.suggested_driver ? ` Looks like <span class="tm-driver-suggested">${esc(d.suggested_driver)}</span> drove this — pick a name and Save to confirm.` : ""}</div>
 
@@ -1796,22 +1864,21 @@ async function renderPlaces() {
   setContent(`
     ${suggestions.length ? `
     <div class="tm-card tm-card-pad">
-      <div class="tm-flex-row" style="align-items:baseline;margin-bottom:6px;">
-        <div style="font-size:14px;font-weight:600;">Suggested places</div>
-        <div style="font-size:12px;color:var(--faint);">frequent stops that aren't saved yet</div>
+      <div class="tm-card-head" style="margin-bottom:6px;">
+        <div class="tm-card-head-title">Suggested places</div>
+        <div class="tm-card-head-sub">frequent stops that aren't saved yet — name one to save it</div>
       </div>
-      <div style="font-size:12px;color:var(--faint);margin-bottom:8px;">
-        Locations are managed with the worker's <code>set_location</code> MCP tool — this dashboard is read-only, so ask
-        Claude to save one (name + coordinates below) and it'll appear in the list.
-      </div>
-      ${suggestions.map((s) => `
-        <div class="tm-activity-row">
+      ${suggestions.map((s, i) => `
+        <div class="tm-suggest-row">
           <span class="tm-dot" style="background:var(--warn);"></span>
-          <div style="min-width:0;">
+          <div class="tm-suggest-info">
             <div class="tm-activity-title">${esc(s.label || "Unnamed spot")}</div>
-            <div class="tm-activity-meta">${s.lat != null && s.lon != null ? `${fmt1(s.lat)}, ${fmt1(s.lon)}` : ""}</div>
+            <div class="tm-activity-meta">${s.lat != null && s.lon != null ? `${fmt1(s.lat)}, ${fmt1(s.lon)}` : ""}${s.visits != null ? ` · ${s.visits} visit${s.visits === 1 ? "" : "s"}` : ""}</div>
           </div>
-          <span class="tm-activity-time">${s.visits != null ? `${s.visits} visit${s.visits === 1 ? "" : "s"}` : ""}</span>
+          <div class="tm-suggest-form">
+            <input class="tm-gate-input tm-suggest-input" id="tm-suggest-name-${i}" type="text" placeholder="Name this place…" autocomplete="off" maxlength="120">
+            <button class="tm-chip-btn" data-action="save-suggested-location" data-lat="${s.lat}" data-lon="${s.lon}" data-input="tm-suggest-name-${i}">Save</button>
+          </div>
         </div>`).join("")}
     </div>` : ""}
     ${locations.length ? `
@@ -1828,7 +1895,7 @@ async function renderPlaces() {
           </div>`).join("")}
         <div class="tm-foot-note">${locations.length} saved place${locations.length === 1 ? "" : "s"} · click one for its stats.</div>
       </div>
-    </div>` : emptyHtml("No saved places yet", "Save geofence locations (home, work, …) with the set_location MCP tool and drives/charges will auto-label against them.")}
+    </div>` : emptyHtml("No saved places yet", suggestions.length ? "Name one of the frequent stops above to save it — drives and charges will start labeling against it automatically." : "Once a spot has been visited a few times it'll show up above as a suggestion you can name and save.")}
   `);
 }
 

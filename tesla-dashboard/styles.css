@@ -264,6 +264,21 @@ body {
 /* ---------- inline driver-edit cell: signal it diverges from the row's own click ---------- */
 .tm-edit-cell { cursor: text; text-decoration: underline dotted var(--faint) 1px; text-underline-offset: 2px; }
 .tm-edit-cell:hover { color: var(--text); }
+
+/* ---------- one-tap "quick assign" roster chips (self-assign a drive) ---------- */
+.tm-quick-assign { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+.tm-quick-chip {
+  border: none; border-radius: 999px; padding: 3px 10px; font-size: 11px; font-weight: 600;
+  background: var(--chip); color: var(--sub); cursor: pointer; font-family: var(--ui);
+}
+.tm-quick-chip:hover { background: color-mix(in oklab, var(--accent) 16%, var(--chip)); color: var(--text); }
+
+/* ---------- suggested-place row: name + Save form ---------- */
+.tm-suggest-row { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; padding: 11px 0; border-bottom: 1px solid var(--line2); }
+.tm-suggest-row:last-child { border-bottom: none; }
+.tm-suggest-info { min-width: 160px; flex: 1 1 200px; }
+.tm-suggest-form { display: flex; gap: 8px; align-items: center; flex: 0 0 auto; }
+.tm-suggest-input { width: 170px; padding: 6px 10px; font-size: 12.5px; }
 .tm-spinner {
   width: 22px; height: 22px; border-radius: 50%; border: 2.5px solid var(--line);
   border-top-color: var(--accent); animation: tmSpin 0.7s linear infinite;
@@ -553,6 +568,9 @@ select.tm-gate-input { font-family: var(--ui); cursor: pointer; }
 
   .tm-bar-row { grid-template-columns: 1fr; gap: 4px; }
   .tm-bar-row > :nth-child(3), .tm-bar-row > :nth-child(4) { text-align: left; }
+
+  .tm-suggest-form { flex-basis: 100%; }
+  .tm-suggest-input { flex: 1; width: auto; }
 }
 
 /* Respect users who opt out of motion (vestibular accessibility). */

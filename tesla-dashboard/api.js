@@ -187,6 +187,14 @@ export const data = {
   assignDriver: (id, driver) =>
     fetch(workerOrigin() + "/data/assign-driver?" + new URLSearchParams({ id, driver: driver || "", token: auth.token }), { method: "POST" })
       .then((r) => (r.ok ? r.json() : Promise.reject(new ApiError("assign failed", r.status)))),
+  /** Benign metadata write (token-gated POST) — save a named geofence (e.g. naming a suggested place). */
+  saveLocation: ({ name, lat, lon, radius_m }) =>
+    fetch(workerOrigin() + "/data/save-location?" + new URLSearchParams({
+      name, lat: String(lat), lon: String(lon),
+      ...(radius_m != null ? { radius_m: String(radius_m) } : {}),
+      token: auth.token,
+    }), { method: "POST" })
+      .then((r) => (r.ok ? r.json() : Promise.reject(new ApiError("save failed", r.status)))),
 };
 
 export { ApiError };

@@ -16,7 +16,7 @@
  */
 
 import { getChargingHistory, getVehicleDrivers } from "./api";
-import { getBudgetStatus } from "./budget";
+import { getBudgetForecast, getBudgetStatus } from "./budget";
 import { signDriveCertificate } from "./certificate";
 import { reverseGeocode } from "./geocode";
 import { postedLimitsForSamples } from "./roadlimits";
@@ -1306,7 +1306,9 @@ export async function getTrackingSummary(env: Env, vin: string): Promise<unknown
     total_charge_energy_kwh: round(charges?.kwh ?? 0, 1),
     total_charge_cost: round(charges?.cost ?? 0, 2),
     pack_kwh: await getPackKwh(env, vin),
-    api_budget: await getBudgetStatus(env).catch(() => null),
+    api_budget: await getBudgetStatus(env)
+      .then(async (status) => ({ ...status, forecast: await getBudgetForecast(env).catch(() => null) }))
+      .catch(() => null),
   };
 }
 

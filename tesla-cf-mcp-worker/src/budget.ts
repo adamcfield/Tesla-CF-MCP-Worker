@@ -45,28 +45,44 @@ const monthKey = (): string => {
   return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}`;
 };
 
+const dayKey = (): string => {
+  const d = new Date();
+  return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}-${String(d.getUTCDate()).padStart(2, "0")}`;
+};
+
 /**
- * The spend table is (re)ensured on every call rather than guarded by a
+ * The spend tables are (re)ensured on every call rather than guarded by a
  * per-isolate flag: a flag would leak across the many fresh in-memory DBs in
  * tests, and in production CREATE TABLE IF NOT EXISTS is a trivial no-op.
  * The one-time legacy KV → D1 fold-in only runs on the READ path (spentMicro)
  * — gates read through there, so ordering is safe.
+ *
+ * api_spend_daily buckets the same spend by UTC day (in addition to the
+ * month total in api_spend) purely so getBudgetForecast has a time series to
+ * regress against — the month total alone can't say whether spend is
+ * accelerating or flat.
  */
 async function ensureSpendTable(env: Env): Promise<void> {
-  await env.DB.prepare(
-    `CREATE TABLE IF NOT EXISTS api_spend (month TEXT PRIMARY KEY, micro INTEGER NOT NULL)`,
-  ).run();
+  await env.DB.batch([
+    env.DB.prepare(`CREATE TABLE IF NOT EXISTS api_spend (month TEXT PRIMARY KEY, micro INTEGER NOT NULL)`),
+    env.DB.prepare(`CREATE TABLE IF NOT EXISTS api_spend_daily (day TEXT PRIMARY KEY, micro INTEGER NOT NULL)`),
+  ]);
 }
 
 export async function recordSpend(env: Env, kind: BillableKind, count = 1): Promise<void> {
   try {
     await ensureSpendTable(env);
-    await env.DB.prepare(
-      `INSERT INTO api_spend (month, micro) VALUES (?1, ?2)
-       ON CONFLICT(month) DO UPDATE SET micro = micro + excluded.micro`,
-    )
-      .bind(monthKey(), COST_MICRO[kind] * count)
-      .run();
+    const micro = COST_MICRO[kind] * count;
+    await env.DB.batch([
+      env.DB.prepare(
+        `INSERT INTO api_spend (month, micro) VALUES (?1, ?2)
+         ON CONFLICT(month) DO UPDATE SET micro = micro + excluded.micro`,
+      ).bind(monthKey(), micro),
+      env.DB.prepare(
+        `INSERT INTO api_spend_daily (day, micro) VALUES (?1, ?2)
+         ON CONFLICT(day) DO UPDATE SET micro = micro + excluded.micro`,
+      ).bind(dayKey(), micro),
+    ]);
   } catch {
     // Accounting must never break the actual operation.
   }
@@ -161,6 +177,107 @@ export async function getBudgetStatus(env: Env): Promise<BudgetStatus> {
     poll_allowed: spent < pollBudget,
     commands_allowed: spent < HARD_CEILING,
   };
+}
+
+// ---------------------------------------------------------------------------
+// Forecast — regress this month's daily spend to project month-end totals,
+// so a dashboard can answer "at this rate, will we run out before the 1st?"
+// instead of only showing the running total.
+// ---------------------------------------------------------------------------
+
+export interface BudgetForecast {
+  method: "regression" | "average" | "insufficient_data";
+  days_elapsed: number;
+  days_in_month: number;
+  days_remaining: number;
+  daily_rate_usd: number;
+  projected_month_usd: number;
+  projected_over_budget: boolean;
+  budget_exhausted_in_days: number | null; // null = not projected to run out before month-end at current rate
+}
+
+async function dailySpendRows(env: Env, month: string): Promise<{ day: string; micro: number }[]> {
+  await ensureSpendTable(env);
+  const rs = await env.DB.prepare(
+    `SELECT day, micro FROM api_spend_daily WHERE day LIKE ?1 ORDER BY day ASC`,
+  )
+    .bind(`${month}-%`)
+    .all<{ day: string; micro: number }>();
+  return rs.results ?? [];
+}
+
+function finishForecast(
+  daysElapsed: number,
+  daysInMonth: number,
+  daysRemaining: number,
+  dailyRateMicro: number,
+  projectedMicro: number,
+  spentMicroNow: number,
+  budgetMicro: number,
+  method: BudgetForecast["method"],
+): BudgetForecast {
+  const rate = Math.max(0, dailyRateMicro);
+  let budgetExhaustedInDays: number | null = null;
+  if (rate > 0) {
+    const remaining = budgetMicro - spentMicroNow;
+    const days = remaining <= 0 ? 0 : remaining / rate;
+    if (days <= daysRemaining) budgetExhaustedInDays = Math.round(days * 10) / 10;
+  }
+  return {
+    method,
+    days_elapsed: daysElapsed,
+    days_in_month: daysInMonth,
+    days_remaining: daysRemaining,
+    daily_rate_usd: Math.round((rate / 10_000)) / 100,
+    projected_month_usd: Math.round((Math.max(projectedMicro, spentMicroNow) / 10_000)) / 100,
+    projected_over_budget: Math.max(projectedMicro, spentMicroNow) > budgetMicro,
+    budget_exhausted_in_days: budgetExhaustedInDays,
+  };
+}
+
+/**
+ * Projects this month's total spend from the daily buckets logged so far.
+ * With ≥2 days of history, fits an ordinary-least-squares line through
+ * cumulative spend vs day-of-month (same closed-form approach as the battery
+ * degradation forecast in forecast.ts) and extrapolates to the last day of
+ * the month; with 0–1 days of history it falls back to a flat average-rate
+ * projection (or "insufficient_data" on day one, before any rate is knowable).
+ */
+export async function getBudgetForecast(env: Env): Promise<BudgetForecast> {
+  const month = monthKey();
+  const [y, m] = month.split("-").map(Number) as [number, number];
+  const daysInMonth = new Date(Date.UTC(y, m, 0)).getUTCDate();
+  const daysElapsed = new Date().getUTCDate();
+  const daysRemaining = Math.max(0, daysInMonth - daysElapsed);
+
+  const status = await getBudgetStatus(env);
+  const budgetMicro = pollBudgetMicro(env);
+  const rows = await dailySpendRows(env, month).catch(() => []);
+
+  if (rows.length < 2) {
+    const dailyRate = daysElapsed > 0 ? status.spent_micro / daysElapsed : 0;
+    const projected = status.spent_micro + dailyRate * daysRemaining;
+    return finishForecast(
+      daysElapsed, daysInMonth, daysRemaining, dailyRate, projected, status.spent_micro, budgetMicro,
+      rows.length === 0 ? "insufficient_data" : "average",
+    );
+  }
+
+  // OLS slope of cumulative spend vs day-of-month index.
+  let cum = 0;
+  const pts = rows.map((r) => {
+    cum += r.micro;
+    return { x: Number(r.day.slice(-2)), y: cum };
+  });
+  const n = pts.length;
+  const mx = pts.reduce((s, p) => s + p.x, 0) / n;
+  const my = pts.reduce((s, p) => s + p.y, 0) / n;
+  let sxx = 0, sxy = 0;
+  for (const p of pts) { sxx += (p.x - mx) ** 2; sxy += (p.x - mx) * (p.y - my); }
+  const slope = sxx > 0 ? sxy / sxx : 0; // micro-dollars/day
+  const intercept = my - slope * mx;
+  const projected = intercept + slope * daysInMonth;
+  return finishForecast(daysElapsed, daysInMonth, daysRemaining, slope, projected, status.spent_micro, budgetMicro, "regression");
 }
 
 // ---------------------------------------------------------------------------
