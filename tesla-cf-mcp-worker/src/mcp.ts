@@ -8,6 +8,7 @@
 
 import { askDigitalTwin, askTessa } from "./ai";
 import * as api from "./api";
+import * as budget from "./budget";
 import { findSimilarDrives } from "./twin";
 import * as cmd from "./commands";
 import * as forecast from "./forecast";
@@ -797,6 +798,18 @@ const TOOLS: Tool[] = [
     handler: (env, a) => tracking.getStateTimeline(env, a.vin, a.hours ?? 168),
   },
   {
+    name: "get_api_call_log",
+    description:
+      "Tesla Fleet API spend breakdown by day and call kind (vehicle data reads, commands, wakes, telemetry " +
+      "signals) over the trailing `days` — what the running spend total shown elsewhere is actually made of. " +
+      "Account-wide, not per-vehicle. Free — reads logged accounting data.",
+    inputSchema: {
+      type: "object",
+      properties: { days: { type: "number", default: 30 } },
+    },
+    handler: (env, a) => budget.getBudgetCallLog(env, a.days ?? 30),
+  },
+  {
     name: "list_locations",
     description: "List named locations (geofences used to tag drives & charges and to price charging per site).",
     inputSchema: { type: "object", properties: {} },
@@ -947,6 +960,7 @@ const READ_TOOLS = new Set([
   "get_similar_drives",
   "ask_digital_twin",
   "list_locations",
+  "get_api_call_log",
   "get_location_stats",
   "list_automations",
 ]);

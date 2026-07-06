@@ -87,6 +87,8 @@ body {
 .tm-sidemeta { padding: 12px 10px 0; font-size: 11px; color: var(--faint); }
 .tm-sidebudget { padding: 2px 10px 12px; }
 .tm-sidebudget:empty { display: none; }
+.tm-sidebudget-click { cursor: pointer; border-radius: 8px; transition: background 0.12s ease; }
+.tm-sidebudget-click:hover { background: var(--chip); }
 .tm-sidebudget-top { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; font-size: 11px; color: var(--sub); }
 .tm-sidebudget-top .tm-mono { font-size: 11px; }
 .tm-sidebudget-bar { height: 3px; border-radius: 999px; background: var(--chip); margin-top: 5px; overflow: hidden; }

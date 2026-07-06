@@ -172,6 +172,8 @@ export const data = {
   climateHabits: (vin, days) => getJson("/data/climate-habits", { vin, days }),
   /** Sentry Mode armed-hours + (when the account streams the full enum) trigger event log. New endpoint — may 404. */
   sentryLog: (vin, days) => getJson("/data/sentry-log", { vin, days }),
+  /** Tesla Fleet API call log & cost breakdown by day/kind, account-wide (no vin). New endpoint — may 404. */
+  budgetCallLog: (days) => getJson("/data/budget-calls", { days }),
   /**
    * Range prediction. With no distance_km, returns {model, ready} so the screen
    * can show model quality + a form; with params, returns the prediction. New endpoint — may 404.

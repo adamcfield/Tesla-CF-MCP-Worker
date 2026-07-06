@@ -5,7 +5,7 @@ import { destroyMaps, renderPointMap, renderRouteMap, renderLifetimeMap, createR
 // Bump on every change to this dashboard (UI, features, or the /data/*
 // endpoints it depends on) and add a matching entry to CHANGELOG.md — see
 // the versioning policy in the repo's CLAUDE.md. Shown in the sidebar footer.
-const APP_VERSION = "1.3.0";
+const APP_VERSION = "1.4.0";
 
 const root = document.getElementById("app");
 let shellBound = false; // guards one-time attach of the root click handler + sync timer
@@ -228,6 +228,7 @@ const TITLES = {
   bh: ["Battery health", ""],
   pr: ["Predictions", "battery forecast & range predictor"],
   vd: ["Vampire drain", "standby losses"],
+  api: ["API usage", "Tesla Fleet API call log & cost — click the sidebar widget to get here"],
 };
 
 const EVENT_COLOR = { drive: "var(--accent)", charge: "var(--good)", sleep: "var(--faint)", update: "#8A63D2" };
@@ -418,7 +419,7 @@ function renderShell() {
             ${g.items.map(([key, label]) => `<button class="tm-navitem ${state.screen === key ? "active" : ""}" data-action="nav" data-screen="${key}">${esc(label)}</button>`).join("")}
           </div>`).join("")}
         <div class="tm-sidefoot">
-          <div class="tm-sidebudget" id="tm-sidebudget">${sideBudgetHtml(state.apiBudget)}</div>
+          <div class="tm-sidebudget tm-sidebudget-click" id="tm-sidebudget" data-action="nav" data-screen="api" title="View API call log & cost">${sideBudgetHtml(state.apiBudget)}</div>
           <div class="tm-segment">
             <button class="tm-segbtn ${state.theme === "light" ? "active" : ""}" data-action="theme" data-theme="light">Light</button>
             <button class="tm-segbtn ${state.theme === "dark" ? "active" : ""}" data-action="theme" data-theme="dark">Dark</button>
@@ -713,6 +714,8 @@ function skeletonHtml(screen) {
       return `${metrics}<div class="tm-grid-2">${chart}${chart}</div>`;
     case "vd":
       return `${metrics}${table(6)}`;
+    case "api":
+      return `${metrics}${table(10)}`;
     default:
       return loadingHtml();
   }
@@ -743,6 +746,7 @@ async function showScreen() {
       case "bh": await renderBatteryHealth(); break;
       case "pr": await renderPredictions(); break;
       case "vd": await renderVampireDrain(); break;
+      case "api": await renderApiUsage(); break;
     }
     state.renderedScreen = state.screen;
     state.lastSync = Date.now();
@@ -820,25 +824,6 @@ function budgetForecastNote(b, compact) {
     : `<div class="tm-stat-note" style="${warn ? "color:var(--warn);" : ""}">${esc(text)}</div>`;
 }
 
-/** Tesla API spend card: month-to-date vs the free-tier poll cap, with a bar + month-end forecast. */
-function budgetCard(b) {
-  if (!b || typeof b !== "object") return "";
-  const pct = b.poll_budget_usd > 0 ? Math.min(100, (b.spent_usd / b.poll_budget_usd) * 100) : 0;
-  const atRisk = !b.poll_allowed || b.forecast?.projected_over_budget === true || b.forecast?.budget_exhausted_in_days != null;
-  const color = atRisk ? "var(--warn)" : "var(--good)";
-  const note = !b.poll_allowed ? "polling paused — resumes on the 1st" : "of free-tier cap · never charged";
-  return `
-    <div class="tm-card tm-card-pad-metric">
-      <div class="tm-stat-label">Tesla API spend · ${esc(b.month || "")}</div>
-      <div class="tm-stat-value">$${fmt2(b.spent_usd)} <span class="tm-stat-unit">/ $${fmt0(b.poll_budget_usd)}</span></div>
-      <div style="height:5px;border-radius:999px;background:var(--chip);margin-top:8px;position:relative;overflow:hidden;">
-        <div style="position:absolute;inset:0 auto 0 0;width:${pct.toFixed(1)}%;background:${color};border-radius:999px;"></div>
-      </div>
-      <div class="tm-stat-note">${esc(note)}</div>
-      ${budgetForecastNote(b, false)}
-    </div>`;
-}
-
 /** Compact Tesla API spend for the sidebar (calls + $ spend + a one-line forecast, above the theme toggle). */
 function sideBudgetHtml(b) {
   if (!b || typeof b !== "object") return "";
@@ -864,6 +849,68 @@ async function refreshSideBudget() {
   if (!vin()) return;
   const s = await safe(cached("summary", () => data.summary(vin())), null);
   if (s?.api_budget) updateSideBudget(s.api_budget);
+}
+
+// ---------------------------------------------------------------------------
+// API usage — drill-down behind the sidebar spend widget
+// ---------------------------------------------------------------------------
+
+async function renderApiUsage() {
+  const [summary, log] = await Promise.all([
+    safe(cached("summary", () => data.summary(vin())), null),
+    safe(data.budgetCallLog(30), null),
+  ]);
+  const b = summary?.api_budget ?? null;
+
+  if (!b && !log?.entries?.length) {
+    return setContent(emptyHtml("No API spend recorded yet", "This fills in once the worker starts polling or streaming telemetry for your car."));
+  }
+
+  const f = b?.forecast ?? null;
+  setContent(`
+    <div class="tm-grid-metrics">
+      <div class="tm-card tm-card-pad-metric">
+        <div class="tm-stat-label">Spent this month</div>
+        <div class="tm-stat-value">$${b ? fmt2(b.spent_usd) : "—"} ${b ? `<span class="tm-stat-unit">/ $${fmt0(b.poll_budget_usd)}</span>` : ""}</div>
+        ${b ? budgetForecastNote(b, false) : ""}
+      </div>
+      <div class="tm-card tm-card-pad-metric">
+        <div class="tm-stat-label">Daily rate</div>
+        <div class="tm-stat-value">${f?.daily_rate_usd != null ? "$" + fmt2(f.daily_rate_usd) : "—"} <span class="tm-stat-unit">/ day</span></div>
+      </div>
+      <div class="tm-card tm-card-pad-metric">
+        <div class="tm-stat-label">Projected · month-end</div>
+        <div class="tm-stat-value">${f?.projected_month_usd != null ? "$" + fmt2(f.projected_month_usd) : "—"}</div>
+      </div>
+      <div class="tm-card tm-card-pad-metric">
+        <div class="tm-stat-label">Last ${log?.days ?? 30} days total</div>
+        <div class="tm-stat-value">${log ? "$" + fmt2(log.total_cost_usd) : "—"}</div>
+      </div>
+    </div>
+    ${log?.by_kind?.length ? `
+    <div class="tm-grid-metrics">
+      ${log.by_kind.map((k) => `
+        <div class="tm-card tm-card-pad-metric">
+          <div class="tm-stat-label">${esc(k.label)}</div>
+          <div class="tm-stat-value">$${fmt2(k.cost_usd)}</div>
+          <div class="tm-stat-note">${fmt0(k.count)} call${k.count === 1 ? "" : "s"}</div>
+        </div>`).join("")}
+    </div>` : ""}
+    <div class="tm-card tm-table-wrap">
+      <div style="min-width:560px;">
+        <div class="tm-table-head" style="grid-template-columns:120px 1fr 90px 90px;">
+          <div>Day</div><div>Call kind</div><div class="tm-right">Count</div><div class="tm-right">Cost</div>
+        </div>
+        ${log?.entries?.length ? log.entries.map((e) => `
+          <div class="tm-table-row no-click" style="grid-template-columns:120px 1fr 90px 90px;">
+            <div style="font-size:12.5px;color:var(--sub);">${esc(e.day)}</div>
+            <div>${esc(e.label)}</div>
+            <div class="tm-right tm-mono" style="color:var(--sub);">${fmt0(e.count)}</div>
+            <div class="tm-right tm-mono">$${fmt2(e.cost_usd)}</div>
+          </div>`).join("") : `<div class="tm-empty" style="padding:20px 22px;">No call log entries in this window yet.</div>`}
+      </div>
+    </div>
+  `);
 }
 
 function readTyres(src) {
@@ -1070,7 +1117,6 @@ async function renderOverview() {
         <div class="tm-stat-label">Avg efficiency</div>
         <div class="tm-stat-value">${summary?.avg_efficiency_wh_km != null ? fmt0(summary.avg_efficiency_wh_km) : "—"} <span class="tm-stat-unit">Wh/km</span></div>
       </div>
-      ${budgetCard(summary?.api_budget)}
     </div>
 
     <div class="tm-grid-2">

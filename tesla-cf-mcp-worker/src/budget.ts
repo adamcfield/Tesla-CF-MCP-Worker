@@ -45,8 +45,7 @@ const monthKey = (): string => {
   return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}`;
 };
 
-const dayKey = (): string => {
-  const d = new Date();
+const dayKey = (d: Date = new Date()): string => {
   return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}-${String(d.getUTCDate()).padStart(2, "0")}`;
 };
 
@@ -61,11 +60,23 @@ const dayKey = (): string => {
  * month total in api_spend) purely so getBudgetForecast has a time series to
  * regress against — the month total alone can't say whether spend is
  * accelerating or flat.
+ *
+ * api_spend_calls further splits the daily bucket by billable kind
+ * (vehicle_data/command/wake/signal) — one row per (day, kind), not one row
+ * per HTTP call (telemetry signals alone would be thousands/day; this stays
+ * a handful of rows/day forever) — so a "what are we actually spending on"
+ * breakdown is answerable without a growing raw call log.
  */
 async function ensureSpendTable(env: Env): Promise<void> {
   await env.DB.batch([
     env.DB.prepare(`CREATE TABLE IF NOT EXISTS api_spend (month TEXT PRIMARY KEY, micro INTEGER NOT NULL)`),
     env.DB.prepare(`CREATE TABLE IF NOT EXISTS api_spend_daily (day TEXT PRIMARY KEY, micro INTEGER NOT NULL)`),
+    env.DB.prepare(
+      `CREATE TABLE IF NOT EXISTS api_spend_calls (
+         day TEXT NOT NULL, kind TEXT NOT NULL, count INTEGER NOT NULL, micro INTEGER NOT NULL,
+         PRIMARY KEY (day, kind)
+       )`,
+    ),
   ]);
 }
 
@@ -82,6 +93,10 @@ export async function recordSpend(env: Env, kind: BillableKind, count = 1): Prom
         `INSERT INTO api_spend_daily (day, micro) VALUES (?1, ?2)
          ON CONFLICT(day) DO UPDATE SET micro = micro + excluded.micro`,
       ).bind(dayKey(), micro),
+      env.DB.prepare(
+        `INSERT INTO api_spend_calls (day, kind, count, micro) VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(day, kind) DO UPDATE SET count = count + excluded.count, micro = micro + excluded.micro`,
+      ).bind(dayKey(), kind, count, micro),
     ]);
   } catch {
     // Accounting must never break the actual operation.
@@ -176,6 +191,71 @@ export async function getBudgetStatus(env: Env): Promise<BudgetStatus> {
     hard_ceiling_usd: HARD_CEILING / 1_000_000,
     poll_allowed: spent < pollBudget,
     commands_allowed: spent < HARD_CEILING,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Call log — per-day/per-kind spend breakdown for the "what are we spending
+// on" drill-down (the sidebar widget only shows the running total).
+// ---------------------------------------------------------------------------
+
+const KIND_LABEL: Record<BillableKind, string> = {
+  vehicle_data: "Vehicle data read",
+  command: "Command",
+  wake: "Wake",
+  signal: "Telemetry signal",
+};
+
+export interface BudgetCallLogEntry {
+  day: string;
+  kind: BillableKind;
+  label: string;
+  count: number;
+  cost_usd: number;
+}
+
+export interface BudgetCallLog {
+  days: number;
+  entries: BudgetCallLogEntry[]; // most recent day first
+  by_kind: { kind: BillableKind; label: string; count: number; cost_usd: number }[];
+  total_cost_usd: number;
+}
+
+/** Per-day/per-kind spend breakdown over the trailing `days` — how the running total was actually earned. */
+export async function getBudgetCallLog(env: Env, days = 30): Promise<BudgetCallLog> {
+  await ensureSpendTable(env);
+  const sinceDay = dayKey(new Date(Date.now() - days * 86400_000));
+  const rs = await env.DB.prepare(
+    `SELECT day, kind, count, micro FROM api_spend_calls WHERE day >= ?1 ORDER BY day DESC, micro DESC`,
+  )
+    .bind(sinceDay)
+    .all<{ day: string; kind: BillableKind; count: number; micro: number }>();
+  const rows = rs.results ?? [];
+
+  const entries = rows.map((r) => ({
+    day: r.day,
+    kind: r.kind,
+    label: KIND_LABEL[r.kind] ?? r.kind,
+    count: r.count,
+    cost_usd: Math.round((r.micro / 10_000)) / 100,
+  }));
+
+  const byKindMicro = new Map<BillableKind, { count: number; micro: number }>();
+  for (const r of rows) {
+    const acc = byKindMicro.get(r.kind) ?? { count: 0, micro: 0 };
+    acc.count += r.count;
+    acc.micro += r.micro;
+    byKindMicro.set(r.kind, acc);
+  }
+  const by_kind = [...byKindMicro.entries()]
+    .map(([kind, acc]) => ({ kind, label: KIND_LABEL[kind] ?? kind, count: acc.count, cost_usd: Math.round((acc.micro / 10_000)) / 100 }))
+    .sort((a, b) => b.cost_usd - a.cost_usd);
+
+  return {
+    days,
+    entries,
+    by_kind,
+    total_cost_usd: Math.round((rows.reduce((s, r) => s + r.micro, 0) / 10_000)) / 100,
   };
 }
 

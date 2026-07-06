@@ -49,7 +49,7 @@ import {
   unauthorized,
 } from "./auth";
 import { askTessa } from "./ai";
-import { getBudgetStatus } from "./budget";
+import { getBudgetStatus, getBudgetCallLog } from "./budget";
 import { verifyDriveCertificate } from "./certificate";
 import { exportChargesCsv, exportDriveGpx, exportDrivesCsv } from "./export";
 import { getBatteryForecast, predictRange } from "./forecast";
@@ -230,6 +230,7 @@ async function handleData(url: URL, env: Env): Promise<Response> {
 
   // Routes keyed by id / session_id (no vin needed).
   if (p === "/data/locations") return json(await listLocations(env));
+  if (p === "/data/budget-calls") return json(await getBudgetCallLog(env, numParam("days", 30)));
   if (p === "/data/alerts") {
     // Recent alert-log entries incl. sentinel anomaly + ai_brief firings. vin optional.
     return json(await listAlerts(env, q.get("vin") ?? undefined, numParam("limit", 50)));
