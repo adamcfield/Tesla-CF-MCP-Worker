@@ -161,15 +161,23 @@ To point at a different worker deployment: `http://localhost:8787/?origin=https:
 
 ## Deploying (Cloudflare Pages)
 
+Deploys are automatic: this Pages project is connected to this repo via
+Cloudflare's Git integration, scoped to the `tesla-dashboard/` root
+directory (so a worker-only or bridge-only commit elsewhere in the monorepo
+doesn't trigger a rebuild here). No build command — it's a zero-build-step
+static site, so every push to `main` just re-uploads the folder as-is; other
+branches get their own preview `*.pages.dev` URL.
+
+To deploy manually instead:
+
 ```sh
 cd tesla-dashboard
 npx wrangler pages deploy . --project-name=tesla-dashboard
 ```
 
-First run creates the Pages project and prints a `*.pages.dev` URL. Re-run
-the same command to redeploy after edits — no `wrangler.toml` needed for a
-plain static site. Add a custom domain later from the Cloudflare dashboard
-if you don't want `pages.dev` in the URL.
+First run creates the Pages project and prints a `*.pages.dev` URL. Add a
+custom domain later from the Cloudflare dashboard if you don't want
+`pages.dev` in the URL.
 
 ## Security note
 

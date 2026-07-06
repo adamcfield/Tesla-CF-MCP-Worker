@@ -108,6 +108,21 @@ it has been paired with. On a phone that has the Tesla app:
 If you skip this, command tools fail with a clear "virtual key not paired"
 error containing this link.
 
+## Deployment
+
+Deploys are automatic: this Worker is connected to this repo via Cloudflare's
+native **Workers Builds** Git integration (Workers & Pages → this worker →
+Settings → Builds), scoped to the `tesla-cf-mcp-worker/` root directory so
+changes elsewhere in the monorepo don't trigger a rebuild. Every push to
+`main` runs the build command (tests + typecheck) and, if it passes, deploys
+via `npx wrangler deploy`; other branches build/typecheck for validation
+(via `npx wrangler versions upload`) without touching production. Secrets and
+the D1/KV bindings live on the Cloudflare side and in `wrangler.toml`
+respectively — the Git integration doesn't need to (and doesn't) touch them.
+
+To deploy manually instead (e.g. from a machine without Git-integration
+access), `npm run deploy` still works exactly as before.
+
 ## Connecting clients
 
 **Claude Code**
