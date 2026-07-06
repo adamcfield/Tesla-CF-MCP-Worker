@@ -652,6 +652,20 @@ const TOOLS: Tool[] = [
     handler: (env, a) => tracking.getClimateHabits(env, a.vin, a.days ?? 90),
   },
   {
+    name: "get_sentry_log",
+    description:
+      "Sentry Mode event log: armed hours and, when the account streams the full SentryModeState enum " +
+      "(Idle/Aware/Panic, not just on/off), actual trigger events (someone approaching, an impact) with " +
+      "location — flags enum_available so you know whether trigger detection is even possible on this account. " +
+      "Free — reads logged data.",
+    inputSchema: {
+      type: "object",
+      properties: { ...vinProp, days: { type: "number", default: 30 } },
+      required: ["vin"],
+    },
+    handler: (env, a) => tracking.getSentryLog(env, a.vin, a.days ?? 30),
+  },
+  {
     name: "get_tire_pressures",
     description:
       "Per-wheel TPMS history (bar): latest reading, time series, and a bar/week trend that catches slow leaks " +
@@ -914,6 +928,7 @@ const READ_TOOLS = new Set([
   "get_charge_curve",
   "get_battery_degradation",
   "get_vampire_drain",
+  "get_sentry_log",
   "get_state_timeline",
   "get_monthly_report",
   "get_efficiency_by_temp",

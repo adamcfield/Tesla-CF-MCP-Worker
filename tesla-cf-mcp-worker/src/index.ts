@@ -72,6 +72,7 @@ import {
   getChargeSessions,
   getChargeTaperCurve,
   getClimateHabits,
+  getSentryLog,
   getDrive,
   getDriveCertificate,
   getDriverScores,
@@ -298,6 +299,8 @@ async function handleData(url: URL, env: Env): Promise<Response> {
       return json(await getClimateHabits(env, vin, numParam("days", 90)));
     case "/data/media-by-driver":
       return json(await getMediaStatsByDriver(env, vin, numParam("days", 90)));
+    case "/data/sentry-log":
+      return json(await getSentryLog(env, vin, numParam("days", 30)));
     case "/data/similar-drives": {
       const nOpt = (name: string): number | undefined => {
         const raw = q.get(name);

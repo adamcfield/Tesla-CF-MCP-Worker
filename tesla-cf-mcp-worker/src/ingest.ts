@@ -306,6 +306,23 @@ function normalizeChargingState(v: unknown): unknown {
   return v;
 }
 
+/**
+ * SentryMode arrives as either a plain boolean (REST `vehicle_state.sentry_mode`,
+ * or the older Fleet Telemetry `BooleanValue` framing) or the richer
+ * `SentryModeState` enum (prefixed string, e.g. "SentryModeStateAware") once a
+ * vehicle's telemetry config streams it. Normalize both into one lowercase
+ * vocabulary — "off" | "idle" | "armed" | "aware" | "panic" — so downstream
+ * code (getSentryLog) can read either shape uniformly.
+ */
+function normalizeSentryState(v: unknown): unknown {
+  if (typeof v === "boolean") return v ? "armed" : "off";
+  if (typeof v === "string") {
+    const stripped = v.startsWith("SentryModeState") ? v.slice("SentryModeState".length) : v;
+    return stripped.toLowerCase();
+  }
+  return v;
+}
+
 function coerce(v: unknown): unknown {
   if (typeof v !== "string") return v;
   if (v === "true") return true;
@@ -380,6 +397,7 @@ export async function applyIngest(env: Env, parsed: ParsedIngest): Promise<Lates
     let value = rawValue;
     const canonical = FIELD_MAP[field] ?? field.toLowerCase();
     if (canonical === "charging_state") value = normalizeChargingState(value);
+    if (canonical === "sentry") value = normalizeSentryState(value);
     value = toMetric(canonical, value);
 
     if (canonical === "location" && value && typeof value === "object") {
