@@ -164,6 +164,12 @@ export const data = {
   media: (vin, days) => getJson("/data/media", { vin, days }),
   /** Same, broken down per assigned driver. New endpoint — may 404. */
   mediaByDriver: (vin, days) => getJson("/data/media-by-driver", { vin, days }),
+  /** Lifetime charging power-delivery curve, binned by 5% SoC. New endpoint — may 404. */
+  chargeTaperCurve: (vin) => getJson("/data/charge-taper", { vin }),
+  /** ADAS feature adoption (AEB disabled %, blind-spot chime count, etc). New endpoint — may 404. */
+  safetyFeatures: (vin, days) => getJson("/data/safety-features", { vin, days }),
+  /** Climate/comfort habits (seat heater/cooling per side, auto-climate %). New endpoint — may 404. */
+  climateHabits: (vin, days) => getJson("/data/climate-habits", { vin, days }),
   /**
    * Range prediction. With no distance_km, returns {model, ready} so the screen
    * can show model quality + a form; with params, returns the prediction. New endpoint — may 404.

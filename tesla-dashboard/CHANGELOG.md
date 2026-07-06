@@ -9,6 +9,32 @@ feature or screen, the **patch** version for fixes/tweaks/copy changes, and the
 configured. See `CLAUDE.md` at the repo root for the policy on keeping this file
 and `APP_VERSION` (in `app.js`) in sync.
 
+## 1.2.0 — 2026-07-06
+
+A shortlist from a user-supplied "100 telemetry ideas" brainstorm — picked
+for being technically sound, non-redundant with existing features, and
+buildable from data already flowing (see the earlier field-mapping pass in
+1.1.0). Skipped the ideas that relied on the deliberately-excluded per-motor
+powertrain fields, duplicated existing screens, or were really automation
+actions rather than analytics (that's a `rules.ts` project, not a dashboard one).
+
+- **Charging stats**: new "Charging taper curve" chart — lifetime average/peak
+  charging power binned by 5% state-of-charge, across every session ever
+  logged (distinct from the per-session charge-curve chart already on the
+  charge-detail page). New `GET /data/charge-taper` endpoint.
+- **Statistics**: tyre pressure card now shows long-term side-to-side/front-
+  rear balance (paired same-timestamp samples, not just the latest reading)
+  and flags a persistent >0.15 bar gap as a possible alignment/wear signal.
+  New "Safety feature usage" card (AEB-disabled %, blind-spot chime
+  activations, lane-departure/forward-collision-warning settings) and new
+  "Climate habits" card (auto-climate %, seat-heater/cooling level and
+  left/right divergence per side). New `GET /data/safety-features` and
+  `GET /data/climate-habits` endpoints.
+- **Media**: new "Traffic mood" section — top tracks playing during heavy
+  traffic (10+ min delay) vs. clear roads, when navigation-delay telemetry is
+  available.
+- New MCP tools: `get_charge_taper_curve`, `get_safety_feature_stats`, `get_climate_habits`.
+
 ## 1.1.0 — 2026-07-06
 
 UI consistency/UX pass, plus several new features spanning the dashboard and

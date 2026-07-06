@@ -1515,6 +1515,50 @@ export async function getMediaStatsByDriver(env: Env, vin: string, days = 90): P
   };
 }
 
+/**
+ * Idea #2/#95: what's playing when traffic gets bad vs. when the road is
+ * clear. Each track-start is paired with the nearest-preceding
+ * nav_traffic_delay_min reading (a plain "as of that moment" lookup, same
+ * idea as mediaTrackChanges' artist pairing) and bucketed heavy (>10 min
+ * delay) vs light (<=5 min). Returns null (not an empty result) when
+ * nav_traffic_delay_min has never been streamed, so the caller can omit the
+ * section entirely rather than show two empty lists.
+ */
+async function mediaTrafficMood(env: Env, vin: string, sinceTs: number): Promise<{ heavy: { title: string; plays: number }[]; light: { title: string; plays: number }[] } | null> {
+  const hasTraffic = await env.DB.prepare(
+    `SELECT 1 FROM telemetry_events WHERE vin = ?1 AND field = 'nav_traffic_delay_min' AND ts >= ?2 LIMIT 1`,
+  ).bind(vin, sinceTs).first();
+  if (!hasTraffic) return null;
+
+  const rs = await env.DB.prepare(
+    `WITH raw AS (
+       SELECT ts, value_text AS v, LAG(value_text) OVER (ORDER BY ts) AS prev_v
+       FROM telemetry_events
+       WHERE vin = ?1 AND field = 'media_title' AND ts >= ?2 AND value_text IS NOT NULL AND value_text != ''
+     ),
+     starts AS (
+       SELECT ts, v FROM raw WHERE prev_v IS NULL OR prev_v != v
+     )
+     SELECT s.v AS title,
+       (SELECT t.value_num FROM telemetry_events t
+        WHERE t.vin = ?1 AND t.field = 'nav_traffic_delay_min' AND t.ts <= s.ts
+        ORDER BY t.ts DESC LIMIT 1) AS delay
+     FROM starts s`,
+  )
+    .bind(vin, sinceTs)
+    .all<{ title: string; delay: number | null }>();
+
+  const counts = { heavy: new Map<string, number>(), light: new Map<string, number>() };
+  for (const r of rs.results ?? []) {
+    if (r.delay == null) continue;
+    const bucket = r.delay > 10 ? counts.heavy : r.delay <= 5 ? counts.light : null;
+    if (bucket) bucket.set(r.title, (bucket.get(r.title) ?? 0) + 1);
+  }
+  const top = (m: Map<string, number>) =>
+    [...m.entries()].sort((a, b) => b[1] - a[1]).slice(0, 5).map(([title, plays]) => ({ title, plays }));
+  return { heavy: top(counts.heavy), light: top(counts.light) };
+}
+
 /** "Most played" leaderboards (tracks/artists/sources/stations) over the trailing `days`. */
 export async function getMediaStats(env: Env, vin: string, days = 90): Promise<unknown> {
   await ensureSchema(env);
@@ -1550,6 +1594,7 @@ export async function getMediaStats(env: Env, vin: string, days = 90): Promise<u
     top_artists: top(artists, "artist", 15),
     top_sources: top(sources, "source", 10),
     top_stations: top(stations, "station", 10),
+    traffic_mood: await mediaTrafficMood(env, vin, sinceTs),
   };
 }
 
@@ -1613,6 +1658,191 @@ export async function getTirePressures(env: Env, vin: string, days = 30): Promis
     trend_bar_per_week: Object.keys(trend).length === 4
       ? { fl: trend.fl, fr: trend.fr, rl: trend.rl, rr: trend.rr }
       : null,
+    balance: await tireBalance(env, vin, since),
+  };
+}
+
+/**
+ * Long-term side-to-side/front-to-rear pressure balance: pairs same-timestamp
+ * samples (the 4 TPMS values normally arrive together in one poll/telemetry
+ * batch) and averages the delta, rather than just comparing the latest
+ * reading — a single stale sample shouldn't read as "asymmetric wear".
+ * `asymmetric: true` flags a persistent >0.15 bar gap on any axis, which
+ * over thousands of miles is a real early alignment/wear signal (idea #67).
+ */
+async function tireBalance(env: Env, vin: string, since: number): Promise<unknown> {
+  const rs = await env.DB.prepare(
+    `SELECT AVG(fl.value_num - fr.value_num) AS fl_fr, AVG(rl.value_num - rr.value_num) AS rl_rr,
+            AVG(fl.value_num - rl.value_num) AS fl_rl, AVG(fr.value_num - rr.value_num) AS fr_rr,
+            COUNT(*) AS n
+     FROM (SELECT ts, value_num FROM telemetry_events WHERE vin = ?1 AND field = 'tpms_fl' AND ts >= ?2 AND value_num IS NOT NULL) fl
+     JOIN (SELECT ts, value_num FROM telemetry_events WHERE vin = ?1 AND field = 'tpms_fr' AND ts >= ?2 AND value_num IS NOT NULL) fr ON fr.ts = fl.ts
+     JOIN (SELECT ts, value_num FROM telemetry_events WHERE vin = ?1 AND field = 'tpms_rl' AND ts >= ?2 AND value_num IS NOT NULL) rl ON rl.ts = fl.ts
+     JOIN (SELECT ts, value_num FROM telemetry_events WHERE vin = ?1 AND field = 'tpms_rr' AND ts >= ?2 AND value_num IS NOT NULL) rr ON rr.ts = fl.ts`,
+  )
+    .bind(vin, since)
+    .first<{ fl_fr: number | null; rl_rr: number | null; fl_rl: number | null; fr_rr: number | null; n: number }>();
+  if (!rs || !rs.n) return null;
+  const deltas = { fl_fr: rs.fl_fr, rl_rr: rs.rl_rr, fl_rl: rs.fl_rl, fr_rr: rs.fr_rr };
+  const maxAbs = Math.max(...Object.values(deltas).map((v) => Math.abs(v ?? 0)));
+  return {
+    paired_samples: rs.n,
+    fl_fr_bar: round(rs.fl_fr ?? 0, 3),
+    rl_rr_bar: round(rs.rl_rr ?? 0, 3),
+    fl_rl_bar: round(rs.fl_rl ?? 0, 3),
+    fr_rr_bar: round(rs.fr_rr ?? 0, 3),
+    asymmetric: maxAbs > 0.15,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Derived: lifetime charging taper curve (idea #51 — how charging power
+// actually falls off as SoC rises, from every session ever logged, not just
+// one at a time like the per-session charge-curve chart already shows).
+// ---------------------------------------------------------------------------
+
+export async function getChargeTaperCurve(env: Env, vin: string): Promise<unknown> {
+  await ensureSchema(env);
+  const rs = await env.DB.prepare(
+    `SELECT CAST(FLOOR(soc / 5) * 5 AS INTEGER) AS soc_bin,
+            AVG(charger_power) AS avg_power_kw, MAX(charger_power) AS max_power_kw, COUNT(*) AS samples
+     FROM charges
+     WHERE vin = ?1 AND soc IS NOT NULL AND charger_power IS NOT NULL AND charger_power > 0
+     GROUP BY soc_bin ORDER BY soc_bin ASC`,
+  )
+    .bind(vin)
+    .all<{ soc_bin: number; avg_power_kw: number; max_power_kw: number; samples: number }>();
+  const bins = rs.results ?? [];
+  return {
+    vin,
+    bins: bins.map((b) => ({
+      soc_min: b.soc_bin,
+      soc_max: b.soc_bin + 5,
+      avg_power_kw: round(b.avg_power_kw, 1),
+      max_power_kw: round(b.max_power_kw, 1),
+      samples: b.samples,
+    })),
+    note: bins.length < 4 ? "Needs more charge sessions across a range of SoC to draw a full taper curve." : null,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Small EAV aggregate helpers shared by the safety/climate derivations below.
+// ---------------------------------------------------------------------------
+
+async function boolFieldFraction(env: Env, vin: string, field: string, sinceTs: number): Promise<{ frac_on: number | null; samples: number }> {
+  const rs = await env.DB.prepare(
+    `SELECT AVG(value_num) AS frac_on, COUNT(*) AS n FROM telemetry_events WHERE vin = ?1 AND field = ?2 AND ts >= ?3 AND value_num IS NOT NULL`,
+  )
+    .bind(vin, field, sinceTs)
+    .first<{ frac_on: number | null; n: number }>();
+  return { frac_on: rs?.frac_on ?? null, samples: rs?.n ?? 0 };
+}
+
+async function avgFieldValue(env: Env, vin: string, field: string, sinceTs: number): Promise<{ avg: number | null; samples: number }> {
+  const rs = await env.DB.prepare(
+    `SELECT AVG(value_num) AS avg, COUNT(*) AS n FROM telemetry_events WHERE vin = ?1 AND field = ?2 AND ts >= ?3 AND value_num IS NOT NULL`,
+  )
+    .bind(vin, field, sinceTs)
+    .first<{ avg: number | null; n: number }>();
+  return { avg: rs?.avg ?? null, samples: rs?.n ?? 0 };
+}
+
+/** Counts 0→1 transitions of a boolean field — "how many times did this fire", not "how long was it on". */
+async function countActivations(env: Env, vin: string, field: string, sinceTs: number): Promise<number> {
+  const rs = await env.DB.prepare(
+    `WITH raw AS (
+       SELECT ts, value_num AS v, LAG(value_num) OVER (ORDER BY ts) AS prev
+       FROM telemetry_events WHERE vin = ?1 AND field = ?2 AND ts >= ?3 AND value_num IS NOT NULL
+     )
+     SELECT COUNT(*) AS n FROM raw WHERE v = 1 AND (prev IS NULL OR prev = 0)`,
+  )
+    .bind(vin, field, sinceTs)
+    .first<{ n: number }>();
+  return rs?.n ?? 0;
+}
+
+async function mostCommonEnumValue(env: Env, vin: string, field: string, sinceTs: number): Promise<string | null> {
+  const rs = await env.DB.prepare(
+    `SELECT value_text AS v FROM telemetry_events
+     WHERE vin = ?1 AND field = ?2 AND ts >= ?3 AND value_text IS NOT NULL AND value_text != ''
+     GROUP BY value_text ORDER BY COUNT(*) DESC LIMIT 1`,
+  )
+    .bind(vin, field, sinceTs)
+    .first<{ v: string }>();
+  return rs?.v ?? null;
+}
+
+// ---------------------------------------------------------------------------
+// Derived: safety/ADAS feature adoption (idea #62/#70) — how much your
+// driving style interacts with the car's own safety systems.
+// ---------------------------------------------------------------------------
+
+export async function getSafetyFeatureStats(env: Env, vin: string, days = 90): Promise<unknown> {
+  await ensureSchema(env);
+  const sinceTs = Math.floor(Date.now() / 1000) - days * 86400;
+  const [aeb, blindSpotChimes, laneDeparture, fcwSensitivity] = await Promise.all([
+    boolFieldFraction(env, vin, "aeb_off", sinceTs),
+    countActivations(env, vin, "blind_spot_chime", sinceTs),
+    mostCommonEnumValue(env, vin, "lane_departure", sinceTs),
+    mostCommonEnumValue(env, vin, "fcw_sensitivity", sinceTs),
+  ]);
+  if (!aeb.samples && !blindSpotChimes && !laneDeparture && !fcwSensitivity) {
+    return {
+      vin, days, has_data: false,
+      note: "No ADAS telemetry recorded yet — stream AutomaticEmergencyBrakingOff, BlindSpotCollisionWarningChime, " +
+        "LaneDepartureAvoidance and ForwardCollisionWarning via configure_telemetry.",
+    };
+  }
+  return {
+    vin,
+    days,
+    has_data: true,
+    aeb_disabled_pct: aeb.frac_on != null ? round(aeb.frac_on * 100, 1) : null,
+    aeb_samples: aeb.samples,
+    blind_spot_chime_count: blindSpotChimes,
+    lane_departure_setting: laneDeparture,
+    forward_collision_warning_setting: fcwSensitivity,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Derived: climate/comfort habits (idea #33/#38) — also the same signal
+// suggestDriverForDrive already leans on for auto-assignment, surfaced here
+// as its own human-readable report instead of just an internal fingerprint.
+// ---------------------------------------------------------------------------
+
+export async function getClimateHabits(env: Env, vin: string, days = 90): Promise<unknown> {
+  await ensureSchema(env);
+  const sinceTs = Math.floor(Date.now() / 1000) - days * 86400;
+  const [autoL, autoR, heaterL, heaterR, coolFL, coolFR] = await Promise.all([
+    boolFieldFraction(env, vin, "auto_seat_climate_l", sinceTs),
+    boolFieldFraction(env, vin, "auto_seat_climate_r", sinceTs),
+    avgFieldValue(env, vin, "seat_heater_l", sinceTs),
+    avgFieldValue(env, vin, "seat_heater_r", sinceTs),
+    avgFieldValue(env, vin, "seat_cool_fl", sinceTs),
+    avgFieldValue(env, vin, "seat_cool_fr", sinceTs),
+  ]);
+  const totalSamples = autoL.samples + autoR.samples + heaterL.samples + heaterR.samples + coolFL.samples + coolFR.samples;
+  if (!totalSamples) {
+    return {
+      vin, days, has_data: false,
+      note: "No climate-habit telemetry recorded yet — stream AutoSeatClimateLeft/Right, SeatHeaterLeft/Right " +
+        "and ClimateSeatCoolingFrontLeft/Right via configure_telemetry.",
+    };
+  }
+  return {
+    vin,
+    days,
+    has_data: true,
+    auto_climate_left_pct: autoL.frac_on != null ? round(autoL.frac_on * 100, 0) : null,
+    auto_climate_right_pct: autoR.frac_on != null ? round(autoR.frac_on * 100, 0) : null,
+    avg_seat_heater_left: heaterL.avg != null ? round(heaterL.avg, 1) : null,
+    avg_seat_heater_right: heaterR.avg != null ? round(heaterR.avg, 1) : null,
+    seat_heater_divergence: heaterL.avg != null && heaterR.avg != null ? round(Math.abs(heaterL.avg - heaterR.avg), 2) : null,
+    avg_seat_cool_left: coolFL.avg != null ? round(coolFL.avg, 1) : null,
+    avg_seat_cool_right: coolFR.avg != null ? round(coolFR.avg, 1) : null,
+    seat_cool_divergence: coolFL.avg != null && coolFR.avg != null ? round(Math.abs(coolFL.avg - coolFR.avg), 2) : null,
   };
 }
 

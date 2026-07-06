@@ -5,7 +5,7 @@ import { destroyMaps, renderPointMap, renderRouteMap, renderLifetimeMap, createR
 // Bump on every change to this dashboard (UI, features, or the /data/*
 // endpoints it depends on) and add a matching entry to CHANGELOG.md — see
 // the versioning policy in the repo's CLAUDE.md. Shown in the sidebar footer.
-const APP_VERSION = "1.1.0";
+const APP_VERSION = "1.2.0";
 
 const root = document.getElementById("app");
 let shellBound = false; // guards one-time attach of the root click handler + sync timer
@@ -900,6 +900,7 @@ function tpmsCard(t) {
     return typeof tr === "number" && tr < -0.15;
   };
   const anyWarn = WHEELS.some(([w]) => flag(w));
+  const bal = t?.balance ?? null;
   return `
     <div class="tm-card tm-card-pad-metric">
       <div class="tm-stat-label" style="display:flex;align-items:baseline;">Tyre pressure
@@ -913,6 +914,10 @@ function tpmsCard(t) {
           </div>`).join("")}
       </div>
       <div class="tm-stat-note">${latest?.ts != null ? `as of ${fmtDateTime(latest.ts)}` : "no TPMS samples yet"}</div>
+      ${bal ? `<div class="tm-stat-note" style="${bal.asymmetric ? "color:var(--warn);" : ""}">
+        ${bal.asymmetric ? "Persistent side-to-side gap — " : "Well balanced — "}
+        FL–FR ${bal.fl_fr_bar >= 0 ? "+" : ""}${bal.fl_fr_bar} · RL–RR ${bal.rl_rr_bar >= 0 ? "+" : ""}${bal.rl_rr_bar} bar avg (${bal.paired_samples} samples)
+      </div>` : ""}
     </div>`;
 }
 
@@ -1284,12 +1289,46 @@ function monthlyReportTable(rows) {
     </div>`;
 }
 
+/** ADAS feature adoption (idea #62/#70) — how much your driving interacts with the car's own safety systems. */
+function safetyFeaturesCard(s) {
+  if (!s || s.has_data === false) return "";
+  return `
+    <div class="tm-card tm-card-pad">
+      <div class="tm-card-head"><div class="tm-card-head-title">Safety feature usage</div><div class="tm-card-head-sub">last ${s.days} days</div></div>
+      <div class="tm-grid-half" style="gap:14px;">
+        <div><div class="tm-readout-label">AEB disabled</div><div class="tm-readout-value" style="${s.aeb_disabled_pct > 0 ? "color:var(--warn);" : ""}">${s.aeb_disabled_pct != null ? fmt0(s.aeb_disabled_pct) + "%" : "—"}</div></div>
+        <div><div class="tm-readout-label">Blind-spot chimes</div><div class="tm-readout-value">${fmt0(s.blind_spot_chime_count)}</div></div>
+        <div><div class="tm-readout-label">Lane departure</div><div class="tm-readout-value" style="font-size:14px;">${esc(s.lane_departure_setting || "—")}</div></div>
+        <div><div class="tm-readout-label">Forward collision warning</div><div class="tm-readout-value" style="font-size:14px;">${esc(s.forward_collision_warning_setting || "—")}</div></div>
+      </div>
+    </div>`;
+}
+
+/** Climate/comfort habits (idea #33/#38) — the same signal the driver auto-assign fingerprint uses, as its own report. */
+function climateHabitsCard(c) {
+  if (!c || c.has_data === false) return "";
+  return `
+    <div class="tm-card tm-card-pad">
+      <div class="tm-card-head"><div class="tm-card-head-title">Climate habits</div><div class="tm-card-head-sub">last ${c.days} days</div></div>
+      <div class="tm-grid-half" style="gap:14px;">
+        <div><div class="tm-readout-label">Auto climate · L</div><div class="tm-readout-value">${c.auto_climate_left_pct != null ? fmt0(c.auto_climate_left_pct) + "%" : "—"}</div></div>
+        <div><div class="tm-readout-label">Auto climate · R</div><div class="tm-readout-value">${c.auto_climate_right_pct != null ? fmt0(c.auto_climate_right_pct) + "%" : "—"}</div></div>
+        <div><div class="tm-readout-label">Seat heater · L / R</div><div class="tm-readout-value">${c.avg_seat_heater_left ?? "—"} / ${c.avg_seat_heater_right ?? "—"}</div></div>
+        <div><div class="tm-readout-label">Seat cooling · L / R</div><div class="tm-readout-value">${c.avg_seat_cool_left ?? "—"} / ${c.avg_seat_cool_right ?? "—"}</div></div>
+      </div>
+      ${c.seat_heater_divergence != null && c.seat_heater_divergence >= 1 ? `<div class="tm-stat-note" style="margin-top:12px;">Driver/passenger seat-heater habits diverge by ${c.seat_heater_divergence} levels on average.</div>` : ""}
+    </div>`;
+}
+
 async function renderStatistics() {
-  const [drives, charges, effTemp, monthlyRes] = await Promise.all([
+  const [drives, charges, effTemp, monthlyRes, tires, safetyFeatures, climateHabits] = await Promise.all([
     safe(cached("all_drives", () => data.drives(vin(), 2000)), []),
     safe(cached("all_charges", () => data.chargeSessions(vin(), 2000)), []),
     safe(cached("eff_temp", () => data.efficiencyByTemp(vin())), null),
     safe(cached("monthly", () => data.monthly(vin(), 12)), null),
+    safe(cached("tires_90", () => data.tires(vin(), 90)), null), // distinct key from Overview's 30-day "tires" cache
+    safe(cached("safety_features", () => data.safetyFeatures(vin(), 90)), null),
+    safe(cached("climate_habits", () => data.climateHabits(vin(), 90)), null),
   ]);
   const monthlyRows = monthlyRes?.months || []; // most recent first (server contract)
 
@@ -1358,6 +1397,8 @@ async function renderStatistics() {
           </div>`).join("")}
       </div>
     </div>`}
+    ${tires?.balance || tires?.latest ? `<div class="tm-grid-3col">${tpmsCard(tires)}</div>` : ""}
+    ${(safetyFeatures?.has_data || climateHabits?.has_data) ? `<div class="tm-grid-2">${safetyFeaturesCard(safetyFeatures)}${climateHabitsCard(climateHabits)}</div>` : ""}
   `);
 }
 
@@ -2115,6 +2156,14 @@ async function renderMedia() {
       <div class="tm-card-head"><div class="tm-card-head-title">Top stations</div></div>
       ${mediaListHtml(stats.top_stations, "station")}
     </div>` : ""}
+    ${stats.traffic_mood && (stats.traffic_mood.heavy.length || stats.traffic_mood.light.length) ? `
+    <div class="tm-card tm-card-pad">
+      <div class="tm-card-head"><div class="tm-card-head-title">Traffic mood</div><div class="tm-card-head-sub">what's playing when traffic bites vs. when the road's clear</div></div>
+      <div class="tm-grid-2">
+        <div><div class="tm-stat-label" style="margin-bottom:8px;color:var(--warn);">Heavy traffic (10+ min delay)</div>${mediaListHtml(stats.traffic_mood.heavy, "title")}</div>
+        <div><div class="tm-stat-label" style="margin-bottom:8px;color:var(--good);">Clear roads (≤5 min delay)</div>${mediaListHtml(stats.traffic_mood.light, "title")}</div>
+      </div>
+    </div>` : ""}
     <div id="tm-media-by-driver"></div>
   `);
 
@@ -2238,9 +2287,32 @@ async function renderChargeDetail() {
 // Charging stats
 // ---------------------------------------------------------------------------
 
+/** Lifetime charging power-delivery curve (avg/peak kW per 5% SoC bin) — idea #51: the taper profile across every session, not just one. */
+function chargeTaperCard(taper) {
+  const bins = taper?.bins || [];
+  const pts = bins.map((b) => [(b.soc_min + b.soc_max) / 2, b.avg_power_kw]);
+  return `
+    <div class="tm-card tm-card-pad">
+      <div class="tm-card-head">
+        <div class="tm-card-head-title">Charging taper curve</div>
+        <div class="tm-card-head-sub">lifetime avg power by state of charge</div>
+      </div>
+      ${pts.length >= 2 ? svgLineChart({
+        series: [{
+          points: pts,
+          markers: true,
+          titles: bins.map((b) => `${b.soc_min}–${b.soc_max}% · avg ${fmt0(b.avg_power_kw)} kW · peak ${fmt0(b.max_power_kw)} kW · ${b.samples} samples`),
+        }],
+        yTicks: autoTicks(pts.map((p) => p[1]), 4),
+        xTicks: pts.map((p) => ({ value: p[0], label: `${fmt0(p[0])}%` })),
+      }) : miniEmptyHtml(taper?.note || "Not enough charge sessions yet to draw a taper curve.")}
+    </div>`;
+}
+
 async function renderChargingStats() {
   const charges = await cached("all_charges", () => data.chargeSessions(vin(), 2000));
   const locations = await safe(cached("locations", () => data.locations()), []);
+  const taper = await safe(cached("charge_taper", () => data.chargeTaperCurve(vin())), null);
   const complete = charges.filter((c) => c.status === "complete" || c.energy_added_kwh != null);
 
   if (!complete.length) return setContent(emptyHtml("No completed charge sessions yet", "Lifetime charging stats will appear here once sessions have been logged."));
@@ -2318,6 +2390,7 @@ async function renderChargingStats() {
           </div>`).join("")}
       </div>
     </div>
+    ${chargeTaperCard(taper)}
   `);
 }
 

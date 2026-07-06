@@ -617,6 +617,41 @@ const TOOLS: Tool[] = [
     handler: (env, a) => tracking.getMediaStatsByDriver(env, a.vin, a.days ?? 90),
   },
   {
+    name: "get_charge_taper_curve",
+    description:
+      "Lifetime charging power-delivery curve: average/peak kW binned by 5% state-of-charge, across every " +
+      "logged charge session — the taper profile your pack actually exhibits, not just one session's chart. " +
+      "Free — reads logged data.",
+    inputSchema: vinSchema,
+    handler: (env, a) => tracking.getChargeTaperCurve(env, a.vin),
+  },
+  {
+    name: "get_safety_feature_stats",
+    description:
+      "ADAS feature adoption: % of samples with automatic emergency braking disabled, blind-spot chime " +
+      "activation count, and the most commonly selected lane-departure-avoidance / forward-collision-warning " +
+      "settings. Needs those fields streamed via configure_telemetry. Free — reads logged data.",
+    inputSchema: {
+      type: "object",
+      properties: { ...vinProp, days: { type: "number", default: 90 } },
+      required: ["vin"],
+    },
+    handler: (env, a) => tracking.getSafetyFeatureStats(env, a.vin, a.days ?? 90),
+  },
+  {
+    name: "get_climate_habits",
+    description:
+      "Climate/comfort habits: how often each side's seat climate runs on auto vs manual, average seat-heater/" +
+      "seat-cooling level per side, and the left/right divergence — the same signal the driver auto-assignment " +
+      "classifier already uses, surfaced as its own report. Free — reads logged data.",
+    inputSchema: {
+      type: "object",
+      properties: { ...vinProp, days: { type: "number", default: 90 } },
+      required: ["vin"],
+    },
+    handler: (env, a) => tracking.getClimateHabits(env, a.vin, a.days ?? 90),
+  },
+  {
     name: "get_tire_pressures",
     description:
       "Per-wheel TPMS history (bar): latest reading, time series, and a bar/week trend that catches slow leaks " +
@@ -884,6 +919,9 @@ const READ_TOOLS = new Set([
   "get_efficiency_by_temp",
   "get_media_stats",
   "get_media_stats_by_driver",
+  "get_charge_taper_curve",
+  "get_safety_feature_stats",
+  "get_climate_habits",
   "get_tire_pressures",
   "get_suggested_locations",
   "list_drivers",

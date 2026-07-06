@@ -70,6 +70,8 @@ import {
   getBatteryDegradation,
   getChargeCurve,
   getChargeSessions,
+  getChargeTaperCurve,
+  getClimateHabits,
   getDrive,
   getDriveCertificate,
   getDriverScores,
@@ -80,6 +82,7 @@ import {
   getMediaStats,
   getMediaStatsByDriver,
   getMonthlyReport,
+  getSafetyFeatureStats,
   getStateTimeline,
   getSuggestedLocations,
   getTirePressures,
@@ -287,6 +290,12 @@ async function handleData(url: URL, env: Env): Promise<Response> {
       return json(await getSuggestedLocations(env, vin));
     case "/data/media":
       return json(await getMediaStats(env, vin, numParam("days", 90)));
+    case "/data/charge-taper":
+      return json(await getChargeTaperCurve(env, vin));
+    case "/data/safety-features":
+      return json(await getSafetyFeatureStats(env, vin, numParam("days", 90)));
+    case "/data/climate-habits":
+      return json(await getClimateHabits(env, vin, numParam("days", 90)));
     case "/data/media-by-driver":
       return json(await getMediaStatsByDriver(env, vin, numParam("days", 90)));
     case "/data/similar-drives": {
