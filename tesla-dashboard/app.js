@@ -1,6 +1,6 @@
 import { auth, data, mcp, verifyToken, exportUrl, ApiError } from "./api.js";
-import { svgLineChart, svgBarChart, svgDonut, svgSplitBar } from "./charts.js";
-import { destroyMaps, renderPointMap, renderRouteMap, renderLifetimeMap, attachReplay, invalidateMaps } from "./map.js";
+import { svgLineChart, svgBarChart, svgDonut, svgSplitBar, svgDriveChart } from "./charts.js";
+import { destroyMaps, renderPointMap, renderRouteMap, renderLifetimeMap, createReplayMarker, invalidateMaps } from "./map.js";
 
 const root = document.getElementById("app");
 let shellBound = false; // guards one-time attach of the root click handler + sync timer
@@ -125,6 +125,40 @@ function fmtDurationMin(min) {
 }
 function fmtDurationSec(sec) {
   return fmtDurationMin(sec == null ? null : sec / 60);
+}
+/** m:ss / h:mm:ss clock for the drive-replay playhead readout. */
+function fmtClock(sec) {
+  sec = Math.max(0, Math.round(sec || 0));
+  const h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60), s = sec % 60;
+  const mm = h ? String(m).padStart(2, "0") : String(m);
+  return (h ? `${h}:` : "") + `${mm}:${String(s).padStart(2, "0")}`;
+}
+/** Great-circle distance (km) between two {lat, lon} points — for drive-replay odometry. */
+function haversineKm(a, b) {
+  const R = 6371, toRad = (x) => (x * Math.PI) / 180;
+  const dLat = toRad(b.lat - a.lat), dLon = toRad(b.lon - a.lon);
+  const s = Math.sin(dLat / 2) ** 2 + Math.cos(toRad(a.lat)) * Math.cos(toRad(b.lat)) * Math.sin(dLon / 2) ** 2;
+  return 2 * R * Math.asin(Math.min(1, Math.sqrt(s)));
+}
+/** Linear interpolation over a sorted [ts, value] series (binary search). */
+function interpAt(series, ts) {
+  if (!series || !series.length) return null;
+  if (ts <= series[0][0]) return series[0][1];
+  if (ts >= series[series.length - 1][0]) return series[series.length - 1][1];
+  let lo = 0, hi = series.length - 1;
+  while (hi - lo > 1) { const m = (lo + hi) >> 1; if (series[m][0] <= ts) lo = m; else hi = m; }
+  const a = series[lo], b = series[hi], f = (ts - a[0]) / ((b[0] - a[0]) || 1);
+  return a[1] + (b[1] - a[1]) * f;
+}
+/** Interpolate a {lat, lon} position over a sorted-by-ts posPts array. */
+function interpPos(posPts, ts) {
+  if (!posPts.length) return null;
+  if (ts <= posPts[0].ts) return posPts[0];
+  if (ts >= posPts[posPts.length - 1].ts) return posPts[posPts.length - 1];
+  let lo = 0, hi = posPts.length - 1;
+  while (hi - lo > 1) { const m = (lo + hi) >> 1; if (posPts[m].ts <= ts) lo = m; else hi = m; }
+  const a = posPts[lo], b = posPts[hi], f = (ts - a.ts) / ((b.ts - a.ts) || 1);
+  return { lat: a.lat + (b.lat - a.lat) * f, lon: a.lon + (b.lon - a.lon) * f };
 }
 function agoLabel(sinceMs) {
   const s = Math.max(0, Math.round((Date.now() - sinceMs) / 1000));
@@ -446,7 +480,11 @@ function onRootClick(e) {
     state.openPlaceId = null;
     renderPlaces();
   } else if (action === "open-drive") {
+    // Opening a drive is a navigation into the Drives section — keep the left-nav
+    // highlight + header in sync (the detail can be reached from Overview/Timeline too).
     state.openDriveId = Number(t.dataset.id);
+    state.screen = "dr";
+    renderShell();
     renderDriveDetail();
   } else if (action === "save-driver") {
     const input = document.getElementById("tm-driver-input");
@@ -462,6 +500,8 @@ function onRootClick(e) {
     renderDrives();
   } else if (action === "open-charge") {
     state.openChargeId = Number(t.dataset.id);
+    state.screen = "ch";
+    renderShell();
     renderChargeDetail();
   } else if (action === "back-charges") {
     state.openChargeId = null;
@@ -1331,8 +1371,71 @@ async function renderDriveDetail() {
   const synthetic = isSyntheticDrive(d);
   const hasRoute = !synthetic && path.length >= 2;
 
-  const speedPts = path.filter((p) => p.speed != null).map((p) => [(p.ts - d.start_ts) / 60, p.speed]);
-  const elevPts = path.filter((p) => p.elevation != null).map((p) => [(p.ts - d.start_ts) / 60, p.elevation]);
+  const t0 = d.start_ts;
+  const speedPts = path.filter((p) => p.speed != null).map((p) => [(p.ts - t0) / 60, p.speed]);
+  const elevPts = path.filter((p) => p.elevation != null).map((p) => [(p.ts - t0) / 60, p.elevation]);
+
+  // ---- Playback prep. Position rows are sparse — a sample may carry lat/lon OR
+  // speed OR soc — so each field is interpolated from its own [ts, value] series. ----
+  const posPts = path.filter((p) => p.lat != null && p.lon != null && p.ts != null).map((p) => ({ ts: p.ts, lat: p.lat, lon: p.lon }));
+  const spSeries = path.filter((p) => p.speed != null && p.ts != null).map((p) => [p.ts, p.speed]);
+  const socSeries = path.filter((p) => p.soc != null && p.ts != null).map((p) => [p.ts, p.soc]);
+  const powSeries = path.filter((p) => p.power != null && p.ts != null).map((p) => [p.ts, p.power]);
+  const hasGps = !synthetic && posPts.length >= 2;
+
+  // Cumulative haversine distance as a [ts, km] series, for the live "distance so far".
+  const kmSeries = [];
+  for (let i = 0, acc = 0; i < posPts.length; i++) {
+    if (i > 0) acc += haversineKm(posPts[i - 1], posPts[i]);
+    kmSeries.push([posPts[i].ts, acc]);
+  }
+  const totalKm = kmSeries.length ? kmSeries[kmSeries.length - 1][1] : (d.distance_km || 0);
+
+  // Instantaneous longitudinal accel (m/s²) from the speed slope, and deduped harsh
+  // brake/accel events (a single hard stop → one dot, not a cluster of samples).
+  const accSeries = [];
+  for (let i = 1; i < spSeries.length; i++) {
+    const dt = Math.max(0.5, spSeries[i][0] - spSeries[i - 1][0]);
+    accSeries.push([spSeries[i][0], ((spSeries[i][1] - spSeries[i - 1][1]) / 3.6) / dt]);
+  }
+  const BRAKE_MS2 = -2.8, ACCEL_MS2 = 2.2, EVENT_GAP_S = 4;
+  const events = [];
+  const lastEv = { brake: -Infinity, accel: -Infinity };
+  for (const [ts, a] of accSeries) {
+    const type = a <= BRAKE_MS2 ? "brake" : a >= ACCEL_MS2 ? "accel" : null;
+    if (!type) continue;
+    if (ts - lastEv[type] < EVENT_GAP_S) {
+      const last = events[events.length - 1];
+      if (last && last.type === type && Math.abs(a) > Math.abs(last.acc)) {
+        Object.assign(last, { acc: a, t: (ts - t0) / 60, speed: interpAt(spSeries, ts) ?? last.speed, g: a / 9.81 });
+      }
+      lastEv[type] = ts;
+      continue;
+    }
+    lastEv[type] = ts;
+    events.push({ t: (ts - t0) / 60, type, speed: interpAt(spSeries, ts) ?? 0, acc: a, g: a / 9.81 });
+  }
+
+  const lastTs = Math.max(posPts.at(-1)?.ts ?? t0, spSeries.at(-1)?.[0] ?? t0);
+  const totalSec = Math.max(1, lastTs - t0);
+  const totalMin = totalSec / 60;
+  const avgPower = powSeries.length ? powSeries.reduce((s, p) => s + p[1], 0) / powSeries.length : null;
+  const chart = speedPts.length > 1
+    ? svgDriveChart({ speedPts, elevPts, events, durationMin: totalMin })
+    : { html: "", plot: null };
+
+  const routePlaceholder = `
+      <div class="tm-card tm-card-pad-lg tm-flex-col" style="min-height:320px;justify-content:center;gap:16px;">
+        ${synthetic ? syntheticBadgeHtml() : ""}
+        <div class="tm-route-placeholder">
+          <div class="tm-route-endpoint"><span class="tm-route-dot" style="background:var(--good);"></span><span class="tm-ellipsis">${esc(driveEndpoint(d, "start", locations))}</span></div>
+          <div class="tm-route-connector"></div>
+          <div class="tm-route-endpoint"><span class="tm-route-dot" style="background:var(--accent);"></span><span class="tm-ellipsis">${esc(driveEndpoint(d, "end", locations))}</span></div>
+        </div>
+        <div class="tm-stat-note" style="margin-top:0;">${synthetic
+          ? "No GPS route recorded for this drive — it was reconstructed from the odometer, so distance & endpoints are known but there's no trace to map."
+          : "No GPS route recorded for this drive."}</div>
+      </div>`;
 
   setContent(`
     ${driverDatalistHtml(roster, "tm-driver-names-detail")}
@@ -1350,6 +1453,38 @@ async function renderDriveDetail() {
     </div>
     ${rosterHintHtml(roster)}
     <div style="font-size:12px;color:var(--faint);">${esc(DRIVER_MANUAL_NOTE)}${!d.driver && d.suggested_driver ? ` Looks like <span class="tm-driver-suggested">${esc(d.suggested_driver)}</span> drove this — pick a name and Save to confirm.` : ""}</div>
+
+    <div class="tm-grid-2-wide">
+      <div class="tm-drive-livegrid">
+        <div class="tm-card tm-lv"><div class="tm-stat-label">Distance</div><div class="tm-lv-val tm-mono" id="tm-lv-dist">${totalKm ? fmt1(totalKm) : (d.distance_km != null ? fmt1(d.distance_km) : "—")} <span class="tm-lv-u">km</span></div><div class="tm-lv-sub" id="tm-lv-dist-s">total</div></div>
+        <div class="tm-card tm-lv"><div class="tm-stat-label">Elapsed</div><div class="tm-lv-val tm-mono" id="tm-lv-time">${fmtDurationMin(d.duration_min)}</div><div class="tm-lv-sub" id="tm-lv-time-s">duration</div></div>
+        <div class="tm-card tm-lv"><div class="tm-stat-label">Speed</div><div class="tm-lv-val tm-mono" id="tm-lv-speed">${d.avg_speed != null ? fmt0(d.avg_speed) : "—"} <span class="tm-lv-u">km/h</span></div><div class="tm-lv-sub" id="tm-lv-speed-s">avg · ${d.max_speed != null ? fmt0(d.max_speed) : "—"} top</div></div>
+        <div class="tm-card tm-lv"><div class="tm-stat-label">Accel</div><div class="tm-lv-val tm-mono" id="tm-lv-accel">${d.max_decel_ms2 != null ? fmt2(d.max_decel_ms2 / 9.81) : "—"} <span class="tm-lv-u">g</span></div><div class="tm-lv-sub" id="tm-lv-accel-s">peak brake</div></div>
+        <div class="tm-card tm-lv"><div class="tm-stat-label">Power</div><div class="tm-lv-val tm-mono" id="tm-lv-power">${avgPower != null ? fmt0(avgPower) : (d.efficiency_wh_km != null ? fmt0(d.efficiency_wh_km) : "—")} <span class="tm-lv-u">${avgPower != null ? "kW" : "Wh/km"}</span></div><div class="tm-lv-sub" id="tm-lv-power-s">${avgPower != null ? "avg" : "consumption"}</div></div>
+        <div class="tm-card tm-lv"><div class="tm-stat-label">Battery</div><div class="tm-lv-val tm-mono" id="tm-lv-soc">${d.start_soc != null && d.end_soc != null ? `${fmt0(d.start_soc)}→${fmt0(d.end_soc)}` : "—"} <span class="tm-lv-u">%</span></div><div class="tm-lv-sub" id="tm-lv-soc-s">start → end</div></div>
+      </div>
+      ${hasGps ? `
+      <div class="tm-card tm-map-card" style="min-height:320px;">
+        <div id="tm-drive-map" class="tm-map-canvas"></div>
+        <button class="tm-map-expand" data-action="map-expand" title="Expand map" aria-label="Expand map">&#10530;</button>
+      </div>` : routePlaceholder}
+    </div>
+
+    ${speedPts.length > 1 ? `
+    <div class="tm-card tm-card-pad">
+      <div class="tm-play-bar">
+        <button class="tm-play-btn" id="tm-play-btn" title="Play drive" aria-label="Play drive">▶</button>
+        <div class="tm-play-clock tm-mono" id="tm-play-clock">0:00 / ${fmtClock(totalSec)}</div>
+        <div class="tm-play-legend">
+          <span><i style="background:var(--bad);"></i>hard brake</span>
+          <span><i style="background:var(--warn);"></i>hard accel</span>
+          <span><i class="tm-dash"></i>elevation</span>
+        </div>
+        <div style="margin-left:auto;font-size:11.5px;color:var(--faint);">${d.outside_temp_avg != null ? `outside ${fmt1(d.outside_temp_avg)} °C` : "Speed km/h · tap chart to scrub"}</div>
+      </div>
+      <div id="tm-drive-chart">${chart.html}</div>
+    </div>` : `<div class="tm-card tm-card-pad"><div class="tm-empty">No speed samples recorded for this drive</div></div>`}
+
     ${d.behavior_score != null || d.max_decel_ms2 != null ? `
     <div class="tm-grid-metrics">
       <div class="tm-card tm-card-pad-metric"><div class="tm-stat-label">Safety score</div><div class="tm-stat-value" style="color:${scoreColor(d.behavior_score)};">${d.behavior_score != null ? d.behavior_score : "—"}</div></div>
@@ -1359,62 +1494,101 @@ async function renderDriveDetail() {
       ${d.max_jerk_ms3 != null ? `<div class="tm-card tm-card-pad-metric"><div class="tm-stat-label">Peak jerk</div><div class="tm-stat-value">${fmt1(d.max_jerk_ms3)} <span class="tm-stat-unit">m/s³</span></div></div>` : ""}
     </div>` : ""}
     ${riskCertificateSection(d)}
-    <div class="tm-grid-2-wide">
-      ${hasRoute ? `
-      <div class="tm-card tm-map-card" style="min-height:300px;">
-        <div id="tm-drive-map" class="tm-map-canvas"></div>
-        <button class="tm-replay-btn" id="tm-replay-btn" title="Replay drive">&#9654;</button>
-      </div>` : `
-      <div class="tm-card tm-card-pad-lg tm-flex-col" style="min-height:300px;justify-content:center;gap:16px;">
-        ${synthetic ? syntheticBadgeHtml() : ""}
-        <div class="tm-route-placeholder">
-          <div class="tm-route-endpoint">
-            <span class="tm-route-dot" style="background:var(--good);"></span>
-            <span class="tm-ellipsis">${esc(driveEndpoint(d, "start", locations))}</span>
-          </div>
-          <div class="tm-route-connector"></div>
-          <div class="tm-route-endpoint">
-            <span class="tm-route-dot" style="background:var(--accent);"></span>
-            <span class="tm-ellipsis">${esc(driveEndpoint(d, "end", locations))}</span>
-          </div>
-        </div>
-        <div class="tm-stat-note" style="margin-top:0;">${synthetic
-          ? "No GPS route recorded for this drive — it was reconstructed from the odometer, so distance & endpoints are known but there's no trace to map."
-          : "No GPS route recorded for this drive."}</div>
-      </div>`}
-      <div class="tm-grid-half" style="align-content:start;">
-        <div class="tm-card" style="padding:18px 20px;"><div class="tm-stat-label">Distance</div><div style="font-size:19px;font-weight:600;margin-top:5px;" class="tm-mono">${d.distance_km != null ? fmt1(d.distance_km) : "—"} km</div></div>
-        <div class="tm-card" style="padding:18px 20px;"><div class="tm-stat-label">Duration</div><div style="font-size:19px;font-weight:600;margin-top:5px;" class="tm-mono">${fmtDurationMin(d.duration_min)}</div></div>
-        <div class="tm-card" style="padding:18px 20px;"><div class="tm-stat-label">Avg · top speed</div><div style="font-size:19px;font-weight:600;margin-top:5px;" class="tm-mono">${d.avg_speed != null ? fmt0(d.avg_speed) : "—"} · ${d.max_speed != null ? fmt0(d.max_speed) : "—"} <span style="font-size:12px;color:var(--sub);">km/h</span></div></div>
-        <div class="tm-card" style="padding:18px 20px;"><div class="tm-stat-label">Consumption</div><div style="font-size:19px;font-weight:600;margin-top:5px;" class="tm-mono">${d.efficiency_wh_km != null ? fmt0(d.efficiency_wh_km) : "—"} <span style="font-size:12px;color:var(--sub);">Wh/km</span></div></div>
-        <div class="tm-card" style="padding:18px 20px;"><div class="tm-stat-label">Energy used</div><div style="font-size:19px;font-weight:600;margin-top:5px;" class="tm-mono">${d.energy_used_kwh != null ? fmt2(d.energy_used_kwh) : "—"} kWh</div></div>
-        <div class="tm-card" style="padding:18px 20px;"><div class="tm-stat-label">Battery</div><div style="font-size:19px;font-weight:600;margin-top:5px;" class="tm-mono">${d.start_soc != null && d.end_soc != null ? `${fmt0(d.start_soc)} → ${fmt0(d.end_soc)}` : "—"} %</div></div>
-      </div>
-    </div>
-    <div class="tm-card tm-card-pad">
-      <div class="tm-flex-row" style="align-items:baseline;gap:14px;margin-bottom:18px;">
-        <div style="font-size:14px;font-weight:600;">Speed</div>
-        <div class="tm-flex-row" style="font-size:11.5px;color:var(--sub);"><span style="width:14px;height:2px;background:var(--accent);border-radius:2px;"></span>km/h</div>
-        <div class="tm-flex-row" style="font-size:11.5px;color:var(--sub);"><span style="width:14px;height:2px;background:var(--faint);border-radius:2px;"></span>elevation</div>
-        <div style="margin-left:auto;font-size:11.5px;color:var(--faint);">${d.outside_temp_avg != null ? `outside ${fmt1(d.outside_temp_avg)} °C` : ""}</div>
-      </div>
-      ${speedPts.length > 1 ? svgLineChart({
-        series: [
-          { points: speedPts, area: true },
-          ...(elevPts.length > 1 ? [{ points: elevPts, color: "var(--faint)", dashed: true, width: 1.5 }] : []),
-        ],
-        yTicks: [0, 25, 50, 75, 100].map((v) => ({ value: v, label: String(v) })),
-        xTicks: [0, Math.round((d.duration_min || 0) / 2), Math.round(d.duration_min || 0)].map((v) => ({ value: v, label: `${v} min` })),
-      }) : `<div class="tm-empty">No speed samples recorded for this drive</div>`}
-    </div>
   `);
 
-  if (hasRoute) {
-    requestAnimationFrame(() => {
-      const map = renderRouteMap(document.getElementById("tm-drive-map"), path);
-      attachReplay(map, path, document.getElementById("tm-replay-btn"));
-    });
+  if (chart.plot || hasGps) {
+    requestAnimationFrame(() => setupDrivePlayback({
+      d, path, hasGps, plot: chart.plot, t0, totalSec, totalMin, totalKm,
+      posPts, spSeries, socSeries, powSeries, kmSeries, accSeries,
+    }));
   }
+}
+
+// Module-scoped so a navigation away (which rebuilds the DOM) can cancel the
+// previous drive's animation frame before a new one attaches.
+let activeDrivePlaybackStop = null;
+
+/**
+ * Unified drive replay: one clock drives the map marker, the chart playhead, and
+ * the live metric cards together. The chart is click/drag scrubbable. Cleanup is
+ * self-guarding — if the play button is gone (navigated away), the loop stops.
+ */
+function setupDrivePlayback(ctx) {
+  if (activeDrivePlaybackStop) { try { activeDrivePlaybackStop(); } catch { /* already gone */ } activeDrivePlaybackStop = null; }
+  const { d, path, hasGps, plot, t0, totalSec, totalMin, totalKm, posPts, spSeries, socSeries, powSeries, kmSeries, accSeries } = ctx;
+
+  const rm = hasGps ? createReplayMarker(renderRouteMap(document.getElementById("tm-drive-map"), path)) : null;
+  const btn = document.getElementById("tm-play-btn");
+  if (!btn) return;
+  const clockEl = document.getElementById("tm-play-clock");
+  const phLine = document.getElementById("tm-ph-line");
+  const phDot = document.getElementById("tm-ph-dot");
+  const scrub = document.getElementById("tm-ph-scrub");
+  const $ = (id) => document.getElementById(id);
+  const el = {
+    dist: $("tm-lv-dist"), distS: $("tm-lv-dist-s"), time: $("tm-lv-time"), timeS: $("tm-lv-time-s"),
+    speed: $("tm-lv-speed"), speedS: $("tm-lv-speed-s"), accel: $("tm-lv-accel"), accelS: $("tm-lv-accel-s"),
+    power: $("tm-lv-power"), powerS: $("tm-lv-power-s"), soc: $("tm-lv-soc"), socS: $("tm-lv-soc-s"),
+  };
+
+  const DURATION_MS = Math.min(40000, Math.max(12000, totalMin * 1100));
+  let raf = null, playing = false, progress = 0, lastFrame = null;
+  const val = (v, u) => `${v} <span class="tm-lv-u">${u}</span>`;
+
+  function paint(frac) {
+    const ts = t0 + frac * totalSec;
+    if (rm) { const pos = interpPos(posPts, ts); if (pos) rm.move(pos.lat, pos.lon); }
+    const sp = interpAt(spSeries, ts), soc = interpAt(socSeries, ts), pow = interpAt(powSeries, ts);
+    const km = interpAt(kmSeries, ts), ac = interpAt(accSeries, ts);
+    if (plot) {
+      const X = plot.X((ts - t0) / 60);
+      phLine.setAttribute("x1", X); phLine.setAttribute("x2", X); phLine.style.opacity = "0.5";
+      if (sp != null) { phDot.setAttribute("cx", X); phDot.setAttribute("cy", plot.Y(sp)); phDot.style.opacity = "1"; }
+    }
+    if (el.dist) { el.dist.innerHTML = val(fmt1(km ?? 0), "km"); el.distS.textContent = `of ${fmt1(totalKm)} km`; }
+    if (el.time) { el.time.textContent = fmtClock(ts - t0); el.timeS.textContent = `of ${fmtClock(totalSec)}`; }
+    if (el.speed) { el.speed.innerHTML = val(sp != null ? fmt0(sp) : "—", "km/h"); el.speedS.textContent = "now"; }
+    if (el.accel && ac != null) {
+      const g = ac / 9.81;
+      el.accel.innerHTML = val(`${g >= 0 ? "+" : ""}${fmt2(g)}`, "g");
+      el.accel.style.color = ac <= -2.8 ? "var(--bad)" : ac >= 2.2 ? "var(--warn)" : "var(--text)";
+      el.accelS.textContent = "now";
+    }
+    if (el.power && pow != null) { el.power.innerHTML = val(fmt0(pow), "kW"); el.powerS.textContent = "now"; }
+    if (el.soc && soc != null) { el.soc.innerHTML = val(fmt0(soc), "%"); el.socS.textContent = "now"; }
+    if (clockEl) clockEl.textContent = `${fmtClock(ts - t0)} / ${fmtClock(totalSec)}`;
+  }
+
+  const setBtn = () => { btn.textContent = playing ? "❚❚" : "▶"; btn.title = playing ? "Pause" : "Play drive"; };
+  const frame = (now) => {
+    raf = null;
+    if (!document.getElementById("tm-play-btn")) { playing = false; return; } // navigated away
+    if (!playing) return;
+    if (lastFrame != null) progress += (now - lastFrame) / DURATION_MS;
+    lastFrame = now;
+    if (progress >= 1) { progress = 1; paint(1); playing = false; lastFrame = null; setBtn(); return; }
+    paint(progress);
+    raf = requestAnimationFrame(frame);
+  };
+  btn.addEventListener("click", () => {
+    playing = !playing;
+    if (playing) { if (progress >= 1) progress = 0; lastFrame = null; if (raf == null) raf = requestAnimationFrame(frame); }
+    else if (raf != null) { cancelAnimationFrame(raf); raf = null; }
+    setBtn();
+  });
+  if (scrub && plot) {
+    const svg = scrub.ownerSVGElement;
+    const seek = (clientX) => {
+      const rect = svg.getBoundingClientRect();
+      const vbX = ((clientX - rect.left) / (rect.width || 1)) * plot.width;
+      progress = Math.max(0, Math.min(1, (vbX - plot.l) / ((plot.width - plot.l - plot.r) || 1)));
+      paint(progress);
+    };
+    scrub.addEventListener("pointerdown", (e) => { seek(e.clientX); try { scrub.setPointerCapture(e.pointerId); } catch { /* unsupported */ } });
+    scrub.addEventListener("pointermove", (e) => { if (e.buttons & 1) seek(e.clientX); });
+  }
+  setBtn();
+  activeDrivePlaybackStop = () => { playing = false; if (raf != null) cancelAnimationFrame(raf); raf = null; if (rm) rm.hide(); };
 }
 
 // ---------------------------------------------------------------------------

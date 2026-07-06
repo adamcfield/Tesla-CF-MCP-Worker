@@ -67,6 +67,71 @@ export function svgLineChart({ width = 760, height = 210, series, yTicks = [], x
   return `<svg viewBox="0 0 ${width} ${height}" class="tm-svg-block">${grid}${xLabels}${seriesMarkup}</svg>`;
 }
 
+/**
+ * Playable single-drive chart: speed area+line, faint elevation terrain, harsh
+ * brake/accel event dots, plus a hidden playhead line + dot the caller animates.
+ * Returns { html, plot } where `plot` exposes the same X()/Y() scale the SVG was
+ * drawn with, so the caller can position the playhead in the SVG's own coordinate
+ * space (viewBox units) regardless of the rendered size.
+ *
+ * `speedPts`/`elevPts`: [[minutes, value], …]. `events`: [{t (min), type:'brake'|'accel', speed, g}].
+ */
+export function svgDriveChart({ speedPts, elevPts = [], events = [], durationMin = 0, width = 760, height = 240 }) {
+  if (!speedPts || speedPts.length < 2) return { html: "", plot: null };
+  const l = 48, r = 16, t = 16, b = 30;
+  const x0 = 0;
+  const x1 = Math.max(durationMin || 0, speedPts[speedPts.length - 1][0]) || 1;
+  const maxSpeed = Math.max(60, ...speedPts.map((p) => p[1]));
+  const y0 = 0, y1 = Math.ceil(maxSpeed / 20) * 20;
+  const X = (v) => +(l + ((v - x0) / ((x1 - x0) || 1)) * (width - l - r)).toFixed(1);
+  const Y = (v) => +(t + (1 - (v - y0) / ((y1 - y0) || 1)) * (height - t - b)).toFixed(1);
+  const bottom = height - b;
+
+  let grid = "";
+  for (let v = y0; v <= y1; v += 20) {
+    const y = Y(v);
+    grid += `<line x1="${l}" x2="${width - r}" y1="${y}" y2="${y}" style="stroke:var(--line2);stroke-width:1;"></line>`
+      + `<text x="${l - 8}" y="${(y + 3.5).toFixed(1)}" text-anchor="end" style="font:10.5px var(--mono);fill:var(--faint);">${v}</text>`;
+  }
+  const xlabels = [0, x1 / 2, x1]
+    .map((v) => `<text x="${X(v)}" y="${height - 8}" text-anchor="middle" style="font:10.5px var(--mono);fill:var(--faint);">${Math.round(v)}m</text>`)
+    .join("");
+
+  // Transparent hit-area for click/drag-to-scrub — sits just above the grid so the
+  // event dots (drawn later) keep their hover tooltips, and empty plot regions scrub.
+  const scrub = `<rect id="tm-ph-scrub" x="${l}" y="${t}" width="${(width - l - r).toFixed(1)}" height="${(bottom - t).toFixed(1)}" style="fill:transparent;cursor:pointer;"></rect>`;
+
+  let elev = "";
+  if (elevPts.length > 1) {
+    const es = elevPts.map((p) => p[1]);
+    const emin = Math.min(...es), emax = Math.max(...es);
+    const En = (e) => Y(((e - emin) / ((emax - emin) || 1)) * y1 * 0.42); // gentle lower-band terrain
+    const pts = elevPts.map((p) => `${X(p[0])},${En(p[1])}`).join(" ");
+    elev = `<polyline points="${pts}" style="fill:none;stroke:var(--faint);stroke-width:1.4;stroke-dasharray:5 4;opacity:0.65;pointer-events:none;"></polyline>`;
+  }
+
+  const spts = speedPts.map((p) => `${X(p[0])},${Y(p[1])}`).join(" ");
+  const first = speedPts[0], last = speedPts[speedPts.length - 1];
+  const area = `<polygon points="${X(first[0])},${bottom} ${spts} ${X(last[0])},${bottom}" style="fill:color-mix(in oklab, var(--accent) 10%, transparent);pointer-events:none;"></polygon>`;
+  const line = `<polyline points="${spts}" style="fill:none;stroke:var(--accent);stroke-width:2.2;stroke-linejoin:round;stroke-linecap:round;pointer-events:none;"></polyline>`;
+
+  const evColor = { brake: "var(--bad)", accel: "var(--warn)" };
+  const evMarks = events
+    .map((ev) => {
+      const col = evColor[ev.type] || "var(--faint)";
+      const g = ev.g != null ? `${ev.g > 0 ? "+" : ""}${ev.g.toFixed(2)}g` : "";
+      const label = `${ev.type === "brake" ? "Hard brake" : "Hard accel"} ${g} · ${Math.round(ev.t)} min`;
+      return `<circle cx="${X(ev.t)}" cy="${Y(ev.speed)}" r="4.5" style="fill:${col};stroke:var(--card);stroke-width:1.5;"><title>${esc(label)}</title></circle>`;
+    })
+    .join("");
+
+  const playhead = `<line id="tm-ph-line" x1="${l}" x2="${l}" y1="${t}" y2="${bottom}" style="stroke:var(--text);stroke-width:1.4;opacity:0;pointer-events:none;"></line>`
+    + `<circle id="tm-ph-dot" cx="${l}" cy="${bottom}" r="5" style="fill:var(--accent);stroke:var(--card);stroke-width:2;opacity:0;pointer-events:none;"></circle>`;
+
+  const html = `<svg viewBox="0 0 ${width} ${height}" class="tm-svg-block" style="touch-action:none;user-select:none;">${grid}${scrub}${elev}${area}${line}${evMarks}${playhead}${xlabels}</svg>`;
+  return { html, plot: { X, Y, l, r, t, b, x0, x1, y0, y1, width, height, bottom } };
+}
+
 /** Simple month/category bar chart. `bars`: [{label, value}]. */
 export function svgBarChart({ width = 760, height = 230, bars, yMax, l = 46, r = 12, t = 12, b = 26 }) {
   if (!bars.length) return "";

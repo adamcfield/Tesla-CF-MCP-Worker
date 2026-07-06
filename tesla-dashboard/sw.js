@@ -15,7 +15,7 @@
  * updated worker takes over and refreshes the page automatically.
  */
 
-const CACHE_NAME = "tesla-dash-shell-v3";
+const CACHE_NAME = "tesla-dash-shell-v4";
 
 const SHELL = [
   "./",
