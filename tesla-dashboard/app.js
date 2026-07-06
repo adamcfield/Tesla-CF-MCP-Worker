@@ -269,9 +269,48 @@ function consumeUrlCredentials() {
   } catch { /* non-browser / sandbox */ }
 }
 
+// ---------------------------------------------------------------------------
+// URL routing — reflects state.screen (+ open drive/charge/place id) in
+// location.hash as "#screen" or "#screen/id", so reload, bookmarks and the
+// browser back/forward buttons land on the right screen instead of always
+// dumping back to Overview. Navigation writes history via pushHistory();
+// back/forward is read back through the popstate listener in renderShell().
+// ---------------------------------------------------------------------------
+
+function hashToState(hash) {
+  const raw = (hash || "").replace(/^#\/?/, "");
+  if (!raw) return null;
+  const [screen, idStr] = raw.split("/");
+  if (!TITLES[screen]) return null;
+  const id = idStr ? Number(idStr) : null;
+  return { screen, id: Number.isFinite(id) ? id : null };
+}
+function stateToHash() {
+  if (state.screen === "dr" && state.openDriveId != null) return `#dr/${state.openDriveId}`;
+  if (state.screen === "ch" && state.openChargeId != null) return `#ch/${state.openChargeId}`;
+  if (state.screen === "pl" && state.openPlaceId != null) return `#pl/${state.openPlaceId}`;
+  return `#${state.screen}`;
+}
+/** Call after any change to state.screen/openDriveId/openChargeId/openPlaceId. */
+function pushHistory() {
+  const hash = stateToHash();
+  if (location.hash !== hash) { try { history.pushState(null, "", hash); } catch { /* sandboxed */ } }
+}
+/** Read location.hash into state at boot, or on a back/forward navigation. */
+function applyHashToState() {
+  const parsed = hashToState(location.hash);
+  if (!parsed) return false;
+  state.screen = parsed.screen;
+  state.openDriveId = parsed.screen === "dr" ? parsed.id : null;
+  state.openChargeId = parsed.screen === "ch" ? parsed.id : null;
+  state.openPlaceId = parsed.screen === "pl" ? parsed.id : null;
+  return true;
+}
+
 async function boot() {
   consumeUrlCredentials();
   if (!auth.hasToken || !auth.vin) return renderGate();
+  applyHashToState(); // land on the screen encoded in the URL, if any
   try {
     await verifyToken(auth.vin);
     await renderApp();
@@ -378,7 +417,7 @@ function renderShell() {
           </div>
           <div class="tm-sidemeta">
             VIN ${esc(auth.vin.slice(-6))}
-            &nbsp;·&nbsp;<button data-action="logout" style="background:none;border:none;color:inherit;font:inherit;cursor:pointer;padding:0;text-decoration:underline;">disconnect</button>
+            &nbsp;·&nbsp;<button data-action="logout" class="tm-link-btn">disconnect</button>
           </div>
         </div>
       </aside>
@@ -391,7 +430,7 @@ function renderShell() {
           <div class="tm-header-live" id="tm-sync-label">
             <span class="tm-dot tm-dot-live"></span>
             <span id="tm-sync-text">loading…</span>
-            <button data-action="refresh" title="Refresh" style="margin-left:8px;background:none;border:none;color:var(--sub);cursor:pointer;font-size:13px;">&#8635;</button>
+            <button data-action="refresh" title="Refresh" aria-label="Refresh" class="tm-icon-btn" style="margin-left:8px;">&#8635;</button>
           </div>
         </header>
         <div class="tm-scroll"><div class="tm-page" id="tm-content"></div></div>
@@ -411,8 +450,16 @@ function renderShell() {
       open.forEach((c) => { c.classList.remove("tm-map-full"); const b = c.querySelector(".tm-map-expand"); if (b) { b.innerHTML = "&#10530;"; b.title = "Expand map"; } });
       setTimeout(() => invalidateMaps(), 80);
     });
+    window.addEventListener("popstate", () => {
+      if (!applyHashToState()) return; // an unrelated/foreign hash — leave state as-is
+      renderShell();
+      showScreen();
+    });
     shellBound = true;
   }
+  // Normalize the address bar to the current screen on first paint, so a plain
+  // load without a hash (or a stale/invalid one) still gets a matching, shareable URL.
+  if (location.hash !== stateToHash()) { try { history.replaceState(null, "", stateToHash()); } catch { /* sandboxed */ } }
   refreshSideBudget();
 }
 
@@ -448,6 +495,7 @@ function onRootClick(e) {
     state.openDriveId = null;
     state.openChargeId = null;
     state.openPlaceId = null;
+    pushHistory();
     renderShell();
     showScreen();
   } else if (action === "theme") {
@@ -475,15 +523,18 @@ function onRootClick(e) {
     if (!t.querySelector(".tm-driver-edit")) beginDriverEdit(t, Number(t.dataset.id));
   } else if (action === "open-place") {
     state.openPlaceId = Number(t.dataset.id);
+    pushHistory();
     renderPlaceDetail();
   } else if (action === "back-places") {
     state.openPlaceId = null;
+    pushHistory();
     renderPlaces();
   } else if (action === "open-drive") {
     // Opening a drive is a navigation into the Drives section — keep the left-nav
     // highlight + header in sync (the detail can be reached from Overview/Timeline too).
     state.openDriveId = Number(t.dataset.id);
     state.screen = "dr";
+    pushHistory();
     renderShell();
     renderDriveDetail();
   } else if (action === "save-driver") {
@@ -497,17 +548,21 @@ function onRootClick(e) {
     }).catch(() => { t.textContent = "Failed"; });
   } else if (action === "back-drives") {
     state.openDriveId = null;
+    pushHistory();
     renderDrives();
   } else if (action === "open-charge") {
     state.openChargeId = Number(t.dataset.id);
     state.screen = "ch";
+    pushHistory();
     renderShell();
     renderChargeDetail();
   } else if (action === "back-charges") {
     state.openChargeId = null;
+    pushHistory();
     renderCharges();
   } else if (action === "goto-bh") {
     state.screen = "bh";
+    pushHistory();
     renderShell();
     showScreen();
   } else if (action === "load-live") {
@@ -522,11 +577,20 @@ function onRootClick(e) {
   } else if (action === "predict-run") {
     runRangePrediction();
   } else if (action === "view-cert") {
-    loadDriveCertificate(Number(t.dataset.id));
+    const prevLabel = t.textContent;
+    t.disabled = true;
+    t.textContent = "Loading…";
+    loadDriveCertificate(Number(t.dataset.id)).finally(() => { t.disabled = false; t.textContent = prevLabel; });
   } else if (action === "copy-cert") {
     copyToClipboard(t.dataset.text || "", t);
   } else if (action === "print-report") {
-    openPrintableReport(Number(t.dataset.id));
+    const prevLabel = t.innerHTML;
+    t.disabled = true;
+    t.textContent = "Preparing…";
+    openPrintableReport(Number(t.dataset.id))
+      .then(() => { t.textContent = "Opened ✓"; })
+      .catch(() => { t.textContent = "Couldn't open"; })
+      .finally(() => { setTimeout(() => { t.disabled = false; t.innerHTML = prevLabel; }, 1300); });
   } else if (action === "map-expand") {
     const card = t.closest(".tm-map-card");
     if (card) {
@@ -548,11 +612,16 @@ function setContent(html) {
 function loadingHtml() {
   return `<div class="tm-empty"><div class="tm-spinner"></div><div>Loading…</div></div>`;
 }
+/** Whole-screen/whole-card empty state: icon badge + title + optional detail. */
 function emptyHtml(title, sub) {
-  return `<div class="tm-card"><div class="tm-empty"><div class="tm-empty-title">${esc(title)}</div>${sub ? `<div>${esc(sub)}</div>` : ""}</div></div>`;
+  return `<div class="tm-card"><div class="tm-empty"><div class="tm-empty-icon">–</div><div class="tm-empty-title">${esc(title)}</div>${sub ? `<div>${esc(sub)}</div>` : ""}</div></div>`;
 }
 function errorHtml(message) {
-  return `<div class="tm-card"><div class="tm-empty"><div class="tm-empty-title" style="color:var(--bad);">Couldn't load this</div><div>${esc(message)}</div></div></div>`;
+  return `<div class="tm-card"><div class="tm-empty"><div class="tm-empty-icon" style="color:var(--bad);">!</div><div class="tm-empty-title" style="color:var(--bad);">Couldn't load this</div><div>${esc(message)}</div></div></div>`;
+}
+/** Single-line empty note inside an already-titled card/chart (e.g. "No SoC history yet"). */
+function miniEmptyHtml(text) {
+  return `<div class="tm-mini-empty">${esc(text)}</div>`;
 }
 
 // ---------------------------------------------------------------------------
@@ -801,7 +870,7 @@ function tyreStatusHtml(t) {
     const tr = trend?.[c.w];
     return typeof tr === "number" && tr < -0.15;
   });
-  if (bad.length === 0 && nums.length === 4) return `<span style="color:var(--good);">&#10003; OK</span>`;
+  if (bad.length === 0 && nums.length === 4) return `<span style="color:var(--good);">&#10003; Good</span>`;
   const c = bad[0];
   const val = c.v != null ? `${fmt0(c.v * 14.5038)} PSI` : "no reading";
   return `<span style="color:var(--warn);">${c.label} ${val}${bad.length > 1 ? ` +${bad.length - 1}` : ""}</span>`;
@@ -934,16 +1003,16 @@ async function renderOverview() {
 
     <div class="tm-grid-2">
       <div class="tm-card tm-card-pad">
-        <div class="tm-flex-row" style="align-items:baseline;margin-bottom:18px;">
-          <div style="font-size:14px;font-weight:600;">Charge level</div>
-          <div style="font-size:12px;color:var(--faint);">last 7 days</div>
+        <div class="tm-card-head">
+          <div class="tm-card-head-title">Charge level</div>
+          <div class="tm-card-head-sub">last 7 days</div>
         </div>
         ${socChart.length > 1 ? svgLineChart({
           series: [{ points: socChart, area: true }],
           yTicks: [0, 25, 50, 75, 100].map((v) => ({ value: v, label: String(v) })),
           xTicks: buildDayTicks(socChart),
           yDomain: [0, 100],
-        }) : `<div class="tm-empty">No SoC history yet</div>`}
+        }) : miniEmptyHtml("No SoC history yet")}
       </div>
       <div class="tm-card tm-card-pad">
         <div style="font-size:14px;font-weight:600;margin-bottom:14px;">Recent activity</div>
@@ -959,7 +1028,7 @@ async function renderOverview() {
             <span class="tm-activity-time">${fmtTime(e.ts)}</span>
             ${link ? `<span class="tm-activity-chev">&#8250;</span>` : ""}
           </div>`;
-        }).join("") : `<div class="tm-empty">Nothing recorded yet</div>`}
+        }).join("") : miniEmptyHtml("Nothing recorded yet")}
       </div>
     </div>
   `);
@@ -1105,9 +1174,9 @@ function efficiencyByTempCard(et) {
   const pts = bins.map((b) => [(b.t_min + b.t_max) / 2, b.avg_wh_km]);
   return `
     <div class="tm-card tm-card-pad">
-      <div class="tm-flex-row" style="align-items:baseline;margin-bottom:18px;">
-        <div style="font-size:14px;font-weight:600;">Efficiency vs temperature</div>
-        <div style="font-size:12px;color:var(--faint);">avg Wh/km per 5 °C bin${totalDrives ? ` · ${totalDrives} drives` : ""}</div>
+      <div class="tm-card-head">
+        <div class="tm-card-head-title">Efficiency vs temperature</div>
+        <div class="tm-card-head-sub">avg Wh/km per 5 °C bin${totalDrives ? ` · ${totalDrives} drives` : ""}</div>
       </div>
       ${pts.length >= 2 ? svgLineChart({
         series: [{
@@ -1117,7 +1186,7 @@ function efficiencyByTempCard(et) {
         }],
         yTicks: autoTicks(pts.map((p) => p[1]), 4),
         xTicks: pts.map((p) => ({ value: p[0], label: `${fmt0(p[0])}°` })),
-      }) : `<div class="tm-empty">Not enough temperature-tagged drives yet — this fills in as drives with outside-temperature samples accumulate.</div>`}
+      }) : miniEmptyHtml("Not enough temperature-tagged drives yet — this fills in as drives with outside-temperature samples accumulate.")}
     </div>`;
 }
 
@@ -1196,13 +1265,13 @@ async function renderStatistics() {
       <div class="tm-card tm-card-pad-metric"><div class="tm-stat-label">Charging cost</div><div class="tm-stat-value">${money(totalCost, cur, 0)}</div></div>
     </div>
     <div class="tm-card tm-card-pad">
-      <div class="tm-flex-row" style="align-items:baseline;margin-bottom:18px;">
-        <div style="font-size:14px;font-weight:600;">Distance driven</div>
-        <div style="font-size:12px;color:var(--faint);">km per month</div>
+      <div class="tm-card-head">
+        <div class="tm-card-head-title">Distance driven</div>
+        <div class="tm-card-head-sub">km per month</div>
       </div>
       ${monthlyRows.length ? svgBarChart({ bars: monthlyRows.slice().reverse().map((m) => ({ label: monthShort(m.month), value: m.distance_km || 0 })) })
         : months.length ? svgBarChart({ bars: months.map((m) => ({ label: m.m, value: m.km })) })
-        : `<div class="tm-empty">No monthly data yet</div>`}
+        : miniEmptyHtml("No monthly data yet")}
     </div>
     ${efficiencyByTempCard(effTemp)}
     ${monthlyRows.length ? monthlyReportTable(monthlyRows) : `
@@ -1248,9 +1317,9 @@ function isSyntheticDrive(d) {
 
 const SYNTHETIC_TITLE = "Reconstructed from the odometer — this drive happened between polls, so distance & endpoints are known but there's no GPS trace. Live capture needs more frequent polling or telemetry streaming.";
 
-/** Muted "recovered · no route" pill for odometer-reconstructed drives. */
+/** Muted "reconstructed · no route" pill for odometer-reconstructed drives. */
 function syntheticBadgeHtml() {
-  return `<span class="tm-pill tm-pill-chip" style="font-size:10.5px;" title="${esc(SYNTHETIC_TITLE)}">recovered · no route</span>`;
+  return `<span class="tm-pill tm-pill-chip" style="font-size:10.5px;" title="${esc(SYNTHETIC_TITLE)}">reconstructed · no route</span>`;
 }
 
 /** Driver cell body: assigned name, or the classifier's guess (muted, "?"-suffixed), or —. */
@@ -1345,7 +1414,7 @@ async function renderDrives() {
           <div class="tm-table-row" data-action="open-drive" data-id="${d.id}" style="grid-template-columns:${cols};">
             <div data-role="when" style="font-size:12.5px;color:var(--sub);">${fmtDateTime(d.start_ts)}</div>
             <div data-role="route" class="tm-ellipsis" style="font-size:13.5px;font-weight:500;"><bdi>${esc(driveEndpoint(d, "start", locations))}</bdi> <span style="color:var(--faint);">→</span> <bdi>${esc(driveEndpoint(d, "end", locations))}</bdi>${isSyntheticDrive(d) ? " " + syntheticBadgeHtml() : ""}</div>
-            <div data-k="Driver" class="tm-ellipsis" data-action="edit-driver" data-id="${d.id}" title="Click to assign driver" style="font-size:12.5px;">${driverCellHtml(d)}</div>
+            <div data-k="Driver" class="tm-ellipsis tm-edit-cell" data-action="edit-driver" data-id="${d.id}" title="Click to assign driver" style="font-size:12.5px;">${driverCellHtml(d)}</div>
             <div data-k="Distance" class="tm-right tm-mono">${d.distance_km != null ? fmt1(d.distance_km) : "—"} km</div>
             <div data-k="Duration" class="tm-right tm-mono" style="color:var(--sub);">${fmtDurationMin(d.duration_min)}</div>
             <div data-k="Speed" class="tm-right tm-mono" style="color:var(--sub);">${d.avg_speed != null ? fmt0(d.avg_speed) : "—"} km/h</div>
@@ -1483,7 +1552,7 @@ async function renderDriveDetail() {
         <div style="margin-left:auto;font-size:11.5px;color:var(--faint);">${d.outside_temp_avg != null ? `outside ${fmt1(d.outside_temp_avg)} °C` : "Speed km/h · tap chart to scrub"}</div>
       </div>
       <div id="tm-drive-chart">${chart.html}</div>
-    </div>` : `<div class="tm-card tm-card-pad"><div class="tm-empty">No speed samples recorded for this drive</div></div>`}
+    </div>` : `<div class="tm-card tm-card-pad">${miniEmptyHtml("No speed samples recorded for this drive")}</div>`}
 
     ${d.behavior_score != null || d.max_decel_ms2 != null ? `
     <div class="tm-grid-metrics">
@@ -1912,7 +1981,7 @@ async function renderChargeDetail() {
         ],
         yTicks: (c.charge_type === "DC" ? [0, 40, 80, 120, 160] : [0, 3, 6, 9, 12]).map((v) => ({ value: v, label: String(v) })),
         xTicks: [0, Math.round((c.duration_min || 0) / 2), Math.round(c.duration_min || 0)].map((v) => ({ value: v, label: `${v} min` })),
-      }) : `<div class="tm-empty">No power samples recorded for this session</div>`}
+      }) : miniEmptyHtml("No power samples recorded for this session")}
     </div>
   `);
 }
@@ -1968,11 +2037,11 @@ async function renderChargingStats() {
     </div>
     <div class="tm-grid-2">
       <div class="tm-card tm-card-pad">
-        <div class="tm-flex-row" style="align-items:baseline;margin-bottom:18px;">
-          <div style="font-size:14px;font-weight:600;">Energy charged</div>
-          <div style="font-size:12px;color:var(--faint);">kWh per month</div>
+        <div class="tm-card-head">
+          <div class="tm-card-head-title">Energy charged</div>
+          <div class="tm-card-head-sub">kWh per month</div>
         </div>
-        ${months.length ? svgBarChart({ bars: months.map((m) => ({ label: m.m, value: m.kwh })) }) : `<div class="tm-empty">No monthly data yet</div>`}
+        ${months.length ? svgBarChart({ bars: months.map((m) => ({ label: m.m, value: m.kwh })) }) : miniEmptyHtml("No monthly data yet")}
       </div>
       <div class="tm-card tm-card-pad tm-flex-col">
         <div style="font-size:14px;font-weight:600;">AC vs DC</div>
@@ -1993,9 +2062,9 @@ async function renderChargingStats() {
       <div style="font-size:14px;font-weight:600;margin-bottom:16px;">Top locations</div>
       <div class="tm-flex-col" style="gap:14px;">
         ${topLocs.map((l) => `
-          <div style="display:grid;grid-template-columns:220px 1fr 110px 110px;gap:16px;align-items:center;">
+          <div class="tm-bar-row">
             <div class="tm-ellipsis" style="font-size:13px;font-weight:500;">${esc(l.name)}</div>
-            <div style="height:8px;border-radius:999px;background:var(--chip);position:relative;"><div style="position:absolute;inset:0 auto 0 0;width:${((l.kwh / maxLocKwh) * 100).toFixed(1)}%;border-radius:999px;background:var(--accent);opacity:0.85;"></div></div>
+            <div class="tm-bar-track"><div class="tm-bar-fill" style="width:${((l.kwh / maxLocKwh) * 100).toFixed(1)}%;"></div></div>
             <div class="tm-mono tm-right" style="font-size:12.5px;">${fmt0(l.kwh)} kWh</div>
             <div class="tm-right" style="font-size:12px;color:var(--faint);">${l.n} sessions</div>
           </div>`).join("")}
@@ -2013,7 +2082,7 @@ async function renderBatteryHealth() {
   const summary = await cached("summary", () => data.summary(vin()));
 
   if (!deg.series?.length || deg.degradation_pct == null) {
-    return setContent(emptyHtml("Not enough data yet", deg.note || "Battery health needs at least two charge sessions ending above 50% state of charge."));
+    return setContent(emptyHtml("Not enough data yet", deg.note || "Battery health tracking needs at least two charges that ended above 50% — check back after a couple more, and the trend will start filling in."));
   }
 
   const health = Math.max(0, 100 - deg.degradation_pct);
@@ -2034,15 +2103,15 @@ async function renderBatteryHealth() {
       </div>
     </div>
     <div class="tm-card tm-card-pad">
-      <div class="tm-flex-row" style="align-items:baseline;margin-bottom:18px;">
-        <div style="font-size:14px;font-weight:600;">Projected range @ 100%</div>
-        <div style="font-size:12px;color:var(--faint);">km vs time, from completed charges</div>
+      <div class="tm-card-head">
+        <div class="tm-card-head-title">Projected range @ 100%</div>
+        <div class="tm-card-head-sub">km vs time, from completed charges</div>
       </div>
       ${pts.length > 1 ? svgLineChart({
         series: [{ points: pts, area: true }],
         yTicks: autoTicks(pts.map((p) => p[1]), 4),
         xTicks: [pts[0], pts[pts.length - 1]].map((p) => ({ value: p[0], label: new Date(p[0] * 1000).toLocaleDateString(undefined, { month: "short", year: "2-digit" }) })),
-      }) : `<div class="tm-empty">Need more charge sessions to plot a trend</div>`}
+      }) : miniEmptyHtml("Need more charge sessions to plot a trend")}
     </div>
   `);
 }
@@ -2515,7 +2584,7 @@ function batteryForecastCard(f) {
   if (!f || f.current_pct == null) {
     return `<div class="tm-card tm-card-pad">
       <div style="font-size:14px;font-weight:600;margin-bottom:4px;">Battery forecast</div>
-      <div class="tm-empty">${esc(f?.note || "Not enough data yet — the degradation forecast needs a run of charge sessions before it can project a slope. Check back once more charges are logged, or once the forecast endpoint is deployed.")}</div>
+      ${miniEmptyHtml(f?.note || "Not enough data yet — the degradation forecast needs a run of charge sessions before it can project a slope. Check back once more charges are logged, or once the forecast endpoint is deployed.")}
     </div>`;
   }
   const slope = f.slope_pct_per_year;
@@ -2548,7 +2617,7 @@ function batteryForecastCard(f) {
           <div style="font-size:12.5px;font-weight:600;color:var(--sub);">Projected health</div>
           <div style="font-size:11.5px;color:var(--faint);margin-left:auto;">% vs year</div>
         </div>
-        <div id="tm-forecast-chart">${f.projected_pct?.length > 1 ? "" : `<div class="tm-empty" style="padding:24px;">No projection points yet</div>`}</div>
+        <div id="tm-forecast-chart">${f.projected_pct?.length > 1 ? "" : miniEmptyHtml("No projection points yet")}</div>
       </div>
       ${f.note ? `<div class="tm-stat-note">${esc(f.note)}</div>` : ""}
     </div>`;
@@ -2594,8 +2663,8 @@ function rangePredictorCard(model, roster) {
         <div style="font-size:14px;font-weight:600;">Range predictor</div>
         <div style="font-size:12px;color:var(--faint);margin-left:auto;">${trust ? esc(trust) : "trained on your drives"}</div>
       </div>
-      ${model && !ready ? `<div class="tm-empty" style="padding:20px;">${esc(model?.note || "Not enough data yet — the range model needs more completed drives before it can predict. Keep driving (and logging) and this fills in.")}</div>` : ""}
-      ${!model ? `<div class="tm-empty" style="padding:20px;">The range-prediction endpoint isn't available on this worker yet — it hasn't been deployed. Once it is, enter a trip below to estimate energy use.</div>` : ""}
+      ${model && !ready ? miniEmptyHtml(model?.note || "Not enough data yet — the range model needs more completed drives before it can predict. Keep driving (and logging) and this fills in.") : ""}
+      ${!model ? miniEmptyHtml("The range-prediction endpoint isn't available on this worker yet — it hasn't been deployed. Once it is, enter a trip below to estimate energy use.") : ""}
       <div class="tm-predict-form" style="${model && !ready ? "opacity:0.5;" : ""}">
         <div class="tm-predict-grid">
           <label class="tm-predict-field"><span>Distance (km)</span><input id="tm-pr-distance" class="tm-gate-input" type="number" inputmode="decimal" min="0" step="1" placeholder="e.g. 120"></label>
