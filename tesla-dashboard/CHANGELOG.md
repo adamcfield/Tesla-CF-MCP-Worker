@@ -9,6 +9,29 @@ feature or screen, the **patch** version for fixes/tweaks/copy changes, and the
 configured. See `CLAUDE.md` at the repo root for the policy on keeping this file
 and `APP_VERSION` (in `app.js`) in sync.
 
+## 1.3.0 — 2026-07-06
+
+Sentry Mode event log — "fully utilize" the telemetry rather than just the
+boolean on/off already visible.
+
+- `ingest.ts` now normalizes `SentryMode` into one vocabulary regardless of
+  which shape the account streams: a plain boolean (REST poll, or a
+  telemetry config not yet upgraded) becomes `"armed"`/`"off"`; the richer
+  `SentryModeState` enum (`Idle`/`Armed`/`Aware`/`Panic`) has its prefix
+  stripped and is lowercased. Legacy rows recorded before this change (a bare
+  0/1) are still read correctly — the reader falls back to them.
+- New backend derivation `getSentryLog`: armed-hours over the window, and —
+  only when the account actually streams the full enum — a trigger-event
+  list (transitions into Aware/Panic) each paired with the nearest known GPS
+  position. `enum_available` tells the two cases apart; a boolean-only
+  account gets armed-hours and a note explaining that true trigger detection
+  needs the fuller telemetry config, instead of silently showing zero events
+  forever. New `GET /data/sentry-log` endpoint and `get_sentry_log` MCP tool
+  (read-scope).
+- New "Sentry Mode" card on the Vampire drain screen: armed hours, trigger
+  event count (panic events called out), and — when available — a table of
+  each event's time, state transition and location.
+
 ## 1.2.1 — 2026-07-06
 
 Closed the real gaps in the field-mapping pass from 1.1.0/1.2.0 — fields that

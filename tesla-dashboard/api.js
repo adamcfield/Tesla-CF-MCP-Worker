@@ -170,6 +170,8 @@ export const data = {
   safetyFeatures: (vin, days) => getJson("/data/safety-features", { vin, days }),
   /** Climate/comfort habits (seat heater/cooling per side, auto-climate %). New endpoint — may 404. */
   climateHabits: (vin, days) => getJson("/data/climate-habits", { vin, days }),
+  /** Sentry Mode armed-hours + (when the account streams the full enum) trigger event log. New endpoint — may 404. */
+  sentryLog: (vin, days) => getJson("/data/sentry-log", { vin, days }),
   /**
    * Range prediction. With no distance_km, returns {model, ready} so the screen
    * can show model quality + a form; with params, returns the prediction. New endpoint — may 404.

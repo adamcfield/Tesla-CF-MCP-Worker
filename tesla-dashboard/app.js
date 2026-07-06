@@ -5,7 +5,7 @@ import { destroyMaps, renderPointMap, renderRouteMap, renderLifetimeMap, createR
 // Bump on every change to this dashboard (UI, features, or the /data/*
 // endpoints it depends on) and add a matching entry to CHANGELOG.md — see
 // the versioning policy in the repo's CLAUDE.md. Shown in the sidebar footer.
-const APP_VERSION = "1.2.1";
+const APP_VERSION = "1.3.0";
 
 const root = document.getElementById("app");
 let shellBound = false; // guards one-time attach of the root click handler + sync timer
@@ -2464,7 +2464,10 @@ function autoTicks(values, n) {
 // ---------------------------------------------------------------------------
 
 async function renderVampireDrain() {
-  const v = await cached("vampire", () => data.vampire(vin(), 30));
+  const [v, sentryLog] = await Promise.all([
+    cached("vampire", () => data.vampire(vin(), 30)),
+    safe(cached("sentry_log", () => data.sentryLog(vin(), 30)), null),
+  ]);
   if (!v.idle_spans) return setContent(emptyHtml("No idle periods recorded yet", "Vampire drain needs some parked time with telemetry samples before/after to measure loss."));
 
   const totalKwh = v.total_soc_lost_pct != null && (await cached("summary", () => data.summary(vin())))?.pack_kwh
@@ -2509,9 +2512,43 @@ async function renderVampireDrain() {
           </div>`).join("")}
       </div>
     </div>
+    ${sentryLogCard(sentryLog)}
   `);
 }
 function fmt3(n) { return n == null ? "—" : (Math.round(n * 1000) / 1000).toString(); }
+
+/**
+ * Sentry Mode event log. Works whichever way the account streams SentryMode:
+ * boolean-only (armed hours, no events, with a note explaining why) or the
+ * full Idle/Aware/Panic enum (armed hours + an actual trigger-event list with
+ * location). `enum_available` is what tells the two apart.
+ */
+function sentryLogCard(s) {
+  if (!s || s.has_data === false) return "";
+  return `
+    <div class="tm-card tm-card-pad">
+      <div class="tm-card-head"><div class="tm-card-head-title">Sentry Mode</div><div class="tm-card-head-sub">last ${s.days} days${s.enum_available ? " · full event detection" : " · on/off only"}</div></div>
+      <div class="tm-grid-half" style="gap:14px;">
+        <div><div class="tm-readout-label">Armed</div><div class="tm-readout-value">${fmt1(s.armed_hours)} <span class="tm-stat-unit">h</span></div></div>
+        <div><div class="tm-readout-label">Trigger events</div><div class="tm-readout-value" style="${s.panic_count > 0 ? "color:var(--warn);" : ""}">${s.event_count}${s.panic_count > 0 ? ` <span class="tm-stat-unit">(${s.panic_count} panic)</span>` : ""}</div></div>
+      </div>
+      ${s.note ? `<div class="tm-stat-note" style="margin-top:12px;">${esc(s.note)}</div>` : ""}
+      ${s.events && s.events.length ? `
+      <div class="tm-table-wrap" style="margin-top:14px;border-top:1px solid var(--border);">
+        <div style="min-width:420px;">
+          <div class="tm-table-head" style="grid-template-columns:1fr 90px 1fr;">
+            <div>When</div><div>Transition</div><div>Location</div>
+          </div>
+          ${s.events.map((e) => `
+            <div class="tm-table-row no-click" style="grid-template-columns:1fr 90px 1fr;">
+              <div style="font-size:12.5px;color:var(--sub);">${fmtDateTime(e.ts)}</div>
+              <div class="tm-mono" style="${e.to === "panic" ? "color:var(--warn);" : ""}">${esc(e.from)} → ${esc(e.to)}</div>
+              <div class="tm-mono" style="color:var(--sub);font-size:12.5px;">${e.lat != null ? `${e.lat.toFixed(4)}, ${e.lon.toFixed(4)}` : "—"}</div>
+            </div>`).join("")}
+        </div>
+      </div>` : ""}
+    </div>`;
+}
 
 // ===========================================================================
 // FRONTIER 1 — Insurance-grade

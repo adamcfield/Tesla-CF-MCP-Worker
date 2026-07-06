@@ -1280,6 +1280,106 @@ export async function getVampireDrain(env: Env, vin: string, days = 30): Promise
 }
 
 // ---------------------------------------------------------------------------
+// Derived: Sentry Mode event log
+// ---------------------------------------------------------------------------
+
+const SENTRY_ARMED_STATES = new Set(["armed", "aware", "panic"]);
+const SENTRY_TRIGGER_STATES = new Set(["aware", "panic"]);
+/** States that prove the account streams the full SentryModeState enum, not just booleans. */
+const SENTRY_ENUM_ONLY_STATES = new Set(["idle", "aware", "panic"]);
+
+/** Nearest position row to `ts` — prefers the closest preceding sample, falls back to the closest following one. */
+async function nearestPositionAt(
+  env: Env,
+  vin: string,
+  ts: number,
+): Promise<{ lat: number; lon: number } | null> {
+  const before = await env.DB.prepare(
+    `SELECT lat, lon, ts FROM positions WHERE vin = ?1 AND ts <= ?2 AND lat IS NOT NULL AND lon IS NOT NULL
+     ORDER BY ts DESC LIMIT 1`,
+  ).bind(vin, ts).first<{ lat: number; lon: number; ts: number }>();
+  const after = await env.DB.prepare(
+    `SELECT lat, lon, ts FROM positions WHERE vin = ?1 AND ts >= ?2 AND lat IS NOT NULL AND lon IS NOT NULL
+     ORDER BY ts ASC LIMIT 1`,
+  ).bind(vin, ts).first<{ lat: number; lon: number; ts: number }>();
+  if (!before && !after) return null;
+  if (!before) return { lat: after!.lat, lon: after!.lon };
+  if (!after) return { lat: before.lat, lon: before.lon };
+  const nearest = ts - before.ts <= after.ts - ts ? before : after;
+  return { lat: nearest.lat, lon: nearest.lon };
+}
+
+/**
+ * Sentry Mode event log over the trailing `days`. Reads the `sentry` EAV
+ * field with a query that's backward-compatible with rows recorded before
+ * normalizeSentryState() existed (legacy rows stored a bare 0/1 in
+ * value_num; new rows store the normalized string in value_text) —
+ * COALESCE reads both shapes uniformly.
+ *
+ * `enum_available` is only true once the account has actually streamed one
+ * of the enum-only states (idle/aware/panic) — on a boolean-only account
+ * (REST poll, or a telemetry config not yet upgraded) it stays false and
+ * `events` will always be empty, since "armed" vs "off" alone can't tell an
+ * actual proximity/motion trigger apart from someone just enabling Sentry.
+ * The `note` field explains that gap rather than silently showing zero
+ * events forever.
+ */
+export async function getSentryLog(env: Env, vin: string, days = 30): Promise<unknown> {
+  await ensureSchema(env);
+  const sinceTs = Math.floor(Date.now() / 1000) - days * 86400;
+  const rs = await env.DB.prepare(
+    `SELECT ts, COALESCE(value_text, CASE WHEN value_num = 1 THEN 'armed' WHEN value_num = 0 THEN 'off' END) AS state
+     FROM telemetry_events
+     WHERE vin = ?1 AND field = 'sentry' AND ts >= ?2
+     ORDER BY ts ASC`,
+  ).bind(vin, sinceTs).all<{ ts: number; state: string | null }>();
+  const rows = (rs.results ?? []).filter((r) => r.state != null) as { ts: number; state: string }[];
+
+  if (!rows.length) {
+    return {
+      vin, days, has_data: false,
+      note: "No Sentry Mode telemetry recorded yet.",
+    };
+  }
+
+  const enumAvailable = rows.some((r) => SENTRY_ENUM_ONLY_STATES.has(r.state));
+
+  let armedSeconds = 0;
+  const nowTs = Math.floor(Date.now() / 1000);
+  const rawEvents: { ts: number; from: string; to: string }[] = [];
+  for (let i = 0; i < rows.length; i++) {
+    const row = rows[i]!;
+    const prev = i > 0 ? rows[i - 1]! : null;
+    const nextTs = i + 1 < rows.length ? rows[i + 1]!.ts : nowTs;
+    if (SENTRY_ARMED_STATES.has(row.state)) armedSeconds += Math.max(0, nextTs - row.ts);
+    if (prev && prev.state !== row.state && SENTRY_TRIGGER_STATES.has(row.state)) {
+      rawEvents.push({ ts: row.ts, from: prev.state, to: row.state });
+    }
+  }
+
+  const events = await Promise.all(
+    rawEvents.map(async (e) => {
+      const pos = await nearestPositionAt(env, vin, e.ts);
+      return { ts: e.ts, from: e.from, to: e.to, lat: pos?.lat ?? null, lon: pos?.lon ?? null };
+    }),
+  );
+
+  return {
+    vin,
+    days,
+    has_data: true,
+    enum_available: enumAvailable,
+    note: enumAvailable
+      ? undefined
+      : "This account only streams Sentry Mode as on/off (armed/off) — Tesla's richer Idle/Aware/Panic states aren't in the telemetry config yet, so real trigger events (someone approaching, an impact) can't be distinguished from just enabling Sentry. Armed-time is still tracked below. Streaming the full enum (via configure_telemetry) would unlock actual event detection.",
+    armed_hours: round(armedSeconds / 3600, 1),
+    event_count: events.length,
+    panic_count: events.filter((e) => e.to === "panic").length,
+    events: events.slice(-50).reverse(),
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Derived: tracking summary
 // ---------------------------------------------------------------------------
 
