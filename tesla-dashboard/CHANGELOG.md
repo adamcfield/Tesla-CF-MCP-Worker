@@ -9,6 +9,20 @@ feature or screen, the **patch** version for fixes/tweaks/copy changes, and the
 configured. See `CLAUDE.md` at the repo root for the policy on keeping this file
 and `APP_VERSION` (in `app.js`) in sync.
 
+## 1.5.1 — 2026-07-06
+
+Make the save-location failure reason actually visible, and clarify what
+the API usage table is (and isn't).
+
+- The 1.5.0 fix put the real save-location error in the button's `title` —
+  a hover-only tooltip, invisible in a screenshot and unusable on touch. It
+  now renders as plain text under the form instead.
+- API usage screen: added a note explaining the call-log table is a
+  per-day/per-kind cost summary (one row per day+kind, count growing in
+  place), not a live per-call feed — and that the "synced Xs ago" seen
+  elsewhere is the dashboard re-reading its own already-stored data, not a
+  new billed Tesla API call.
+
 ## 1.5.0 — 2026-07-06
 
 Places: add a spot proactively instead of only naming ones the car already

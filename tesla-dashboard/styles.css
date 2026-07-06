@@ -292,6 +292,7 @@ body {
 .tm-suggest-info { min-width: 160px; flex: 1 1 200px; }
 .tm-suggest-form { display: flex; gap: 8px; align-items: center; flex: 0 0 auto; }
 .tm-suggest-input { width: 170px; padding: 6px 10px; font-size: 12.5px; }
+.tm-suggest-error { flex-basis: 100%; font-size: 12px; color: var(--warn); }
 .tm-spinner {
   width: 22px; height: 22px; border-radius: 50%; border: 2.5px solid var(--line);
   border-top-color: var(--accent); animation: tmSpin 0.7s linear infinite;
