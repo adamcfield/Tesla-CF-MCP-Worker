@@ -422,7 +422,8 @@ export default {
       // assign-driver above: read scope suffices, and it can't touch the
       // vehicle). Lets the dashboard turn a "suggested place" — a frequent
       // stop it already detected — into a saved geofence in one step, instead
-      // of requiring a separate MCP tool call.
+      // of requiring a separate MCP tool call. Also doubles as the edit route
+      // (pass id) for renaming/re-tagging an already-saved location.
       if (path === "/data/save-location" && request.method === "POST") {
         if (scope === null) return json({ error: "unauthorized" }, 401);
         const name = url.searchParams.get("name")?.trim().slice(0, 120);
@@ -432,7 +433,21 @@ export default {
         if (!Number.isFinite(lat) || !Number.isFinite(lon)) return json({ error: "lat/lon query params required" }, 400);
         const radiusParam = url.searchParams.get("radius_m");
         const radius_m = radiusParam != null && radiusParam !== "" ? Number(radiusParam) : undefined;
-        return json(await setLocation(env, { name, lat, lon, radius_m: Number.isFinite(radius_m as number) ? radius_m : undefined }));
+        const idParam = url.searchParams.get("id");
+        const id = idParam != null && idParam !== "" ? Number(idParam) : undefined;
+        // Absent entirely = "leave tags as-is" (setLocation's update path);
+        // present-but-empty = "explicitly clear tags" — both distinct from a
+        // comma-separated list of names.
+        const driversParam = url.searchParams.get("drivers");
+        const drivers = driversParam != null
+          ? driversParam.split(",").map((d) => d.trim()).filter(Boolean)
+          : undefined;
+        return json(await setLocation(env, {
+          id: Number.isFinite(id as number) ? id : undefined,
+          name, lat, lon,
+          radius_m: Number.isFinite(radius_m as number) ? radius_m : undefined,
+          drivers,
+        }));
       }
 
       // --- data exports (CSV/GPX downloads; read scope) -------------------

@@ -658,6 +658,24 @@ interface LocationRow {
   lon: number;
   radius_m: number;
   cost_per_kwh: number | null;
+  drivers: string[]; // empty = untagged/shared (every pre-existing row)
+}
+
+/** Raw `locations.drivers` column (JSON array text, or null) → a clean string[]. */
+function parseLocationDrivers(raw: unknown): string[] {
+  if (typeof raw !== "string" || !raw) return [];
+  try {
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed.filter((d): d is string => typeof d === "string" && d.trim() !== "") : [];
+  } catch {
+    return [];
+  }
+}
+
+/** string[] (or undefined/empty) → what gets stored in the `drivers` column — null means untagged/shared. */
+function serializeLocationDrivers(drivers?: string[] | null): string | null {
+  const cleaned = (drivers ?? []).map((d) => d.trim()).filter(Boolean);
+  return cleaned.length ? JSON.stringify(cleaned) : null;
 }
 
 /** Nearest named location containing (lat,lon), or null. */
@@ -689,28 +707,35 @@ async function locationCostPerKwh(
 
 export async function listLocations(env: Env): Promise<LocationRow[]> {
   await ensureSchema(env);
-  const rs = await env.DB.prepare(`SELECT * FROM locations ORDER BY name`).all<LocationRow>();
-  return rs.results ?? [];
+  const rs = await env.DB.prepare(`SELECT * FROM locations ORDER BY name`).all<LocationRow & { drivers: unknown }>();
+  return (rs.results ?? []).map((r) => ({ ...r, drivers: parseLocationDrivers(r.drivers) }));
 }
 
 export async function setLocation(
   env: Env,
-  loc: { id?: number; name: string; lat: number; lon: number; radius_m?: number; cost_per_kwh?: number },
+  loc: { id?: number; name: string; lat: number; lon: number; radius_m?: number; cost_per_kwh?: number; drivers?: string[] | null },
 ): Promise<{ id: number }> {
   await ensureSchema(env);
   if (loc.id !== undefined) {
+    // `drivers` omitted (undefined) on an update means "leave tags as they
+    // are" — e.g. renaming a location shouldn't silently wipe its driver
+    // tags. Only an explicit array (including []) overwrites them.
+    const driversJson = loc.drivers !== undefined
+      ? serializeLocationDrivers(loc.drivers)
+      : (await env.DB.prepare(`SELECT drivers FROM locations WHERE id = ?1`).bind(loc.id).first<{ drivers: string | null }>())?.drivers ?? null;
     await env.DB.prepare(
-      `UPDATE locations SET name=?2, lat=?3, lon=?4, radius_m=?5, cost_per_kwh=?6 WHERE id=?1`,
+      `UPDATE locations SET name=?2, lat=?3, lon=?4, radius_m=?5, cost_per_kwh=?6, drivers=?7 WHERE id=?1`,
     )
-      .bind(loc.id, loc.name, loc.lat, loc.lon, loc.radius_m ?? 150, loc.cost_per_kwh ?? null)
+      .bind(loc.id, loc.name, loc.lat, loc.lon, loc.radius_m ?? 150, loc.cost_per_kwh ?? null, driversJson)
       .run();
     return { id: loc.id };
   }
+  const driversJson = serializeLocationDrivers(loc.drivers);
   const res = await env.DB.prepare(
-    `INSERT INTO locations (name, lat, lon, radius_m, cost_per_kwh, created_ts)
-     VALUES (?1,?2,?3,?4,?5,?6)`,
+    `INSERT INTO locations (name, lat, lon, radius_m, cost_per_kwh, created_ts, drivers)
+     VALUES (?1,?2,?3,?4,?5,?6,?7)`,
   )
-    .bind(loc.name, loc.lat, loc.lon, loc.radius_m ?? 150, loc.cost_per_kwh ?? null, Math.floor(Date.now() / 1000))
+    .bind(loc.name, loc.lat, loc.lon, loc.radius_m ?? 150, loc.cost_per_kwh ?? null, Math.floor(Date.now() / 1000), driversJson)
     .run();
   return { id: Number(res.meta.last_row_id ?? 0) };
 }
@@ -723,7 +748,7 @@ export async function deleteLocation(env: Env, id: number): Promise<{ deleted: b
 
 export async function getLocationStats(env: Env, id: number): Promise<unknown> {
   await ensureSchema(env);
-  const loc = await env.DB.prepare(`SELECT * FROM locations WHERE id = ?1`).bind(id).first();
+  const loc = await env.DB.prepare(`SELECT * FROM locations WHERE id = ?1`).bind(id).first<{ drivers: unknown }>();
   if (!loc) return { error: "location not found" };
   const drivesFrom = await env.DB.prepare(`SELECT COUNT(*) n FROM drives WHERE start_location_id = ?1`).bind(id).first<{ n: number }>();
   const drivesTo = await env.DB.prepare(`SELECT COUNT(*) n FROM drives WHERE end_location_id = ?1`).bind(id).first<{ n: number }>();
@@ -732,7 +757,7 @@ export async function getLocationStats(env: Env, id: number): Promise<unknown> {
      FROM charge_sessions WHERE location_id = ?1 AND status = 'complete'`,
   ).bind(id).first<{ n: number; kwh: number; cost: number }>();
   return {
-    location: loc,
+    location: { ...loc, drivers: parseLocationDrivers(loc.drivers) },
     drives_from: drivesFrom?.n ?? 0,
     drives_to: drivesTo?.n ?? 0,
     charge_sessions: charges?.n ?? 0,

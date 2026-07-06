@@ -144,6 +144,10 @@ export async function ensureSchema(env: Env): Promise<void> {
     ),
     env.DB.prepare(`CREATE INDEX IF NOT EXISTS idx_locations_name ON locations (name)`),
   ]);
+  // drivers: JSON array of driver names this location is tagged to (e.g. "Home"
+  // tagged to both household drivers, "Work" tagged to just one) — null/empty
+  // means untagged/shared, matching every pre-existing row.
+  await addMissingColumns(env, "locations", { drivers: "TEXT" });
 
   // charge_sessions predates the tracking build — widen it in place. D1 has no
   // "ADD COLUMN IF NOT EXISTS", so diff against the live table first.

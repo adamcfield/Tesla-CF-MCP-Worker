@@ -203,11 +203,18 @@ export const data = {
   assignDriver: (id, driver) =>
     fetch(workerOrigin() + "/data/assign-driver?" + new URLSearchParams({ id, driver: driver || "", token: auth.token }), { method: "POST" })
       .then((r) => (r.ok ? r.json() : Promise.reject(new ApiError("assign failed", r.status)))),
-  /** Benign metadata write (token-gated POST) — save a named geofence (e.g. naming a suggested place or one found by address). */
-  saveLocation: ({ name, lat, lon, radius_m }) =>
+  /**
+   * Benign metadata write (token-gated POST) — save a named geofence (e.g. naming a
+   * suggested place or one found by address), or edit one (pass id). `drivers`
+   * (optional) tags which household driver(s) it belongs to; omit entirely to
+   * leave existing tags untouched on an edit, pass [] to explicitly clear them.
+   */
+  saveLocation: ({ id, name, lat, lon, radius_m, drivers }) =>
     fetch(workerOrigin() + "/data/save-location?" + new URLSearchParams({
       name, lat: String(lat), lon: String(lon),
+      ...(id != null ? { id: String(id) } : {}),
       ...(radius_m != null ? { radius_m: String(radius_m) } : {}),
+      ...(drivers !== undefined ? { drivers: drivers.join(",") } : {}),
       token: auth.token,
     }), { method: "POST" })
       .then(async (r) => {

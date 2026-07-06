@@ -5,7 +5,7 @@ import { destroyMaps, renderPointMap, renderRouteMap, renderLifetimeMap, createR
 // Bump on every change to this dashboard (UI, features, or the /data/*
 // endpoints it depends on) and add a matching entry to CHANGELOG.md — see
 // the versioning policy in the repo's CLAUDE.md. Shown in the sidebar footer.
-const APP_VERSION = "1.5.1";
+const APP_VERSION = "1.6.0";
 
 const root = document.getElementById("app");
 let shellBound = false; // guards one-time attach of the root click handler + sync timer
@@ -196,11 +196,12 @@ const state = {
   openDriveId: null,
   openChargeId: null,
   openPlaceId: null,
+  editingPlaceTags: false, // place-detail: driver-tag chip editor open/closed
   renderedScreen: null, // last screen whose content actually painted (skeleton vs refresh-in-place)
   syncing: false,
   lastSync: null,
   apiBudget: null, // Tesla API spend snapshot, surfaced in the sidebar
-  placeSearch: { results: null, selected: null, error: null }, // Places screen: "add by address" geocode flow
+  placeSearch: { suggestions: [], roster: [], results: null, selected: null, error: null }, // "Add a place" modal state
   cache: {}, // per-screen fetched payloads, cleared on manual refresh
   askTranscript: [], // Ask-Tessa chat history — in-memory only, never persisted
   askPending: false, // true while an /ai/ask request is in flight
@@ -446,6 +447,7 @@ function renderShell() {
         </header>
         <div class="tm-scroll"><div class="tm-page" id="tm-content"></div></div>
       </main>
+      <div id="tm-modal-root"></div>
     </div>`;
 
   // Bind once: renderShell re-runs on every navigation, but the click handler
@@ -456,6 +458,7 @@ function renderShell() {
     setInterval(tickSyncLabel, 1000);
     document.addEventListener("keydown", (ev) => {
       if (ev.key !== "Escape") return;
+      if (closeModal()) return;
       const open = document.querySelectorAll(".tm-map-card.tm-map-full");
       if (!open.length) return;
       open.forEach((c) => { c.classList.remove("tm-map-full"); const b = c.querySelector(".tm-map-expand"); if (b) { b.innerHTML = "&#10530;"; b.title = "Expand map"; } });
@@ -480,6 +483,29 @@ function tickSyncLabel() {
   if (el && state.lastSync) el.textContent = `synced ${agoLabel(state.lastSync)}`;
 }
 
+// ---------------------------------------------------------------------------
+// Modal — a single reusable popup root (see #tm-modal-root in renderShell).
+// Backdrop click or Escape closes it; clicking inside the card doesn't
+// (the card carries data-action="modal-noop" so the delegated click handler's
+// closest("[data-action]") stops there instead of bubbling to the backdrop).
+// ---------------------------------------------------------------------------
+
+function openModal(html) {
+  const root = document.getElementById("tm-modal-root");
+  if (!root) return;
+  root.innerHTML = `
+    <div class="tm-modal-backdrop" data-action="modal-close">
+      <div class="tm-modal" data-action="modal-noop">${html}</div>
+    </div>`;
+}
+/** Returns true if a modal was open (and is now closed) — lets the Escape handler know whether to also handle map-fullscreen. */
+function closeModal() {
+  const root = document.getElementById("tm-modal-root");
+  if (!root || !root.innerHTML) return false;
+  root.innerHTML = "";
+  return true;
+}
+
 function setSyncing(on) {
   state.syncing = on;
   const el = document.getElementById("tm-sync-text");
@@ -494,6 +520,12 @@ function onRootClick(e) {
   const t = e.target.closest("[data-action]");
   if (!t) return;
   const action = t.dataset.action;
+  if (action === "modal-noop") {
+    return; // absorbs clicks on inert areas inside the modal card
+  } else if (action === "modal-close") {
+    closeModal();
+    return;
+  }
   if (action === "nav-toggle") {
     setNavOpen(!document.querySelector("[data-tm-root]")?.classList.contains("tm-nav-open"));
     return;
@@ -539,39 +571,16 @@ function onRootClick(e) {
     if (!t.querySelector(".tm-driver-edit")) beginDriverEdit(t, Number(t.dataset.id));
   } else if (action === "open-place") {
     state.openPlaceId = Number(t.dataset.id);
+    state.editingPlaceTags = false;
     pushHistory();
     renderPlaceDetail();
   } else if (action === "back-places") {
     state.openPlaceId = null;
+    state.editingPlaceTags = false;
     pushHistory();
     renderPlaces();
-  } else if (action === "save-suggested-location") {
-    const input = document.getElementById(t.dataset.input);
-    const name = input ? input.value.trim() : "";
-    if (!name) { input?.focus(); return; }
-    const lat = Number(t.dataset.lat), lon = Number(t.dataset.lon);
-    t.disabled = true;
-    t.textContent = "Saving…";
-    data.saveLocation({ name, lat, lon }).then(() => {
-      delete state.cache.locations;
-      delete state.cache.suggested_locations;
-      state.placeSearch = { results: null, selected: null, error: null };
-      t.textContent = "Saved ✓";
-      setTimeout(() => { if (state.screen === "pl") renderPlaces(); }, 700);
-    }).catch((e) => {
-      t.disabled = false;
-      t.textContent = "Failed";
-      // A hover-only title is invisible on touch and easy to miss on desktop
-      // too — show the reason as plain text right under the form.
-      const row = t.closest(".tm-suggest-row");
-      let err = row?.querySelector(".tm-suggest-error");
-      if (row && !err) {
-        err = document.createElement("div");
-        err.className = "tm-suggest-error";
-        row.appendChild(err);
-      }
-      if (err) err.textContent = e?.message || "Save failed — unknown error";
-    });
+  } else if (action === "open-add-place") {
+    openAddPlaceModal();
   } else if (action === "place-search") {
     const input = document.getElementById("tm-place-search-input");
     const q = input ? input.value.trim() : "";
@@ -579,22 +588,77 @@ function onRootClick(e) {
     t.disabled = true;
     t.textContent = "Searching…";
     data.geocode(q).then((res) => {
-      state.placeSearch = { results: res?.results || [], selected: null, error: null };
-      renderPlaces();
+      state.placeSearch.results = res?.results || [];
+      state.placeSearch.error = null;
+      refreshAddPlaceModal();
     }).catch((e) => {
-      state.placeSearch = { results: null, selected: null, error: e?.message || "Search failed" };
-      renderPlaces();
+      state.placeSearch.results = null;
+      state.placeSearch.error = e?.message || "Search failed";
+      refreshAddPlaceModal();
     });
   } else if (action === "place-search-select") {
-    const idx = Number(t.dataset.idx);
-    const hit = state.placeSearch.results?.[idx];
+    const hit = state.placeSearch.results?.[Number(t.dataset.idx)];
     if (hit) {
-      state.placeSearch = { results: state.placeSearch.results, selected: hit, error: null };
-      renderPlaces();
+      state.placeSearch.selected = hit;
+      state.placeSearch.error = null;
+      refreshAddPlaceModal();
+    }
+  } else if (action === "place-suggestion-select") {
+    const s = state.placeSearch.suggestions?.[Number(t.dataset.idx)];
+    if (s) {
+      state.placeSearch.selected = { label: s.label || "Unnamed spot", lat: s.lat, lon: s.lon };
+      state.placeSearch.error = null;
+      refreshAddPlaceModal();
     }
   } else if (action === "place-search-clear") {
-    state.placeSearch = { results: null, selected: null, error: null };
-    renderPlaces();
+    state.placeSearch.selected = null;
+    state.placeSearch.error = null;
+    refreshAddPlaceModal();
+  } else if (action === "toggle-driver-chip") {
+    t.classList.toggle("active");
+  } else if (action === "place-modal-save") {
+    const input = document.getElementById("tm-place-modal-name");
+    const name = input ? input.value.trim() : "";
+    if (!name) { input?.focus(); return; }
+    const lat = Number(t.dataset.lat), lon = Number(t.dataset.lon);
+    const drivers = selectedDriverNames(t.closest(".tm-driver-tags-scope"));
+    t.disabled = true;
+    t.textContent = "Saving…";
+    data.saveLocation({ name, lat, lon, drivers }).then(() => {
+      delete state.cache.locations;
+      delete state.cache.suggested_locations;
+      closeModal();
+      renderPlaces();
+    }).catch((e) => {
+      t.disabled = false;
+      t.textContent = "Save";
+      state.placeSearch.error = e?.message || "Save failed — unknown error";
+      refreshAddPlaceModal();
+    });
+  } else if (action === "edit-place-tags") {
+    state.editingPlaceTags = true;
+    renderPlaceDetail();
+  } else if (action === "cancel-place-tags") {
+    state.editingPlaceTags = false;
+    renderPlaceDetail();
+  } else if (action === "save-place-tags") {
+    const id = Number(t.dataset.id);
+    const drivers = selectedDriverNames(t.closest(".tm-driver-tags-scope"));
+    t.disabled = true;
+    t.textContent = "Saving…";
+    safe(data.locationStats(id), null).then((stats) => {
+      if (!stats?.location) throw new Error("Couldn't reload this location");
+      const l = stats.location;
+      return data.saveLocation({ id, name: l.name, lat: l.lat, lon: l.lon, drivers });
+    }).then(() => {
+      delete state.cache.locations;
+      state.editingPlaceTags = false;
+      renderPlaceDetail();
+    }).catch((e) => {
+      t.disabled = false;
+      t.textContent = "Save tags";
+      alert(e?.message || "Save failed — unknown error");
+    });
   } else if (action === "quick-assign") {
     // One-tap self-assign: reuses the same assign-driver write the manual
     // input/Save flow already uses, just skipping the typing.
@@ -2002,45 +2066,94 @@ function driverStat(label, value, unit) {
 // Places — saved geofence locations + visit-based suggestions
 // ---------------------------------------------------------------------------
 
+/** Toggleable driver-tag chips — click reads directly off the DOM at save time, no state needed. */
+function driverChipsHtml(names, preselected = []) {
+  if (!names.length) return "";
+  return `<div class="tm-driver-tags">${names.map((n) => `
+    <button type="button" class="tm-driver-chip ${preselected.includes(n) ? "active" : ""}" data-action="toggle-driver-chip" data-name="${esc(n)}">${esc(n)}</button>`).join("")}</div>`;
+}
+function selectedDriverNames(scopeEl) {
+  return [...scopeEl.querySelectorAll(".tm-driver-chip.active")].map((c) => c.dataset.name);
+}
+
 /**
- * "Add a place" by address: search /geocode, pick a hit, name it, save it —
- * for a spot the car hasn't visited (yet) rather than a detected frequent stop.
+ * "Add a place" popup: pick a frequent stop the car has already visited, or
+ * search an address for one it hasn't — either way, name it, optionally tag
+ * which driver(s) it's for, and save it. Kept as a modal (not always on the
+ * page) since most visits to Places don't involve adding anything.
  */
-function placeSearchCardHtml() {
+function addPlaceModalHtml() {
   const ps = state.placeSearch;
-  return `
-    <div class="tm-card tm-card-pad">
-      <div class="tm-card-head" style="margin-bottom:6px;">
-        <div class="tm-card-head-title">Add a place</div>
-        <div class="tm-card-head-sub">search an address and pin it, instead of waiting for a suggestion</div>
+  const names = [...new Set((ps.roster || []).map(rosterName).filter(Boolean))].sort((a, b) => a.localeCompare(b));
+  const closeBtn = `<button class="tm-icon-btn" data-action="modal-close" aria-label="Close">✕</button>`;
+
+  if (ps.selected) {
+    return `
+      <div class="tm-modal-head">
+        <div><div class="tm-modal-title">Name this place</div><div class="tm-modal-sub">${esc(ps.selected.label || "")}</div></div>
+        ${closeBtn}
       </div>
-      ${ps.selected ? `
-        <div class="tm-suggest-row">
-          <span class="tm-dot" style="background:var(--accent);"></span>
-          <div class="tm-suggest-info">
-            <div class="tm-activity-title">${esc(ps.selected.label)}</div>
-            <div class="tm-activity-meta">${fmt1(ps.selected.lat)}, ${fmt1(ps.selected.lon)}</div>
-          </div>
-          <div class="tm-suggest-form">
-            <input class="tm-gate-input tm-suggest-input" id="tm-place-search-name" type="text" placeholder="Name this place…" autocomplete="off" maxlength="120">
-            <button class="tm-chip-btn" data-action="save-suggested-location" data-lat="${ps.selected.lat}" data-lon="${ps.selected.lon}" data-input="tm-place-search-name">Save</button>
-            <button class="tm-link-btn" data-action="place-search-clear">✕ choose another</button>
-          </div>
+      <div id="tm-place-modal-map" class="tm-map-canvas" style="height:160px;border-radius:10px;margin-bottom:14px;"></div>
+      <div class="tm-driver-tags-scope">
+        <input class="tm-gate-input" id="tm-place-modal-name" type="text" placeholder="Name this place…" autocomplete="off" maxlength="120" style="width:100%;">
+        ${names.length ? `<div class="tm-stat-label" style="margin:12px 0 2px;">Whose place is this? <span style="font-weight:400;text-transform:none;letter-spacing:0;">(optional — leave blank to share)</span></div>${driverChipsHtml(names)}` : ""}
+        ${ps.error ? `<div class="tm-suggest-error" style="margin-top:10px;">${esc(ps.error)}</div>` : ""}
+        <div class="tm-flex-row" style="gap:14px;margin-top:16px;">
+          <button class="tm-chip-btn" data-action="place-modal-save" data-lat="${ps.selected.lat}" data-lon="${ps.selected.lon}">Save</button>
+          <button class="tm-link-btn" data-action="place-search-clear">✕ choose another</button>
         </div>
-      ` : `
-        <div class="tm-suggest-form" style="margin-bottom:${ps.results ? "10px" : "0"};">
-          <input class="tm-gate-input tm-suggest-input" id="tm-place-search-input" type="text" placeholder="Address, place name…" autocomplete="off" maxlength="120">
-          <button class="tm-chip-btn" data-action="place-search">Search</button>
-        </div>
-        ${ps.error ? `<div class="tm-stat-note" style="color:var(--warn);">${esc(ps.error)}</div>` : ""}
-        ${ps.results && ps.results.length ? ps.results.map((r, i) => `
-          <div class="tm-table-row" data-action="place-search-select" data-idx="${i}" style="grid-template-columns:1fr auto;">
-            <div class="tm-ellipsis" style="font-size:13.5px;">${esc(r.label)}</div>
-            <span class="tm-pill tm-pill-chip" style="font-size:10.5px;">${esc(r.source)}</span>
-          </div>`).join("") : ""}
-        ${ps.results && ps.results.length === 0 ? `<div class="tm-stat-note">No matches — try a fuller address.</div>` : ""}
-      `}
-    </div>`;
+      </div>`;
+  }
+
+  return `
+    <div class="tm-modal-head">
+      <div><div class="tm-modal-title">Add a place</div><div class="tm-modal-sub">from a frequent stop, or search an address</div></div>
+      ${closeBtn}
+    </div>
+    ${ps.suggestions.length ? `
+      <div class="tm-stat-label" style="margin-bottom:6px;">Frequent stops</div>
+      ${ps.suggestions.map((s, i) => `
+        <div class="tm-table-row" data-action="place-suggestion-select" data-idx="${i}" style="grid-template-columns:1fr auto;">
+          <div class="tm-ellipsis" style="font-size:13.5px;">${esc(s.label || "Unnamed spot")}</div>
+          <span class="tm-pill tm-pill-chip" style="font-size:10.5px;">${fmt0(s.visits ?? 0)} visit${s.visits === 1 ? "" : "s"}</span>
+        </div>`).join("")}
+      <div style="border-top:1px solid var(--line2);margin:14px 0;"></div>
+    ` : ""}
+    <div class="tm-stat-label" style="margin-bottom:6px;">Search an address</div>
+    <div class="tm-flex-row" style="gap:8px;">
+      <input class="tm-gate-input" id="tm-place-search-input" type="text" placeholder="Address, place name…" autocomplete="off" maxlength="120" style="flex:1;">
+      <button class="tm-chip-btn" data-action="place-search">Search</button>
+    </div>
+    ${ps.error ? `<div class="tm-suggest-error" style="margin-top:8px;">${esc(ps.error)}</div>` : ""}
+    ${ps.results && ps.results.length ? `<div style="margin-top:10px;">${ps.results.map((r, i) => `
+      <div class="tm-table-row" data-action="place-search-select" data-idx="${i}" style="grid-template-columns:1fr auto;">
+        <div class="tm-ellipsis" style="font-size:13.5px;">${esc(r.label)}</div>
+        <span class="tm-pill tm-pill-chip" style="font-size:10.5px;">${esc(r.source)}</span>
+      </div>`).join("")}</div>` : ""}
+    ${ps.results && ps.results.length === 0 ? `<div class="tm-stat-note" style="margin-top:8px;">No matches — try a fuller address.</div>` : ""}
+  `;
+}
+
+/** Re-renders the already-open modal from current state (no data fetch — used after search/select/clear/error). */
+function refreshAddPlaceModal() {
+  openModal(addPlaceModalHtml());
+  if (state.placeSearch.selected) {
+    const { lat, lon, label } = state.placeSearch.selected;
+    requestAnimationFrame(() => renderPointMap(document.getElementById("tm-place-modal-map"), lat, lon, esc(label || "")));
+  }
+}
+
+/** Opens the modal, fetching suggestions + the driver roster once. */
+async function openAddPlaceModal() {
+  state.placeSearch = { suggestions: [], roster: [], results: null, selected: null, error: null };
+  openModal(addPlaceModalHtml()); // instant empty shell while the fetch is in flight
+  const [suggestedRes, roster] = await Promise.all([
+    safe(cached("suggested_locations", () => data.suggestedLocations(vin())), null),
+    loadDriverRoster(),
+  ]);
+  state.placeSearch.suggestions = suggestedRes?.suggestions || [];
+  state.placeSearch.roster = roster;
+  refreshAddPlaceModal();
 }
 
 async function renderPlaces() {
@@ -2049,44 +2162,31 @@ async function renderPlaces() {
     safe(cached("locations", () => data.locations()), []),
     safe(cached("suggested_locations", () => data.suggestedLocations(vin())), null),
   ]);
-  const suggestions = suggestedRes?.suggestions || [];
+  const suggestionCount = suggestedRes?.suggestions?.length || 0;
 
   setContent(`
-    ${placeSearchCardHtml()}
-    ${suggestions.length ? `
-    <div class="tm-card tm-card-pad">
-      <div class="tm-card-head" style="margin-bottom:6px;">
-        <div class="tm-card-head-title">Suggested places</div>
-        <div class="tm-card-head-sub">frequent stops that aren't saved yet — name one to save it</div>
-      </div>
-      ${suggestions.map((s, i) => `
-        <div class="tm-suggest-row">
-          <span class="tm-dot" style="background:var(--warn);"></span>
-          <div class="tm-suggest-info">
-            <div class="tm-activity-title">${esc(s.label || "Unnamed spot")}</div>
-            <div class="tm-activity-meta">${s.lat != null && s.lon != null ? `${fmt1(s.lat)}, ${fmt1(s.lon)}` : ""}${s.visits != null ? ` · ${s.visits} visit${s.visits === 1 ? "" : "s"}` : ""}</div>
-          </div>
-          <div class="tm-suggest-form">
-            <input class="tm-gate-input tm-suggest-input" id="tm-suggest-name-${i}" type="text" placeholder="Name this place…" autocomplete="off" maxlength="120">
-            <button class="tm-chip-btn" data-action="save-suggested-location" data-lat="${s.lat}" data-lon="${s.lon}" data-input="tm-suggest-name-${i}">Save</button>
-          </div>
-        </div>`).join("")}
-    </div>` : ""}
+    <div class="tm-flex-row" style="justify-content:space-between;flex-wrap:wrap;gap:10px;">
+      <div style="font-size:12.5px;color:var(--sub);">${locations.length} saved place${locations.length === 1 ? "" : "s"}${suggestionCount ? ` · ${suggestionCount} frequent stop${suggestionCount === 1 ? "" : "s"} not yet named` : ""}</div>
+      <button class="tm-chip-btn" data-action="open-add-place">+ Add a place</button>
+    </div>
     ${locations.length ? `
     <div class="tm-card tm-table-wrap">
-      <div style="min-width:520px;">
+      <div style="min-width:560px;">
         <div class="tm-table-head" style="grid-template-columns:1fr 150px 96px;">
           <div>Name</div><div class="tm-right">Coordinates</div><div class="tm-right">Radius</div>
         </div>
         ${locations.map((l) => `
           <div class="tm-table-row" data-action="open-place" data-id="${l.id}" style="grid-template-columns:1fr 150px 96px;">
-            <div class="tm-ellipsis" style="font-size:13.5px;font-weight:500;">${esc(l.name)}</div>
+            <div style="min-width:0;">
+              <div class="tm-ellipsis" style="font-size:13.5px;font-weight:500;">${esc(l.name)}</div>
+              ${l.drivers?.length ? `<div style="margin-top:4px;">${l.drivers.map((d) => `<span class="tm-place-tag" style="margin-right:4px;">${esc(d)}</span>`).join("")}</div>` : ""}
+            </div>
             <div class="tm-right tm-mono" style="color:var(--sub);font-size:12px;">${fmt1(l.lat)}, ${fmt1(l.lon)}</div>
             <div class="tm-right tm-mono" style="color:var(--sub);">${l.radius_m != null ? fmt0(l.radius_m) + " m" : "—"}</div>
           </div>`).join("")}
         <div class="tm-foot-note">${locations.length} saved place${locations.length === 1 ? "" : "s"} · click one for its stats.</div>
       </div>
-    </div>` : emptyHtml("No saved places yet", suggestions.length ? "Name one of the frequent stops above to save it — drives and charges will start labeling against it automatically." : "Once a spot has been visited a few times it'll show up above as a suggestion you can name and save.")}
+    </div>` : emptyHtml("No saved places yet", suggestionCount ? "Add one of the frequent stops the car's already visited, or search an address." : "Add a place by address, or wait for a frequent-stop suggestion once a spot's been visited a few times.")}
   `);
 }
 
@@ -2101,6 +2201,8 @@ async function renderPlaceDetail() {
   // Location stats carry no currency of their own — borrow the dominant one
   // from any already-loaded charge sessions (falls back to € in money()).
   const cur = dominantCurrency(state.cache.all_charges || []);
+  const roster = state.editingPlaceTags ? await loadDriverRoster() : [];
+  const names = [...new Set(roster.map(rosterName).filter(Boolean))].sort((a, b) => a.localeCompare(b));
 
   setContent(`
     <div class="tm-flex-row" style="gap:14px;flex-wrap:wrap;">
@@ -2108,7 +2210,17 @@ async function renderPlaceDetail() {
       <div style="font-size:15px;font-weight:600;">${esc(l.name)}</div>
       <div style="font-size:12.5px;color:var(--faint);">${fmt1(l.lat)}, ${fmt1(l.lon)} · ${l.radius_m != null ? fmt0(l.radius_m) + " m radius" : ""}</div>
     </div>
-    <div class="tm-grid-2-wide">
+    <div class="tm-driver-tags-scope tm-flex-row" style="align-items:center;flex-wrap:wrap;gap:8px;margin-top:6px;">
+      ${state.editingPlaceTags ? `
+        ${names.length ? driverChipsHtml(names, l.drivers) : `<span style="font-size:12px;color:var(--faint);">No household drivers on the roster yet.</span>`}
+        <button class="tm-chip-btn" style="padding:5px 12px;" data-action="save-place-tags" data-id="${l.id}">Save tags</button>
+        <button class="tm-link-btn" data-action="cancel-place-tags">✕ cancel</button>
+      ` : `
+        ${l.drivers?.length ? l.drivers.map((d) => `<span class="tm-place-tag">${esc(d)}</span>`).join("") : `<span style="font-size:12px;color:var(--faint);">Shared — not tagged to a specific driver</span>`}
+        <button class="tm-link-btn" data-action="edit-place-tags">edit tags</button>
+      `}
+    </div>
+    <div class="tm-grid-2-wide" style="margin-top:14px;">
       <div class="tm-card tm-map-card" style="min-height:280px;">
         <div id="tm-place-map" class="tm-map-canvas"></div>
       </div>
