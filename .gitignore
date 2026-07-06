@@ -9,3 +9,4 @@ node_modules/
 tsc*.log
 # Design source (large binary, kept locally only)
 TeslaMate UI redesign.zip
+HANDOFF.md
