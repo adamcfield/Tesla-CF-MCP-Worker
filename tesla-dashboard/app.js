@@ -1,6 +1,6 @@
 import { auth, data, mcp, verifyToken, exportUrl, ApiError } from "./api.js";
 import { svgLineChart, svgBarChart, svgDonut, svgSplitBar } from "./charts.js";
-import { destroyMaps, renderPointMap, renderRouteMap, renderLifetimeMap, attachReplay } from "./map.js";
+import { destroyMaps, renderPointMap, renderRouteMap, renderLifetimeMap, attachReplay, invalidateMaps } from "./map.js";
 
 const root = document.getElementById("app");
 let shellBound = false; // guards one-time attach of the root click handler + sync timer
@@ -159,6 +159,7 @@ const state = {
   renderedScreen: null, // last screen whose content actually painted (skeleton vs refresh-in-place)
   syncing: false,
   lastSync: null,
+  apiBudget: null, // Tesla API spend snapshot, surfaced in the sidebar
   cache: {}, // per-screen fetched payloads, cleared on manual refresh
   askTranscript: [], // Ask-Tessa chat history — in-memory only, never persisted
   askPending: false, // true while an /ai/ask request is in flight
@@ -336,6 +337,7 @@ function renderShell() {
             ${g.items.map(([key, label]) => `<button class="tm-navitem ${state.screen === key ? "active" : ""}" data-action="nav" data-screen="${key}">${esc(label)}</button>`).join("")}
           </div>`).join("")}
         <div class="tm-sidefoot">
+          <div class="tm-sidebudget" id="tm-sidebudget">${sideBudgetHtml(state.apiBudget)}</div>
           <div class="tm-segment">
             <button class="tm-segbtn ${state.theme === "light" ? "active" : ""}" data-action="theme" data-theme="light">Light</button>
             <button class="tm-segbtn ${state.theme === "dark" ? "active" : ""}" data-action="theme" data-theme="dark">Dark</button>
@@ -368,8 +370,16 @@ function renderShell() {
   if (!shellBound) {
     root.addEventListener("click", onRootClick);
     setInterval(tickSyncLabel, 1000);
+    document.addEventListener("keydown", (ev) => {
+      if (ev.key !== "Escape") return;
+      const open = document.querySelectorAll(".tm-map-card.tm-map-full");
+      if (!open.length) return;
+      open.forEach((c) => { c.classList.remove("tm-map-full"); const b = c.querySelector(".tm-map-expand"); if (b) { b.innerHTML = "&#10530;"; b.title = "Expand map"; } });
+      setTimeout(() => invalidateMaps(), 80);
+    });
     shellBound = true;
   }
+  refreshSideBudget();
 }
 
 function tickSyncLabel() {
@@ -477,6 +487,14 @@ function onRootClick(e) {
     copyToClipboard(t.dataset.text || "", t);
   } else if (action === "print-report") {
     openPrintableReport(Number(t.dataset.id));
+  } else if (action === "map-expand") {
+    const card = t.closest(".tm-map-card");
+    if (card) {
+      const full = card.classList.toggle("tm-map-full");
+      t.innerHTML = full ? "&#10005;" : "&#10530;";
+      t.title = full ? "Close map" : "Expand map";
+      setTimeout(() => invalidateMaps(), 80);
+    }
   }
 }
 
@@ -648,6 +666,31 @@ function budgetCard(b) {
     </div>`;
 }
 
+/** Compact Tesla API spend for the sidebar (calls + $ spend, above the theme toggle). */
+function sideBudgetHtml(b) {
+  if (!b || typeof b !== "object") return "";
+  const cap = b.poll_budget_usd > 0 ? b.poll_budget_usd : null;
+  const pct = cap ? Math.min(100, (b.spent_usd / cap) * 100) : 0;
+  const color = b.poll_allowed === false ? "var(--warn)" : "var(--good)";
+  const calls = [b.reads, b.billed_reads, b.count, b.calls].find((v) => typeof v === "number");
+  return `
+    <div class="tm-sidebudget-top">
+      <span>Tesla API${calls != null ? ` · ${fmt0(calls)} calls` : ""}</span>
+      <span class="tm-mono">$${fmt2(b.spent_usd)}${cap ? ` <span style="color:var(--faint);">/ ${fmt0(cap)}</span>` : ""}</span>
+    </div>
+    ${cap ? `<div class="tm-sidebudget-bar"><div style="width:${pct.toFixed(1)}%;background:${color};"></div></div>` : ""}`;
+}
+function updateSideBudget(b) {
+  if (b) state.apiBudget = b;
+  const el = document.getElementById("tm-sidebudget");
+  if (el) el.innerHTML = sideBudgetHtml(state.apiBudget);
+}
+async function refreshSideBudget() {
+  if (!vin()) return;
+  const s = await safe(cached("summary", () => data.summary(vin())), null);
+  if (s?.api_budget) updateSideBudget(s.api_budget);
+}
+
 function readTyres(src) {
   // Live vehicle_data uses tpms_pressure_fl; the worker's latest-state store
   // uses the canonical short form tpms_fl. Accept both. Values are bar.
@@ -696,6 +739,32 @@ function tpmsCard(t) {
       </div>
       <div class="tm-stat-note">${latest?.ts != null ? `as of ${fmtDateTime(latest.ts)}` : "no TPMS samples yet"}</div>
     </div>`;
+}
+
+/**
+ * Compact tyre status for the Overview readout: a green check when all four
+ * corners are present and within tolerance, otherwise the worst-offending
+ * corner (label + PSI, or "no reading" when a sensor value is missing).
+ */
+function tyreStatusHtml(t) {
+  const latest = t?.latest ?? null;
+  const trend = t?.trend_bar_per_week ?? null;
+  if (!latest) return `<span style="color:var(--faint);">—</span>`;
+  const cells = WHEELS.map(([w, label]) => ({ w, label, v: typeof latest[w] === "number" ? latest[w] : null }));
+  const nums = cells.filter((c) => c.v != null).map((c) => c.v);
+  if (nums.length === 0) return `<span style="color:var(--faint);">—</span>`;
+  let median = null;
+  if (nums.length === 4) { const s = nums.slice().sort((a, b) => a - b); median = (s[1] + s[2]) / 2; }
+  const bad = cells.filter((c) => {
+    if (c.v == null) return true;
+    if (median != null && Math.abs(c.v - median) > 0.3) return true;
+    const tr = trend?.[c.w];
+    return typeof tr === "number" && tr < -0.15;
+  });
+  if (bad.length === 0 && nums.length === 4) return `<span style="color:var(--good);">&#10003; OK</span>`;
+  const c = bad[0];
+  const val = c.v != null ? `${fmt0(c.v * 14.5038)} PSI` : "no reading";
+  return `<span style="color:var(--warn);">${c.label} ${val}${bad.length > 1 ? ` +${bad.length - 1}` : ""}</span>`;
 }
 
 async function renderOverview() {
@@ -780,7 +849,7 @@ async function renderOverview() {
           <div class="tm-grid-metrics" style="grid-template-columns:repeat(auto-fit,minmax(90px,1fr));gap:14px;">
             <div><div class="tm-readout-label">Inside</div><div class="tm-readout-value">${inside != null ? fmt1(inside) + " °C" : "—"}</div></div>
             <div><div class="tm-readout-label">Outside</div><div class="tm-readout-value">${outside != null ? fmt1(outside) + " °C" : "—"}</div></div>
-            <div><div class="tm-readout-label">Tyres</div><div class="tm-readout-value">${tyres != null ? fmt1(tyres * 14.5038) + " PSI" : "—"}</div></div>
+            <div><div class="tm-readout-label">Tyres</div><div class="tm-readout-value">${tyreStatusHtml(tires)}</div></div>
             <div><div class="tm-readout-label">Security</div><div class="tm-readout-value">${locked == null ? "—" : locked ? "Locked" : "Unlocked"}</div></div>
           </div>
         ` : `
@@ -793,6 +862,7 @@ async function renderOverview() {
       </div>
       <div class="tm-card tm-map-card">
         <div id="tm-ov-map" class="tm-map-canvas"></div>
+        ${lat != null && lon != null ? `<button class="tm-map-expand" data-action="map-expand" title="Expand map" aria-label="Expand map">&#10530;</button>` : ""}
         ${lat != null && lon != null ? `
         <div class="tm-map-overlay">
           <div style="min-width:0;">
@@ -820,8 +890,6 @@ async function renderOverview() {
         <div class="tm-stat-label">Avg efficiency</div>
         <div class="tm-stat-value">${summary?.avg_efficiency_wh_km != null ? fmt0(summary.avg_efficiency_wh_km) : "—"} <span class="tm-stat-unit">Wh/km</span></div>
       </div>
-      ${tpmsCard(tires)}
-      ${budgetCard(summary?.api_budget)}
     </div>
 
     <div class="tm-grid-2">
@@ -839,18 +907,24 @@ async function renderOverview() {
       </div>
       <div class="tm-card tm-card-pad">
         <div style="font-size:14px;font-weight:600;margin-bottom:14px;">Recent activity</div>
-        ${recentFeed.length ? recentFeed.map((e) => `
-          <div class="tm-activity-row">
+        ${recentFeed.length ? recentFeed.map((e) => {
+          const link = e.type === "drive" && e.raw ? `data-action="open-drive" data-id="${e.raw.id}"` : e.type === "charge" && e.raw ? `data-action="open-charge" data-id="${e.raw.id}"` : "";
+          return `
+          <div class="tm-activity-row ${link ? "tm-activity-click" : ""}" ${link}>
             <span class="tm-dot" style="background:${EVENT_COLOR[e.type]};"></span>
             <div style="min-width:0;">
               <div class="tm-activity-title">${esc(e.title)}</div>
               <div class="tm-activity-meta">${esc(e.meta)}</div>
             </div>
             <span class="tm-activity-time">${fmtTime(e.ts)}</span>
-          </div>`).join("") : `<div class="tm-empty">Nothing recorded yet</div>`}
+            ${link ? `<span class="tm-activity-chev">&#8250;</span>` : ""}
+          </div>`;
+        }).join("") : `<div class="tm-empty">Nothing recorded yet</div>`}
       </div>
     </div>
   `);
+
+  updateSideBudget(summary?.api_budget);
 
   if (lat != null && lon != null) {
     requestAnimationFrame(() => renderPointMap(document.getElementById("tm-ov-map"), lat, lon, esc(nearestLoc?.name || "Current location")));
@@ -960,15 +1034,19 @@ async function renderTimeline() {
         <div>
           <div class="tm-timeline-day-label">${esc(day.label)}</div>
           <div class="tm-card" style="padding:6px 22px;">
-            ${day.ev.map((e) => `
-              <div class="tm-timeline-row">
+            ${day.ev.map((e) => {
+              const link = e.type === "drive" && e.raw ? `data-action="open-drive" data-id="${e.raw.id}"` : e.type === "charge" && e.raw ? `data-action="open-charge" data-id="${e.raw.id}"` : "";
+              return `
+              <div class="tm-timeline-row ${link ? "tm-activity-click" : ""}" ${link}>
                 <span class="tm-timeline-time">${fmtTime(e.ts)}</span>
                 <span class="tm-dot" style="background:${EVENT_COLOR[e.type]};"></span>
                 <div style="min-width:0;">
                   <div class="tm-timeline-title">${esc(e.title)}</div>
                   <div class="tm-timeline-meta">${esc(e.meta)}</div>
                 </div>
-              </div>`).join("")}
+                ${link ? `<span class="tm-activity-chev" style="margin-left:auto;">&#8250;</span>` : ""}
+              </div>`;
+            }).join("")}
           </div>
         </div>`).join("")}
       <div style="font-size:11.5px;color:var(--faint);">Showing the last ${feed.length} recorded events.</div>

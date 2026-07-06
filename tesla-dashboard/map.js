@@ -31,6 +31,13 @@ function track(map) {
   return map;
 }
 
+/** Re-measure all live maps after a container resize (e.g. the fullscreen toggle). */
+export function invalidateMaps() {
+  for (const m of activeMaps) {
+    try { m.invalidateSize(); } catch { /* map already gone */ }
+  }
+}
+
 const GOVMAP_ATTR = '&copy; <a href="https://www.govmap.gov.il/">מפ"י / GovMap</a>';
 const OSM_ATTR = "&copy; OpenStreetMap contributors";
 const CARTO_ATTR = "&copy; OpenStreetMap &copy; CARTO";

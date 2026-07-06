@@ -85,6 +85,12 @@ body {
 }
 .tm-segbtn.active { background: var(--card); color: var(--text); box-shadow: 0 1px 3px rgba(10,14,24,0.16); }
 .tm-sidemeta { padding: 12px 10px 0; font-size: 11px; color: var(--faint); }
+.tm-sidebudget { padding: 2px 10px 12px; }
+.tm-sidebudget:empty { display: none; }
+.tm-sidebudget-top { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; font-size: 11px; color: var(--sub); }
+.tm-sidebudget-top .tm-mono { font-size: 11px; }
+.tm-sidebudget-bar { height: 3px; border-radius: 999px; background: var(--chip); margin-top: 5px; overflow: hidden; }
+.tm-sidebudget-bar > div { height: 100%; border-radius: 999px; }
 
 /* ---------- main ---------- */
 .tm-main { flex: 1; min-width: 0; display: flex; flex-direction: column; overflow: hidden; }
@@ -182,6 +188,9 @@ body {
 .tm-activity-title { font-size: 13px; font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .tm-activity-meta { font-size: 11.5px; color: var(--sub); margin-top: 1px; }
 .tm-activity-time { margin-left: auto; font-size: 11px; color: var(--faint); font-family: var(--mono); white-space: nowrap; }
+.tm-activity-click { cursor: pointer; }
+.tm-activity-click:hover { background: color-mix(in oklab, var(--text) 4%, transparent); border-radius: 8px; }
+.tm-activity-chev { color: var(--faint); font-size: 17px; margin-left: 8px; flex: none; line-height: 1; }
 
 .tm-timeline-day-label {
   font-size: 12px; font-weight: 600; letter-spacing: 0.06em; text-transform: uppercase;
@@ -243,6 +252,20 @@ body {
   box-shadow: 0 1px 4px rgba(10,14,24,0.14);
 }
 .tm-replay-btn:hover { border-color: var(--faint); }
+
+/* Overview map: expand-to-fullscreen toggle. */
+.tm-map-expand {
+  position: absolute; left: 14px; top: 14px; z-index: 600;
+  width: 36px; height: 36px; border-radius: 10px;
+  border: 1px solid var(--line); background: var(--card); color: var(--text);
+  cursor: pointer; font-size: 15px; line-height: 1; display: grid; place-items: center;
+  box-shadow: 0 1px 4px rgba(10,14,24,0.14);
+}
+.tm-map-expand:hover { border-color: var(--faint); }
+.tm-map-card.tm-map-full {
+  position: fixed; inset: 0; z-index: 3000; margin: 0;
+  border-radius: 0; width: 100vw; height: 100vh; height: 100dvh; min-height: 0;
+}
 
 /* ---------- drives: driver column inline edit ---------- */
 .tm-driver-suggested { color: var(--faint); font-style: italic; }
