@@ -5,7 +5,7 @@ import { destroyMaps, renderPointMap, renderRouteMap, renderLifetimeMap, createR
 // Bump on every change to this dashboard (UI, features, or the /data/*
 // endpoints it depends on) and add a matching entry to CHANGELOG.md — see
 // the versioning policy in the repo's CLAUDE.md. Shown in the sidebar footer.
-const APP_VERSION = "1.5.0";
+const APP_VERSION = "1.5.1";
 
 const root = document.getElementById("app");
 let shellBound = false; // guards one-time attach of the root click handler + sync timer
@@ -561,7 +561,16 @@ function onRootClick(e) {
     }).catch((e) => {
       t.disabled = false;
       t.textContent = "Failed";
-      t.title = e?.message || "Save failed";
+      // A hover-only title is invisible on touch and easy to miss on desktop
+      // too — show the reason as plain text right under the form.
+      const row = t.closest(".tm-suggest-row");
+      let err = row?.querySelector(".tm-suggest-error");
+      if (row && !err) {
+        err = document.createElement("div");
+        err.className = "tm-suggest-error";
+        row.appendChild(err);
+      }
+      if (err) err.textContent = e?.message || "Save failed — unknown error";
     });
   } else if (action === "place-search") {
     const input = document.getElementById("tm-place-search-input");
@@ -934,6 +943,7 @@ async function renderApiUsage() {
             <div class="tm-right tm-mono" style="color:var(--sub);">${fmt0(e.count)}</div>
             <div class="tm-right tm-mono">$${fmt2(e.cost_usd)}</div>
           </div>`).join("") : `<div class="tm-empty" style="padding:20px 22px;">No call log entries in this window yet.</div>`}
+        <div class="tm-foot-note">One row per day + call kind, not one row per call — reload this screen to see today's row grow. This is a cost summary, not a live call feed: the "synced Xs ago" you see elsewhere is the dashboard re-reading already-stored data (free), separate from the worker's own, much slower Tesla API poll cadence that this screen tracks.</div>
       </div>
     </div>
   `);
