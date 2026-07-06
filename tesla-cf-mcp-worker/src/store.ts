@@ -164,6 +164,7 @@ export async function ensureSchema(env: Env): Promise<void> {
     site_name: "TEXT", // Supercharger site label (no lat/lon from that endpoint)
     currency: "TEXT",
     source: "TEXT", // 'derived' (live telemetry) | 'backfill' (Tesla history)
+    curve_compacted: "INTEGER", // 1 once this session's charge curve has been thinned (see rules.ts compactOldHistory)
   });
   await env.DB.prepare(
     `CREATE UNIQUE INDEX IF NOT EXISTS idx_charge_sessions_ext ON charge_sessions (external_id) WHERE external_id IS NOT NULL`,
@@ -208,6 +209,7 @@ export async function ensureSchema(env: Env): Promise<void> {
     // person — the exposed stand-in for seat-position memory).
     fp_temp_set: "REAL", // driver-side climate setpoint
     fp_seat_heater: "REAL", // driver seat-heater level (0-3)
+    positions_compacted: "INTEGER", // 1 once this drive's route has been thinned (see rules.ts compactOldHistory)
   });
 
   // Positions predates the IMU columns — widen in place for old deployments.

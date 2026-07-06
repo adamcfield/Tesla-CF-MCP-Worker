@@ -39,6 +39,20 @@ export interface Env {
    */
   RETENTION_DAYS?: string;
   /**
+   * Optional age (days) past which a completed drive's route positions and a
+   * completed charge session's curve samples are THINNED, not deleted — the
+   * drive/charge_session summary row (distance, energy, cost, behavior score,
+   * etc.) is the long-term "essence" and is never touched. Default 365; set
+   * "0" to disable and keep full-resolution history forever.
+   */
+  COMPACT_AFTER_DAYS?: string;
+  /**
+   * Optional target sample count to keep per drive route once it's past
+   * COMPACT_AFTER_DAYS (endpoints are always kept; the rest is evenly
+   * decimated). Default 60. Charge curves use half this, floored at 10.
+   */
+  COMPACT_MAX_POINTS?: string;
+  /**
    * Optional soft cap (USD) for AUTOMATED polling spend per month, default 9.
    * Clamped under the $9.70 hard ceiling that protects Tesla's $10 disable line.
    */

@@ -430,7 +430,18 @@ Make/n8n can call any MCP tool directly: `POST /mcp` with
 - **Retention:** set `RETENTION_DAYS` (var or secret) to prune the bulky raw
   stores — `telemetry_events` and idle (non-drive) `positions` — older than
   that on each tick. Derived history (drives, charge sessions + curves, the
-  state timeline, drive-route positions) is never pruned. Unset = keep forever.
+  state timeline, drive-route positions) is never pruned. Unset = keep forever
+  (defaults to 400 days).
+- **Compaction:** separately, set `COMPACT_AFTER_DAYS` (default 365; `"0"`
+  disables it) to THIN — never delete — a completed drive's route positions
+  or a completed charge session's curve samples once they're that old, down
+  to `COMPACT_MAX_POINTS` (default 60; charge curves use half that) evenly
+  spaced points, always keeping the first/last sample. The drive/session
+  summary row itself (distance, energy, cost, behavior score, degradation
+  samples, etc.) is the long-term value and is never touched — only the
+  fine-grained time series shrinks, so an old route/curve is still viewable,
+  just at lower resolution. Batched (100 drives + 100 sessions per tick) and
+  marked so the backlog is worked off gradually rather than rescanned.
 - **CORS:** `/data/*` and `/mcp` send `access-control-allow-origin: *` and
   answer the `OPTIONS` preflight before the auth gate, so browser clients (the
   dashboard, MCP inspectors) work cross-origin. Safe because auth is a
