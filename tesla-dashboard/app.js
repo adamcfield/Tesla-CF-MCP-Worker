@@ -5,7 +5,7 @@ import { destroyMaps, renderPointMap, renderRouteMap, renderLifetimeMap, createR
 // Bump on every change to this dashboard (UI, features, or the /data/*
 // endpoints it depends on) and add a matching entry to CHANGELOG.md — see
 // the versioning policy in the repo's CLAUDE.md. Shown in the sidebar footer.
-const APP_VERSION = "1.4.0";
+const APP_VERSION = "1.5.0";
 
 const root = document.getElementById("app");
 let shellBound = false; // guards one-time attach of the root click handler + sync timer
@@ -200,6 +200,7 @@ const state = {
   syncing: false,
   lastSync: null,
   apiBudget: null, // Tesla API spend snapshot, surfaced in the sidebar
+  placeSearch: { results: null, selected: null, error: null }, // Places screen: "add by address" geocode flow
   cache: {}, // per-screen fetched payloads, cleared on manual refresh
   askTranscript: [], // Ask-Tessa chat history — in-memory only, never persisted
   askPending: false, // true while an /ai/ask request is in flight
@@ -554,12 +555,37 @@ function onRootClick(e) {
     data.saveLocation({ name, lat, lon }).then(() => {
       delete state.cache.locations;
       delete state.cache.suggested_locations;
+      state.placeSearch = { results: null, selected: null, error: null };
       t.textContent = "Saved ✓";
       setTimeout(() => { if (state.screen === "pl") renderPlaces(); }, 700);
-    }).catch(() => {
+    }).catch((e) => {
       t.disabled = false;
       t.textContent = "Failed";
+      t.title = e?.message || "Save failed";
     });
+  } else if (action === "place-search") {
+    const input = document.getElementById("tm-place-search-input");
+    const q = input ? input.value.trim() : "";
+    if (!q) { input?.focus(); return; }
+    t.disabled = true;
+    t.textContent = "Searching…";
+    data.geocode(q).then((res) => {
+      state.placeSearch = { results: res?.results || [], selected: null, error: null };
+      renderPlaces();
+    }).catch((e) => {
+      state.placeSearch = { results: null, selected: null, error: e?.message || "Search failed" };
+      renderPlaces();
+    });
+  } else if (action === "place-search-select") {
+    const idx = Number(t.dataset.idx);
+    const hit = state.placeSearch.results?.[idx];
+    if (hit) {
+      state.placeSearch = { results: state.placeSearch.results, selected: hit, error: null };
+      renderPlaces();
+    }
+  } else if (action === "place-search-clear") {
+    state.placeSearch = { results: null, selected: null, error: null };
+    renderPlaces();
   } else if (action === "quick-assign") {
     // One-tap self-assign: reuses the same assign-driver write the manual
     // input/Save flow already uses, just skipping the typing.
@@ -1966,6 +1992,47 @@ function driverStat(label, value, unit) {
 // Places — saved geofence locations + visit-based suggestions
 // ---------------------------------------------------------------------------
 
+/**
+ * "Add a place" by address: search /geocode, pick a hit, name it, save it —
+ * for a spot the car hasn't visited (yet) rather than a detected frequent stop.
+ */
+function placeSearchCardHtml() {
+  const ps = state.placeSearch;
+  return `
+    <div class="tm-card tm-card-pad">
+      <div class="tm-card-head" style="margin-bottom:6px;">
+        <div class="tm-card-head-title">Add a place</div>
+        <div class="tm-card-head-sub">search an address and pin it, instead of waiting for a suggestion</div>
+      </div>
+      ${ps.selected ? `
+        <div class="tm-suggest-row">
+          <span class="tm-dot" style="background:var(--accent);"></span>
+          <div class="tm-suggest-info">
+            <div class="tm-activity-title">${esc(ps.selected.label)}</div>
+            <div class="tm-activity-meta">${fmt1(ps.selected.lat)}, ${fmt1(ps.selected.lon)}</div>
+          </div>
+          <div class="tm-suggest-form">
+            <input class="tm-gate-input tm-suggest-input" id="tm-place-search-name" type="text" placeholder="Name this place…" autocomplete="off" maxlength="120">
+            <button class="tm-chip-btn" data-action="save-suggested-location" data-lat="${ps.selected.lat}" data-lon="${ps.selected.lon}" data-input="tm-place-search-name">Save</button>
+            <button class="tm-link-btn" data-action="place-search-clear">✕ choose another</button>
+          </div>
+        </div>
+      ` : `
+        <div class="tm-suggest-form" style="margin-bottom:${ps.results ? "10px" : "0"};">
+          <input class="tm-gate-input tm-suggest-input" id="tm-place-search-input" type="text" placeholder="Address, place name…" autocomplete="off" maxlength="120">
+          <button class="tm-chip-btn" data-action="place-search">Search</button>
+        </div>
+        ${ps.error ? `<div class="tm-stat-note" style="color:var(--warn);">${esc(ps.error)}</div>` : ""}
+        ${ps.results && ps.results.length ? ps.results.map((r, i) => `
+          <div class="tm-table-row" data-action="place-search-select" data-idx="${i}" style="grid-template-columns:1fr auto;">
+            <div class="tm-ellipsis" style="font-size:13.5px;">${esc(r.label)}</div>
+            <span class="tm-pill tm-pill-chip" style="font-size:10.5px;">${esc(r.source)}</span>
+          </div>`).join("") : ""}
+        ${ps.results && ps.results.length === 0 ? `<div class="tm-stat-note">No matches — try a fuller address.</div>` : ""}
+      `}
+    </div>`;
+}
+
 async function renderPlaces() {
   if (state.openPlaceId != null) return renderPlaceDetail();
   const [locations, suggestedRes] = await Promise.all([
@@ -1975,6 +2042,7 @@ async function renderPlaces() {
   const suggestions = suggestedRes?.suggestions || [];
 
   setContent(`
+    ${placeSearchCardHtml()}
     ${suggestions.length ? `
     <div class="tm-card tm-card-pad">
       <div class="tm-card-head" style="margin-bottom:6px;">

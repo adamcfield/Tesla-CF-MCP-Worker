@@ -151,6 +151,8 @@ export const data = {
   states: (vin, hours) => getJson("/data/states", { vin, hours }),
   locations: () => getJson("/data/locations"),
   locationStats: (id) => getJson("/data/location-stats", { id }),
+  /** Forward-geocode an address to candidate {label, lat, lon, source} hits (GovMap, falling back to Nominatim). */
+  geocode: (q, lang) => getJson("/geocode", { q, lang }),
   driverScores: (vin) => getJson("/data/driver-scores", { vin }),
   efficiencyByTemp: (vin) => getJson("/data/efficiency-by-temp", { vin }),
   tires: (vin, days) => getJson("/data/tires", { vin, days }),
@@ -201,14 +203,21 @@ export const data = {
   assignDriver: (id, driver) =>
     fetch(workerOrigin() + "/data/assign-driver?" + new URLSearchParams({ id, driver: driver || "", token: auth.token }), { method: "POST" })
       .then((r) => (r.ok ? r.json() : Promise.reject(new ApiError("assign failed", r.status)))),
-  /** Benign metadata write (token-gated POST) — save a named geofence (e.g. naming a suggested place). */
+  /** Benign metadata write (token-gated POST) — save a named geofence (e.g. naming a suggested place or one found by address). */
   saveLocation: ({ name, lat, lon, radius_m }) =>
     fetch(workerOrigin() + "/data/save-location?" + new URLSearchParams({
       name, lat: String(lat), lon: String(lon),
       ...(radius_m != null ? { radius_m: String(radius_m) } : {}),
       token: auth.token,
     }), { method: "POST" })
-      .then((r) => (r.ok ? r.json() : Promise.reject(new ApiError("save failed", r.status)))),
+      .then(async (r) => {
+        if (r.ok) return r.json();
+        // Surface the worker's own error message (e.g. "name query param
+        // required") when there is one, instead of a bare status code —
+        // that's the difference between a diagnosable failure and "Failed".
+        const detail = await r.json().then((b) => b?.error).catch(() => null);
+        throw new ApiError(detail || `save failed (${r.status})`, r.status);
+      }),
 };
 
 export { ApiError };
