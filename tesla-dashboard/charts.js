@@ -76,7 +76,7 @@ export function svgLineChart({ width = 760, height = 210, series, yTicks = [], x
  *
  * `speedPts`/`elevPts`: [[minutes, value], …]. `events`: [{t (min), type:'brake'|'accel', speed, g}].
  */
-export function svgDriveChart({ speedPts, elevPts = [], events = [], durationMin = 0, width = 760, height = 240 }) {
+export function svgDriveChart({ speedPts, elevPts = [], events = [], tracks = [], durationMin = 0, width = 760, height = 240 }) {
   if (!speedPts || speedPts.length < 2) return { html: "", plot: null };
   const l = 48, r = 16, t = 16, b = 30;
   const x0 = 0;
@@ -125,10 +125,24 @@ export function svgDriveChart({ speedPts, elevPts = [], events = [], durationMin
     })
     .join("");
 
+  // Track-change markers: a "was this playing" timeline, not tied to speed,
+  // so they sit as a fixed row near the top rather than on the speed curve —
+  // a dashed guide down to the axis makes each one easy to line up by eye.
+  const MEDIA_COLOR = "#8A63D2";
+  const trackMarks = tracks
+    .map((tr) => {
+      const x = X(tr.t);
+      const who = tr.artist ? `${tr.title} — ${tr.artist}` : tr.title;
+      const label = `♪ ${who} · ${Math.round(tr.t)} min`;
+      return `<line x1="${x}" x2="${x}" y1="${t + 10}" y2="${bottom}" style="stroke:${MEDIA_COLOR};stroke-width:1;stroke-dasharray:2 3;opacity:0.3;pointer-events:none;"></line>`
+        + `<circle cx="${x}" cy="${t + 6}" r="3.5" style="fill:${MEDIA_COLOR};stroke:var(--card);stroke-width:1.2;"><title>${esc(label)}</title></circle>`;
+    })
+    .join("");
+
   const playhead = `<line id="tm-ph-line" x1="${l}" x2="${l}" y1="${t}" y2="${bottom}" style="stroke:var(--text);stroke-width:1.4;opacity:0;pointer-events:none;"></line>`
     + `<circle id="tm-ph-dot" cx="${l}" cy="${bottom}" r="5" style="fill:var(--accent);stroke:var(--card);stroke-width:2;opacity:0;pointer-events:none;"></circle>`;
 
-  const html = `<svg viewBox="0 0 ${width} ${height}" class="tm-svg-block" style="touch-action:none;user-select:none;">${grid}${scrub}${elev}${area}${line}${evMarks}${playhead}${xlabels}</svg>`;
+  const html = `<svg viewBox="0 0 ${width} ${height}" class="tm-svg-block" style="touch-action:none;user-select:none;">${grid}${scrub}${elev}${area}${line}${evMarks}${trackMarks}${playhead}${xlabels}</svg>`;
   return { html, plot: { X, Y, l, r, t, b, x0, x1, y0, y1, width, height, bottom } };
 }
 

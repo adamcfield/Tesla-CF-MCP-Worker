@@ -142,6 +142,8 @@ body {
   font-weight: 600; cursor: pointer; font-family: var(--ui);
 }
 .tm-chip-btn:hover { border-color: var(--faint); }
+.tm-chip-btn:disabled { opacity: 0.6; cursor: default; }
+.tm-chip-btn:disabled:hover { border-color: var(--line); }
 .tm-chip-btn.active { background: var(--text); color: var(--bg); border-color: var(--text); }
 .tm-chip-btn .n { font-family: var(--mono); font-size: 11px; opacity: 0.65; }
 
@@ -229,6 +231,65 @@ body {
   padding: 48px 20px; color: var(--sub); text-align: center; font-size: 13px;
 }
 .tm-empty-title { font-weight: 600; color: var(--text); font-size: 14px; }
+.tm-empty-icon {
+  width: 40px; height: 40px; margin-bottom: 2px; border-radius: 12px;
+  display: grid; place-items: center; font-size: 17px; font-weight: 600; color: var(--accent);
+  background: color-mix(in oklab, var(--accent) 12%, var(--card)); font-family: var(--mono);
+}
+/* Single-line empty note inside an already-titled card/chart (no icon, no heavy padding). */
+.tm-mini-empty { color: var(--sub); font-size: 13px; padding: 20px 2px; text-align: center; }
+
+/* ---------- shared card-section header: title + faint sub, optional right-aligned extra ---------- */
+.tm-card-head { display: flex; align-items: baseline; gap: 10px; margin-bottom: 18px; flex-wrap: wrap; }
+.tm-card-head-title { font-size: 14px; font-weight: 600; color: var(--text); }
+.tm-card-head-sub { font-size: 12px; color: var(--faint); }
+.tm-card-head-r { margin-left: auto; }
+
+/* ---------- invisible text-style button (disconnect, etc.) and a muted icon button (refresh) ---------- */
+.tm-link-btn {
+  background: none; border: none; color: inherit; font: inherit; cursor: pointer; padding: 0;
+  text-decoration: underline;
+}
+.tm-icon-btn {
+  background: none; border: none; color: var(--sub); cursor: pointer; font-size: 13px; padding: 2px;
+  border-radius: 6px; line-height: 1;
+}
+.tm-icon-btn:hover { color: var(--text); background: color-mix(in oklab, var(--text) 6%, transparent); }
+
+/* ---------- ranked horizontal bar list (e.g. "Top locations") ---------- */
+.tm-bar-row { display: grid; grid-template-columns: 220px 1fr 110px 110px; gap: 16px; align-items: center; }
+.tm-bar-track { height: 8px; border-radius: 999px; background: var(--chip); position: relative; }
+.tm-bar-fill { position: absolute; inset: 0 auto 0 0; border-radius: 999px; background: var(--accent); opacity: 0.85; }
+
+/* ---------- inline driver-edit cell: signal it diverges from the row's own click ---------- */
+.tm-edit-cell { cursor: text; text-decoration: underline dotted var(--faint) 1px; text-underline-offset: 2px; }
+.tm-edit-cell:hover { color: var(--text); }
+
+/* ---------- one-tap "quick assign" roster chips (self-assign a drive) ---------- */
+.tm-quick-assign { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+.tm-quick-chip {
+  border: none; border-radius: 999px; padding: 3px 10px; font-size: 11px; font-weight: 600;
+  background: var(--chip); color: var(--sub); cursor: pointer; font-family: var(--ui);
+}
+.tm-quick-chip:hover { background: color-mix(in oklab, var(--accent) 16%, var(--chip)); color: var(--text); }
+
+/* ---------- media: cover art thumbnail + leaderboard rows ---------- */
+.tm-media-cover {
+  width: 36px; height: 36px; border-radius: 8px; background: var(--chip); color: var(--faint);
+  display: grid; place-items: center; font-size: 15px; overflow: hidden; flex: none;
+}
+.tm-media-cover img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.tm-media-cover-lg { width: 56px; height: 56px; border-radius: 10px; font-size: 20px; }
+.tm-media-row { display: flex; align-items: center; gap: 10px; padding: 8px 2px; border-bottom: 1px solid var(--line2); }
+.tm-media-row:last-child { border-bottom: none; }
+.tm-media-rank { width: 16px; text-align: center; font-size: 11px; font-weight: 600; color: var(--faint); flex: none; }
+
+/* ---------- suggested-place row: name + Save form ---------- */
+.tm-suggest-row { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; padding: 11px 0; border-bottom: 1px solid var(--line2); }
+.tm-suggest-row:last-child { border-bottom: none; }
+.tm-suggest-info { min-width: 160px; flex: 1 1 200px; }
+.tm-suggest-form { display: flex; gap: 8px; align-items: center; flex: 0 0 auto; }
+.tm-suggest-input { width: 170px; padding: 6px 10px; font-size: 12.5px; }
 .tm-spinner {
   width: 22px; height: 22px; border-radius: 50%; border: 2.5px solid var(--line);
   border-top-color: var(--accent); animation: tmSpin 0.7s linear infinite;
@@ -515,6 +576,12 @@ select.tm-gate-input { font-family: var(--ui); cursor: pointer; }
   }
   /* The Household hint duplicates the driver-filter chips on a small screen. */
   .tm-roster-hint { display: none; }
+
+  .tm-bar-row { grid-template-columns: 1fr; gap: 4px; }
+  .tm-bar-row > :nth-child(3), .tm-bar-row > :nth-child(4) { text-align: left; }
+
+  .tm-suggest-form { flex-basis: 100%; }
+  .tm-suggest-input { flex: 1; width: auto; }
 }
 
 /* Respect users who opt out of motion (vestibular accessibility). */

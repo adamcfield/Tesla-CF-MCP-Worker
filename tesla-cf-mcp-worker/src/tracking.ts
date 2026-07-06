@@ -16,7 +16,7 @@
  */
 
 import { getChargingHistory, getVehicleDrivers } from "./api";
-import { getBudgetStatus } from "./budget";
+import { getBudgetForecast, getBudgetStatus } from "./budget";
 import { signDriveCertificate } from "./certificate";
 import { reverseGeocode } from "./geocode";
 import { postedLimitsForSamples } from "./roadlimits";
@@ -843,11 +843,17 @@ export async function backfillChargeAddresses(env: Env, vin: string, limit = 40)
   return { vin, examined: (rs.results ?? []).length, updated };
 }
 
-/** Assign (or clear, with driver=null) the driver of a drive. */
+/**
+ * Assign (or clear, with driver=null) the driver of a drive. This is always a
+ * HUMAN action (the dashboard's manual input/quick-assign, or the set_driver
+ * MCP tool) — tagged driver_source='manual' so it's visually distinct from,
+ * and always overrides, a system auto-assignment (see suggestDriverForDrive).
+ */
 export async function setDriveDriver(env: Env, id: number, driver: string | null): Promise<{ updated: boolean }> {
   await ensureSchema(env);
-  const res = await env.DB.prepare(`UPDATE drives SET driver = ?2 WHERE id = ?1`)
-    .bind(id, driver && driver.trim() ? driver.trim() : null)
+  const clean = driver && driver.trim() ? driver.trim() : null;
+  const res = await env.DB.prepare(`UPDATE drives SET driver = ?2, driver_source = ?3 WHERE id = ?1`)
+    .bind(id, clean, clean ? "manual" : null)
     .run();
   return { updated: (res.meta.changes ?? 0) > 0 };
 }
@@ -965,7 +971,9 @@ export async function getDrive(env: Env, id: number): Promise<unknown> {
   )
     .bind(id)
     .all();
-  return { drive, path: path.results ?? [] };
+  const d = drive as { vin: string; start_ts: number; end_ts: number | null };
+  const media = d.end_ts != null ? await mediaTrackChanges(env, d.vin, d.start_ts, d.end_ts).catch(() => []) : [];
+  return { drive, path: path.results ?? [], media };
 }
 
 /**
@@ -1306,7 +1314,9 @@ export async function getTrackingSummary(env: Env, vin: string): Promise<unknown
     total_charge_energy_kwh: round(charges?.kwh ?? 0, 1),
     total_charge_cost: round(charges?.cost ?? 0, 2),
     pack_kwh: await getPackKwh(env, vin),
-    api_budget: await getBudgetStatus(env).catch(() => null),
+    api_budget: await getBudgetStatus(env)
+      .then(async (status) => ({ ...status, forecast: await getBudgetForecast(env).catch(() => null) }))
+      .catch(() => null),
   };
 }
 
@@ -1343,6 +1353,248 @@ export async function getEfficiencyByTemp(env: Env, vin: string): Promise<unknow
       drives: r.drives,
       distance_km: round(r.distance_km, 1),
     })),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Media — "most played" from Fleet Telemetry's MediaNowPlaying* fields
+// ---------------------------------------------------------------------------
+
+/**
+ * Groups a media field's (title/artist/source/station) generic EAV history
+ * into "plays": a play starts whenever the value changes from the previous
+ * sample, and runs until the next change (or now, for whatever's still
+ * playing) — so repeated identical samples of the same track don't inflate
+ * the count. Requires Fleet Telemetry streaming to have been configured with
+ * the Media* fields (see configure_telemetry) — this is closed-form on
+ * whatever's already in telemetry_events, no new collection.
+ */
+async function mediaLeaderboard(
+  env: Env,
+  vin: string,
+  field: string,
+  sinceTs: number,
+  nowTs: number,
+): Promise<{ name: string; plays: number; seconds: number }[]> {
+  const rs = await env.DB.prepare(
+    `WITH raw AS (
+       SELECT ts, value_text AS v, LAG(value_text) OVER (ORDER BY ts) AS prev_v
+       FROM telemetry_events
+       WHERE vin = ?1 AND field = ?2 AND ts >= ?3 AND value_text IS NOT NULL AND value_text != ''
+     ),
+     starts AS (
+       SELECT ts, v FROM raw WHERE prev_v IS NULL OR prev_v != v
+     ),
+     spans AS (
+       SELECT v, ts, COALESCE(LEAD(ts) OVER (ORDER BY ts), ?4) AS end_ts FROM starts
+     )
+     -- Cap each span at 10 min: an open-ended "still playing" span otherwise
+     -- runs to wall-clock "now", so a car idle for days since its last sample
+     -- would count that whole gap as listening time for whatever was last playing.
+     SELECT v AS name, COUNT(*) AS plays, SUM(MAX(0, MIN(end_ts - ts, 600))) AS seconds
+     FROM spans GROUP BY v ORDER BY plays DESC`,
+  )
+    .bind(vin, field, sinceTs, nowTs)
+    .all<{ name: string; plays: number; seconds: number }>();
+  return rs.results ?? [];
+}
+
+/**
+ * Ordered track-change events within a time window (a drive's start/end) —
+ * for marking "what was playing" on the drive-detail chart. Unlike
+ * mediaLeaderboard this returns the raw sequence, not an aggregated
+ * leaderboard, and best-effort attaches whichever artist value was current
+ * as of each title change (a second field, sampled independently, so it's a
+ * nearest-preceding-value join rather than a guaranteed exact pairing).
+ */
+export async function mediaTrackChanges(
+  env: Env,
+  vin: string,
+  sinceTs: number,
+  untilTs: number,
+): Promise<{ ts: number; title: string; artist: string | null }[]> {
+  await ensureSchema(env);
+  const titleRows = await env.DB.prepare(
+    `WITH raw AS (
+       SELECT ts, value_text AS v, LAG(value_text) OVER (ORDER BY ts) AS prev_v
+       FROM telemetry_events
+       WHERE vin = ?1 AND field = 'media_title' AND ts BETWEEN ?2 AND ?3
+     )
+     SELECT ts, v AS title FROM raw
+     WHERE (prev_v IS NULL OR prev_v != v) AND v IS NOT NULL AND v != ''
+     ORDER BY ts ASC`,
+  )
+    .bind(vin, sinceTs, untilTs)
+    .all<{ ts: number; title: string }>();
+  const titles = titleRows.results ?? [];
+  if (!titles.length) return [];
+
+  const artistRows = await env.DB.prepare(
+    `SELECT ts, value_text AS artist FROM telemetry_events
+     WHERE vin = ?1 AND field = 'media_artist' AND ts BETWEEN ?2 AND ?3
+     ORDER BY ts ASC`,
+  )
+    .bind(vin, sinceTs, untilTs)
+    .all<{ ts: number; artist: string | null }>();
+  const artists = artistRows.results ?? [];
+  let ai = 0;
+  let currentArtist: string | null = null;
+  const artistAt = (ts: number): string | null => {
+    while (ai < artists.length && artists[ai]!.ts <= ts) { currentArtist = artists[ai]!.artist; ai++; }
+    return currentArtist;
+  };
+  return titles.map((r) => ({ ts: r.ts, title: r.title, artist: artistAt(r.ts) }));
+}
+
+/**
+ * Same value-change play-counting as mediaLeaderboard, but attributed to
+ * whichever driver was assigned to the drive each play fell inside (a plain
+ * LEFT JOIN on time range — plays outside any drive, or inside an
+ * unassigned one, land in "Unassigned"). No duration/seconds here: a
+ * per-driver breakdown is about WHO listens to WHAT, and play count alone
+ * answers that honestly without the span-capping complexity of the overall
+ * leaderboard.
+ */
+async function mediaLeaderboardByDriver(
+  env: Env,
+  vin: string,
+  field: string,
+  sinceTs: number,
+): Promise<{ driver: string; name: string; plays: number }[]> {
+  const rs = await env.DB.prepare(
+    `WITH raw AS (
+       SELECT ts, value_text AS v, LAG(value_text) OVER (ORDER BY ts) AS prev_v
+       FROM telemetry_events
+       WHERE vin = ?1 AND field = ?2 AND ts >= ?3 AND value_text IS NOT NULL AND value_text != ''
+     ),
+     starts AS (
+       SELECT ts, v FROM raw WHERE prev_v IS NULL OR prev_v != v
+     )
+     SELECT COALESCE(d.driver, 'Unassigned') AS driver, s.v AS name, COUNT(*) AS plays
+     FROM starts s
+     LEFT JOIN drives d ON d.vin = ?1 AND d.status = 'complete' AND s.ts BETWEEN d.start_ts AND d.end_ts
+     GROUP BY driver, name
+     ORDER BY driver ASC, plays DESC`,
+  )
+    .bind(vin, field, sinceTs)
+    .all<{ driver: string; name: string; plays: number }>();
+  return rs.results ?? [];
+}
+
+/** "Most played" leaderboards broken down per assigned driver, over the trailing `days`. */
+export async function getMediaStatsByDriver(env: Env, vin: string, days = 90): Promise<unknown> {
+  await ensureSchema(env);
+  const sinceTs = Math.floor(Date.now() / 1000) - days * 86400;
+  const [titleRows, artistRows, sourceRows] = await Promise.all([
+    mediaLeaderboardByDriver(env, vin, "media_title", sinceTs),
+    mediaLeaderboardByDriver(env, vin, "media_artist", sinceTs),
+    mediaLeaderboardByDriver(env, vin, "media_source", sinceTs),
+  ]);
+  if (!titleRows.length && !artistRows.length && !sourceRows.length) {
+    return {
+      vin, days, has_data: false,
+      note: "No media telemetry recorded yet — see get_media_stats. Per-driver breakdown also needs those drives to have an assigned driver (Drives page).",
+    };
+  }
+  const driverNames = new Set<string>();
+  for (const r of [...titleRows, ...artistRows, ...sourceRows]) driverNames.add(r.driver);
+  const forDriver = (rows: typeof titleRows, driver: string, key: string, limit: number) =>
+    rows.filter((r) => r.driver === driver).slice(0, limit).map((r) => ({ [key]: r.name, plays: r.plays }));
+
+  return {
+    vin,
+    days,
+    has_data: true,
+    drivers: [...driverNames].sort((a, b) => a.localeCompare(b)).map((driver) => ({
+      driver,
+      total_plays: titleRows.filter((r) => r.driver === driver).reduce((s, r) => s + r.plays, 0),
+      top_tracks: forDriver(titleRows, driver, "title", 10),
+      top_artists: forDriver(artistRows, driver, "artist", 10),
+      top_sources: forDriver(sourceRows, driver, "source", 5),
+    })),
+  };
+}
+
+/**
+ * Idea #2/#95: what's playing when traffic gets bad vs. when the road is
+ * clear. Each track-start is paired with the nearest-preceding
+ * nav_traffic_delay_min reading (a plain "as of that moment" lookup, same
+ * idea as mediaTrackChanges' artist pairing) and bucketed heavy (>10 min
+ * delay) vs light (<=5 min). Returns null (not an empty result) when
+ * nav_traffic_delay_min has never been streamed, so the caller can omit the
+ * section entirely rather than show two empty lists.
+ */
+async function mediaTrafficMood(env: Env, vin: string, sinceTs: number): Promise<{ heavy: { title: string; plays: number }[]; light: { title: string; plays: number }[] } | null> {
+  const hasTraffic = await env.DB.prepare(
+    `SELECT 1 FROM telemetry_events WHERE vin = ?1 AND field = 'nav_traffic_delay_min' AND ts >= ?2 LIMIT 1`,
+  ).bind(vin, sinceTs).first();
+  if (!hasTraffic) return null;
+
+  const rs = await env.DB.prepare(
+    `WITH raw AS (
+       SELECT ts, value_text AS v, LAG(value_text) OVER (ORDER BY ts) AS prev_v
+       FROM telemetry_events
+       WHERE vin = ?1 AND field = 'media_title' AND ts >= ?2 AND value_text IS NOT NULL AND value_text != ''
+     ),
+     starts AS (
+       SELECT ts, v FROM raw WHERE prev_v IS NULL OR prev_v != v
+     )
+     SELECT s.v AS title,
+       (SELECT t.value_num FROM telemetry_events t
+        WHERE t.vin = ?1 AND t.field = 'nav_traffic_delay_min' AND t.ts <= s.ts
+        ORDER BY t.ts DESC LIMIT 1) AS delay
+     FROM starts s`,
+  )
+    .bind(vin, sinceTs)
+    .all<{ title: string; delay: number | null }>();
+
+  const counts = { heavy: new Map<string, number>(), light: new Map<string, number>() };
+  for (const r of rs.results ?? []) {
+    if (r.delay == null) continue;
+    const bucket = r.delay > 10 ? counts.heavy : r.delay <= 5 ? counts.light : null;
+    if (bucket) bucket.set(r.title, (bucket.get(r.title) ?? 0) + 1);
+  }
+  const top = (m: Map<string, number>) =>
+    [...m.entries()].sort((a, b) => b[1] - a[1]).slice(0, 5).map(([title, plays]) => ({ title, plays }));
+  return { heavy: top(counts.heavy), light: top(counts.light) };
+}
+
+/** "Most played" leaderboards (tracks/artists/sources/stations) over the trailing `days`. */
+export async function getMediaStats(env: Env, vin: string, days = 90): Promise<unknown> {
+  await ensureSchema(env);
+  const nowTs = Math.floor(Date.now() / 1000);
+  const sinceTs = nowTs - days * 86400;
+  const [tracks, artists, sources, stations] = await Promise.all([
+    mediaLeaderboard(env, vin, "media_title", sinceTs, nowTs),
+    mediaLeaderboard(env, vin, "media_artist", sinceTs, nowTs),
+    mediaLeaderboard(env, vin, "media_source", sinceTs, nowTs),
+    mediaLeaderboard(env, vin, "media_station", sinceTs, nowTs),
+  ]);
+
+  if (!tracks.length && !artists.length && !sources.length && !stations.length) {
+    return {
+      vin, days, has_data: false,
+      note: "No media telemetry recorded yet. Stream MediaNowPlayingTitle, MediaNowPlayingArtist, " +
+        "MediaNowPlayingStation and MediaPlaybackSource via configure_telemetry to start tracking what's played.",
+    };
+  }
+
+  const totalPlays = tracks.reduce((s, r) => s + r.plays, 0);
+  const totalSeconds = tracks.reduce((s, r) => s + (r.seconds || 0), 0);
+  const top = (rows: { name: string; plays: number; seconds: number }[], key: string, limit: number) =>
+    rows.slice(0, limit).map((r) => ({ [key]: r.name, plays: r.plays, minutes: round(r.seconds / 60, 0) }));
+
+  return {
+    vin,
+    days,
+    has_data: true,
+    total_plays: totalPlays,
+    total_listening_hours: round(totalSeconds / 3600, 1),
+    top_tracks: top(tracks, "title", 15),
+    top_artists: top(artists, "artist", 15),
+    top_sources: top(sources, "source", 10),
+    top_stations: top(stations, "station", 10),
+    traffic_mood: await mediaTrafficMood(env, vin, sinceTs),
   };
 }
 
@@ -1406,6 +1658,191 @@ export async function getTirePressures(env: Env, vin: string, days = 30): Promis
     trend_bar_per_week: Object.keys(trend).length === 4
       ? { fl: trend.fl, fr: trend.fr, rl: trend.rl, rr: trend.rr }
       : null,
+    balance: await tireBalance(env, vin, since),
+  };
+}
+
+/**
+ * Long-term side-to-side/front-to-rear pressure balance: pairs same-timestamp
+ * samples (the 4 TPMS values normally arrive together in one poll/telemetry
+ * batch) and averages the delta, rather than just comparing the latest
+ * reading — a single stale sample shouldn't read as "asymmetric wear".
+ * `asymmetric: true` flags a persistent >0.15 bar gap on any axis, which
+ * over thousands of miles is a real early alignment/wear signal (idea #67).
+ */
+async function tireBalance(env: Env, vin: string, since: number): Promise<unknown> {
+  const rs = await env.DB.prepare(
+    `SELECT AVG(fl.value_num - fr.value_num) AS fl_fr, AVG(rl.value_num - rr.value_num) AS rl_rr,
+            AVG(fl.value_num - rl.value_num) AS fl_rl, AVG(fr.value_num - rr.value_num) AS fr_rr,
+            COUNT(*) AS n
+     FROM (SELECT ts, value_num FROM telemetry_events WHERE vin = ?1 AND field = 'tpms_fl' AND ts >= ?2 AND value_num IS NOT NULL) fl
+     JOIN (SELECT ts, value_num FROM telemetry_events WHERE vin = ?1 AND field = 'tpms_fr' AND ts >= ?2 AND value_num IS NOT NULL) fr ON fr.ts = fl.ts
+     JOIN (SELECT ts, value_num FROM telemetry_events WHERE vin = ?1 AND field = 'tpms_rl' AND ts >= ?2 AND value_num IS NOT NULL) rl ON rl.ts = fl.ts
+     JOIN (SELECT ts, value_num FROM telemetry_events WHERE vin = ?1 AND field = 'tpms_rr' AND ts >= ?2 AND value_num IS NOT NULL) rr ON rr.ts = fl.ts`,
+  )
+    .bind(vin, since)
+    .first<{ fl_fr: number | null; rl_rr: number | null; fl_rl: number | null; fr_rr: number | null; n: number }>();
+  if (!rs || !rs.n) return null;
+  const deltas = { fl_fr: rs.fl_fr, rl_rr: rs.rl_rr, fl_rl: rs.fl_rl, fr_rr: rs.fr_rr };
+  const maxAbs = Math.max(...Object.values(deltas).map((v) => Math.abs(v ?? 0)));
+  return {
+    paired_samples: rs.n,
+    fl_fr_bar: round(rs.fl_fr ?? 0, 3),
+    rl_rr_bar: round(rs.rl_rr ?? 0, 3),
+    fl_rl_bar: round(rs.fl_rl ?? 0, 3),
+    fr_rr_bar: round(rs.fr_rr ?? 0, 3),
+    asymmetric: maxAbs > 0.15,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Derived: lifetime charging taper curve (idea #51 — how charging power
+// actually falls off as SoC rises, from every session ever logged, not just
+// one at a time like the per-session charge-curve chart already shows).
+// ---------------------------------------------------------------------------
+
+export async function getChargeTaperCurve(env: Env, vin: string): Promise<unknown> {
+  await ensureSchema(env);
+  const rs = await env.DB.prepare(
+    `SELECT CAST(FLOOR(soc / 5) * 5 AS INTEGER) AS soc_bin,
+            AVG(charger_power) AS avg_power_kw, MAX(charger_power) AS max_power_kw, COUNT(*) AS samples
+     FROM charges
+     WHERE vin = ?1 AND soc IS NOT NULL AND charger_power IS NOT NULL AND charger_power > 0
+     GROUP BY soc_bin ORDER BY soc_bin ASC`,
+  )
+    .bind(vin)
+    .all<{ soc_bin: number; avg_power_kw: number; max_power_kw: number; samples: number }>();
+  const bins = rs.results ?? [];
+  return {
+    vin,
+    bins: bins.map((b) => ({
+      soc_min: b.soc_bin,
+      soc_max: b.soc_bin + 5,
+      avg_power_kw: round(b.avg_power_kw, 1),
+      max_power_kw: round(b.max_power_kw, 1),
+      samples: b.samples,
+    })),
+    note: bins.length < 4 ? "Needs more charge sessions across a range of SoC to draw a full taper curve." : null,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Small EAV aggregate helpers shared by the safety/climate derivations below.
+// ---------------------------------------------------------------------------
+
+async function boolFieldFraction(env: Env, vin: string, field: string, sinceTs: number): Promise<{ frac_on: number | null; samples: number }> {
+  const rs = await env.DB.prepare(
+    `SELECT AVG(value_num) AS frac_on, COUNT(*) AS n FROM telemetry_events WHERE vin = ?1 AND field = ?2 AND ts >= ?3 AND value_num IS NOT NULL`,
+  )
+    .bind(vin, field, sinceTs)
+    .first<{ frac_on: number | null; n: number }>();
+  return { frac_on: rs?.frac_on ?? null, samples: rs?.n ?? 0 };
+}
+
+async function avgFieldValue(env: Env, vin: string, field: string, sinceTs: number): Promise<{ avg: number | null; samples: number }> {
+  const rs = await env.DB.prepare(
+    `SELECT AVG(value_num) AS avg, COUNT(*) AS n FROM telemetry_events WHERE vin = ?1 AND field = ?2 AND ts >= ?3 AND value_num IS NOT NULL`,
+  )
+    .bind(vin, field, sinceTs)
+    .first<{ avg: number | null; n: number }>();
+  return { avg: rs?.avg ?? null, samples: rs?.n ?? 0 };
+}
+
+/** Counts 0→1 transitions of a boolean field — "how many times did this fire", not "how long was it on". */
+async function countActivations(env: Env, vin: string, field: string, sinceTs: number): Promise<number> {
+  const rs = await env.DB.prepare(
+    `WITH raw AS (
+       SELECT ts, value_num AS v, LAG(value_num) OVER (ORDER BY ts) AS prev
+       FROM telemetry_events WHERE vin = ?1 AND field = ?2 AND ts >= ?3 AND value_num IS NOT NULL
+     )
+     SELECT COUNT(*) AS n FROM raw WHERE v = 1 AND (prev IS NULL OR prev = 0)`,
+  )
+    .bind(vin, field, sinceTs)
+    .first<{ n: number }>();
+  return rs?.n ?? 0;
+}
+
+async function mostCommonEnumValue(env: Env, vin: string, field: string, sinceTs: number): Promise<string | null> {
+  const rs = await env.DB.prepare(
+    `SELECT value_text AS v FROM telemetry_events
+     WHERE vin = ?1 AND field = ?2 AND ts >= ?3 AND value_text IS NOT NULL AND value_text != ''
+     GROUP BY value_text ORDER BY COUNT(*) DESC LIMIT 1`,
+  )
+    .bind(vin, field, sinceTs)
+    .first<{ v: string }>();
+  return rs?.v ?? null;
+}
+
+// ---------------------------------------------------------------------------
+// Derived: safety/ADAS feature adoption (idea #62/#70) — how much your
+// driving style interacts with the car's own safety systems.
+// ---------------------------------------------------------------------------
+
+export async function getSafetyFeatureStats(env: Env, vin: string, days = 90): Promise<unknown> {
+  await ensureSchema(env);
+  const sinceTs = Math.floor(Date.now() / 1000) - days * 86400;
+  const [aeb, blindSpotChimes, laneDeparture, fcwSensitivity] = await Promise.all([
+    boolFieldFraction(env, vin, "aeb_off", sinceTs),
+    countActivations(env, vin, "blind_spot_chime", sinceTs),
+    mostCommonEnumValue(env, vin, "lane_departure", sinceTs),
+    mostCommonEnumValue(env, vin, "fcw_sensitivity", sinceTs),
+  ]);
+  if (!aeb.samples && !blindSpotChimes && !laneDeparture && !fcwSensitivity) {
+    return {
+      vin, days, has_data: false,
+      note: "No ADAS telemetry recorded yet — stream AutomaticEmergencyBrakingOff, BlindSpotCollisionWarningChime, " +
+        "LaneDepartureAvoidance and ForwardCollisionWarning via configure_telemetry.",
+    };
+  }
+  return {
+    vin,
+    days,
+    has_data: true,
+    aeb_disabled_pct: aeb.frac_on != null ? round(aeb.frac_on * 100, 1) : null,
+    aeb_samples: aeb.samples,
+    blind_spot_chime_count: blindSpotChimes,
+    lane_departure_setting: laneDeparture,
+    forward_collision_warning_setting: fcwSensitivity,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Derived: climate/comfort habits (idea #33/#38) — also the same signal
+// suggestDriverForDrive already leans on for auto-assignment, surfaced here
+// as its own human-readable report instead of just an internal fingerprint.
+// ---------------------------------------------------------------------------
+
+export async function getClimateHabits(env: Env, vin: string, days = 90): Promise<unknown> {
+  await ensureSchema(env);
+  const sinceTs = Math.floor(Date.now() / 1000) - days * 86400;
+  const [autoL, autoR, heaterL, heaterR, coolFL, coolFR] = await Promise.all([
+    boolFieldFraction(env, vin, "auto_seat_climate_l", sinceTs),
+    boolFieldFraction(env, vin, "auto_seat_climate_r", sinceTs),
+    avgFieldValue(env, vin, "seat_heater_l", sinceTs),
+    avgFieldValue(env, vin, "seat_heater_r", sinceTs),
+    avgFieldValue(env, vin, "seat_cool_fl", sinceTs),
+    avgFieldValue(env, vin, "seat_cool_fr", sinceTs),
+  ]);
+  const totalSamples = autoL.samples + autoR.samples + heaterL.samples + heaterR.samples + coolFL.samples + coolFR.samples;
+  if (!totalSamples) {
+    return {
+      vin, days, has_data: false,
+      note: "No climate-habit telemetry recorded yet — stream AutoSeatClimateLeft/Right, SeatHeaterLeft/Right " +
+        "and ClimateSeatCoolingFrontLeft/Right via configure_telemetry.",
+    };
+  }
+  return {
+    vin,
+    days,
+    has_data: true,
+    auto_climate_left_pct: autoL.frac_on != null ? round(autoL.frac_on * 100, 0) : null,
+    auto_climate_right_pct: autoR.frac_on != null ? round(autoR.frac_on * 100, 0) : null,
+    avg_seat_heater_left: heaterL.avg != null ? round(heaterL.avg, 1) : null,
+    avg_seat_heater_right: heaterR.avg != null ? round(heaterR.avg, 1) : null,
+    seat_heater_divergence: heaterL.avg != null && heaterR.avg != null ? round(Math.abs(heaterL.avg - heaterR.avg), 2) : null,
+    avg_seat_cool_left: coolFL.avg != null ? round(coolFL.avg, 1) : null,
+    avg_seat_cool_right: coolFR.avg != null ? round(coolFR.avg, 1) : null,
+    seat_cool_divergence: coolFL.avg != null && coolFR.avg != null ? round(Math.abs(coolFL.avg - coolFR.avg), 2) : null,
   };
 }
 
@@ -1530,12 +1967,28 @@ export async function getSuggestedLocations(env: Env, vin: string): Promise<unkn
 // Driver auto-suggestion
 // ---------------------------------------------------------------------------
 
+/** Independent same-place+same-time-bucket historical drives required before the system trusts itself to auto-assign without asking. */
+const AUTO_ASSIGN_MIN_MATCHES = 3;
+/** ...and the winner must clear the runner-up by this much combined weight — otherwise it's ambiguous, ask instead. */
+const AUTO_ASSIGN_MIN_MARGIN = 1.5;
+
 /**
- * Suggests a driver for a just-closed drive from tagged history: drives that
- * started in the same geofence (or ~1 km grid cell) in the same hour-of-week
- * bucket (weekday/weekend × 3-hour block). The most frequent tagged driver
- * with ≥2 supporting drives wins. Stored in suggested_driver — the UI shows
- * it as a one-tap confirmation, never silently promotes it to `driver`.
+ * Infers a driver for a just-closed drive from tagged history — Tesla exposes
+ * no actual "who's driving" field, so this leans on the next-best signals:
+ * place + time-of-week (weekday/weekend × 3-hour block) match against each
+ * driver's own history, corroborated by two fields that track with the
+ * active driver profile (driver-side climate setpoint, seat-heater habit —
+ * a stand-in for seat-position memory).
+ *
+ * Two-tier outcome:
+ *   - CONFIDENT (≥3 independent supporting drives, clearly ahead of any other
+ *     candidate): the system assigns `driver` itself, tagged driver_source =
+ *     'auto' — no human action needed. Still just as correctable as a manual
+ *     tag (setDriveDriver always overrides it and flips the tag to 'manual').
+ *   - WEAKER (some signal, but too thin or ambiguous to trust unsupervised):
+ *     falls back to today's behaviour — stored in suggested_driver as a
+ *     one-tap confirmation, never silently written to `driver`.
+ *   - Otherwise: nothing (not enough signal to say anything useful).
  */
 export async function suggestDriverForDrive(env: Env, driveId: number, vin: string): Promise<void> {
   const d = await env.DB.prepare(
@@ -1566,9 +2019,16 @@ export async function suggestDriverForDrive(env: Env, driveId: number, vin: stri
   // Weighted voting: same place + same day/hour bucket is the strong signal;
   // a matching active-driver-profile fingerprint (climate setpoint + seat-heater
   // habit) adds a corroborating vote — the exposed stand-in for a seat-position
-  // memory, since these fields track with the active driver.
-  const votes = new Map<string, number>();
-  const add = (driver: string, w: number) => votes.set(driver, (votes.get(driver) ?? 0) + w);
+  // memory, since these fields track with the active driver. `matches` counts
+  // only the strong place+time signal (not fingerprint-only), so a single
+  // suspiciously-perfect fingerprint match can't alone clear the auto-assign bar.
+  const votes = new Map<string, { weight: number; matches: number }>();
+  const add = (driver: string, w: number, isPlaceTimeMatch: boolean) => {
+    const cur = votes.get(driver) ?? { weight: 0, matches: 0 };
+    cur.weight += w;
+    if (isPlaceTimeMatch) cur.matches += 1;
+    votes.set(driver, cur);
+  };
   const fpMatch = (a: number | null, b: number | null, tol: number): boolean =>
     a != null && b != null && Math.abs(a - b) <= tol;
 
@@ -1577,17 +2037,29 @@ export async function suggestDriverForDrive(env: Env, driveId: number, vin: stri
       (d.start_location_id != null && c.start_location_id === d.start_location_id) ||
       (d.start_lat != null && d.start_lon != null && c.start_lat != null && c.start_lon != null &&
         haversineMeters(d.start_lat, d.start_lon, c.start_lat, c.start_lon) <= 1000);
+    const placeTimeMatch = samePlace && bucketOf(c.start_ts) === targetBucket;
     let w = 0;
-    if (samePlace && bucketOf(c.start_ts) === targetBucket) w += 1; // place + time
+    if (placeTimeMatch) w += 1; // place + time
     // Fingerprint corroboration: driver climate setpoint (±0.5°C) + seat heater.
     if (fpMatch(d.fp_temp_set, c.fp_temp_set, 0.5)) w += 0.5;
     if (fpMatch(d.fp_seat_heater, c.fp_seat_heater, 0)) w += 0.3;
-    if (w > 0) add(c.driver, w);
+    if (w > 0) add(c.driver, w, placeTimeMatch);
   }
-  let best: { driver: string; n: number } | null = null;
-  for (const [driver, n] of votes) if (!best || n > best.n) best = { driver, n };
-  // Require a place+time match's worth of confidence (≥1.5 combined weight).
-  if (best && best.n >= 1.5) {
+  let best: { driver: string; weight: number; matches: number } | null = null;
+  let runnerUp: { driver: string; weight: number; matches: number } | null = null;
+  for (const [driver, v] of votes) {
+    if (!best || v.weight > best.weight) { runnerUp = best; best = { driver, ...v }; }
+    else if (!runnerUp || v.weight > runnerUp.weight) runnerUp = { driver, ...v };
+  }
+  if (!best) return; // no signal at all
+
+  const confidentAuto =
+    best.matches >= AUTO_ASSIGN_MIN_MATCHES &&
+    (!runnerUp || best.weight - runnerUp.weight >= AUTO_ASSIGN_MIN_MARGIN);
+  if (confidentAuto) {
+    await env.DB.prepare(`UPDATE drives SET driver = ?2, driver_source = 'auto' WHERE id = ?1`).bind(driveId, best.driver).run();
+  } else if (best.weight >= 1.5) {
+    // Require a place+time match's worth of confidence (≥1.5 combined weight).
     await env.DB.prepare(`UPDATE drives SET suggested_driver = ?2 WHERE id = ?1`).bind(driveId, best.driver).run();
   }
 }

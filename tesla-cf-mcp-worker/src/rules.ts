@@ -490,6 +490,7 @@ async function runCronTickInner(env: Env): Promise<Record<string, unknown>> {
     if (n > 0) summary.coach_notes = n;
   } catch { /* AI is best-effort */ }
   await purgeExpiredHistory(env, summary);
+  await compactOldHistory(env, summary);
   return summary;
 }
 
@@ -633,6 +634,108 @@ async function purgeExpiredHistory(env: Env, summary: Record<string, unknown>): 
     if (purged > 0) summary.purged_rows = purged;
   } catch (e) {
     summary.purge_error = e instanceof Error ? e.message : String(e);
+  }
+}
+
+/** How many not-yet-compacted drives/sessions to process per tick — bounds a single cron invocation's D1 round-trips. */
+const COMPACT_BATCH = 100;
+
+/**
+ * Decimates one drive's `positions` rows (or one charge session's `charges`
+ * rows) down to `target`, keeping the first row, the last row, and an evenly
+ * spaced selection in between — a route/curve driven a year ago rarely needs
+ * every ~10s sample to still be useful, just its shape. Returns rows removed.
+ * No-ops (but still marks compacted) when there's nothing to trim.
+ */
+async function decimateSeries(
+  env: Env,
+  table: "positions" | "charges",
+  fkColumn: "drive_id" | "session_id",
+  fkValue: number,
+  target: number,
+): Promise<number> {
+  const countRow = await env.DB.prepare(`SELECT COUNT(*) AS n FROM ${table} WHERE ${fkColumn} = ?1`)
+    .bind(fkValue)
+    .first<{ n: number }>();
+  const n = countRow?.n ?? 0;
+  if (n <= target) return 0;
+  const step = Math.ceil(n / target);
+  const res = await env.DB.prepare(
+    `DELETE FROM ${table}
+     WHERE ${fkColumn} = ?1
+     AND id NOT IN (
+       SELECT id FROM (
+         SELECT id, ROW_NUMBER() OVER (ORDER BY ts ASC) AS rn
+         FROM ${table} WHERE ${fkColumn} = ?1
+       )
+       WHERE rn = 1 OR rn = ?2 OR (rn - 1) % ?3 = 0
+     )`,
+  )
+    .bind(fkValue, n, step)
+    .run();
+  return res.meta.changes ?? 0;
+}
+
+/**
+ * Storage compaction (COMPACT_AFTER_DAYS env var; default 365 days, set "0"
+ * to disable). Unlike purgeExpiredHistory above, this never DELETES a drive
+ * or charge session — the summary row (distance, energy, cost, behavior
+ * score, degradation samples, etc.) is the long-term "essence" and stays
+ * forever. It only thins the attached raw time-series (route positions /
+ * charge curve samples) for old, completed drives and sessions down to a
+ * fixed point budget, so a route/curve is still viewable — just at lower
+ * resolution — instead of being either kept at full density forever or
+ * deleted outright. Batched and marked (`positions_compacted` /
+ * `curve_compacted`) so a fixed-size slice of the backlog is done per tick
+ * rather than rescanning everything every time.
+ */
+export async function compactOldHistory(env: Env, summary: Record<string, unknown> = {}): Promise<void> {
+  const rawDays = env.COMPACT_AFTER_DAYS;
+  const days = rawDays === undefined || rawDays === "" ? 365 : Number(rawDays);
+  if (!Number.isFinite(days) || days <= 0) return;
+  const cutoff = Math.floor(Date.now() / 1000) - Math.round(days * 86400);
+  const maxPoints = Math.max(10, Math.round(Number(env.COMPACT_MAX_POINTS) || 60));
+  const maxChargePoints = Math.max(10, Math.round(maxPoints / 2));
+
+  try {
+    const drives = await env.DB.prepare(
+      `SELECT id FROM drives
+       WHERE status = 'complete' AND start_ts < ?1 AND (positions_compacted IS NULL OR positions_compacted = 0)
+       ORDER BY start_ts ASC LIMIT ?2`,
+    )
+      .bind(cutoff, COMPACT_BATCH)
+      .all<{ id: number }>();
+
+    let positionsRemoved = 0;
+    for (const d of drives.results ?? []) {
+      positionsRemoved += await decimateSeries(env, "positions", "drive_id", d.id, maxPoints);
+      await env.DB.prepare(`UPDATE drives SET positions_compacted = 1 WHERE id = ?1`).bind(d.id).run();
+    }
+
+    const sessions = await env.DB.prepare(
+      `SELECT id FROM charge_sessions
+       WHERE status = 'complete' AND start_ts < ?1 AND (curve_compacted IS NULL OR curve_compacted = 0)
+       ORDER BY start_ts ASC LIMIT ?2`,
+    )
+      .bind(cutoff, COMPACT_BATCH)
+      .all<{ id: number }>();
+
+    let chargePointsRemoved = 0;
+    for (const s of sessions.results ?? []) {
+      chargePointsRemoved += await decimateSeries(env, "charges", "session_id", s.id, maxChargePoints);
+      await env.DB.prepare(`UPDATE charge_sessions SET curve_compacted = 1 WHERE id = ?1`).bind(s.id).run();
+    }
+
+    if ((drives.results?.length ?? 0) || (sessions.results?.length ?? 0)) {
+      summary.compacted = {
+        drives: drives.results?.length ?? 0,
+        positions_removed: positionsRemoved,
+        sessions: sessions.results?.length ?? 0,
+        charge_points_removed: chargePointsRemoved,
+      };
+    }
+  } catch (e) {
+    summary.compact_error = e instanceof Error ? e.message : String(e);
   }
 }
 

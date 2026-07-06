@@ -2,6 +2,11 @@ import { auth, data, mcp, verifyToken, exportUrl, ApiError } from "./api.js";
 import { svgLineChart, svgBarChart, svgDonut, svgSplitBar, svgDriveChart } from "./charts.js";
 import { destroyMaps, renderPointMap, renderRouteMap, renderLifetimeMap, createReplayMarker, invalidateMaps } from "./map.js";
 
+// Bump on every change to this dashboard (UI, features, or the /data/*
+// endpoints it depends on) and add a matching entry to CHANGELOG.md — see
+// the versioning policy in the repo's CLAUDE.md. Shown in the sidebar footer.
+const APP_VERSION = "1.2.0";
+
 const root = document.getElementById("app");
 let shellBound = false; // guards one-time attach of the root click handler + sync timer
 
@@ -187,6 +192,7 @@ const state = {
   vehicleData: null, // last on-demand get_vehicle_data snapshot
   driveFilter: 1, // 0=7d, 1=30d, 2=all
   driverFilter: "__all", // "__all" | "__none" (unassigned) | driver name
+  mediaDriverFilter: null, // selected driver chip on the Media screen's per-driver breakdown
   openDriveId: null,
   openChargeId: null,
   openPlaceId: null,
@@ -202,6 +208,7 @@ const state = {
 const NAV = [
   { label: "", items: [["ask", "✦ Ask Tessa"], ["ov", "Overview"], ["tl", "Timeline"], ["st", "Statistics"]] },
   { label: "Driving", items: [["dr", "Drives"], ["dv", "Drivers"], ["pl", "Places"], ["map", "Lifetime map"]] },
+  { label: "Media", items: [["md", "♪ Media"]] },
   { label: "Charging", items: [["ch", "Charges"], ["cs", "Charging stats"]] },
   { label: "Battery", items: [["bh", "Battery health"], ["pr", "Predictions"], ["vd", "Vampire drain"]] },
 ];
@@ -215,6 +222,7 @@ const TITLES = {
   dv: ["Drivers", "behaviour & risk scoring"],
   pl: ["Places", "saved locations & suggestions"],
   map: ["Lifetime map", ""],
+  md: ["Media", "most played, from the car's infotainment system"],
   ch: ["Charges", ""],
   cs: ["Charging stats", "lifetime"],
   bh: ["Battery health", ""],
@@ -269,9 +277,48 @@ function consumeUrlCredentials() {
   } catch { /* non-browser / sandbox */ }
 }
 
+// ---------------------------------------------------------------------------
+// URL routing — reflects state.screen (+ open drive/charge/place id) in
+// location.hash as "#screen" or "#screen/id", so reload, bookmarks and the
+// browser back/forward buttons land on the right screen instead of always
+// dumping back to Overview. Navigation writes history via pushHistory();
+// back/forward is read back through the popstate listener in renderShell().
+// ---------------------------------------------------------------------------
+
+function hashToState(hash) {
+  const raw = (hash || "").replace(/^#\/?/, "");
+  if (!raw) return null;
+  const [screen, idStr] = raw.split("/");
+  if (!TITLES[screen]) return null;
+  const id = idStr ? Number(idStr) : null;
+  return { screen, id: Number.isFinite(id) ? id : null };
+}
+function stateToHash() {
+  if (state.screen === "dr" && state.openDriveId != null) return `#dr/${state.openDriveId}`;
+  if (state.screen === "ch" && state.openChargeId != null) return `#ch/${state.openChargeId}`;
+  if (state.screen === "pl" && state.openPlaceId != null) return `#pl/${state.openPlaceId}`;
+  return `#${state.screen}`;
+}
+/** Call after any change to state.screen/openDriveId/openChargeId/openPlaceId. */
+function pushHistory() {
+  const hash = stateToHash();
+  if (location.hash !== hash) { try { history.pushState(null, "", hash); } catch { /* sandboxed */ } }
+}
+/** Read location.hash into state at boot, or on a back/forward navigation. */
+function applyHashToState() {
+  const parsed = hashToState(location.hash);
+  if (!parsed) return false;
+  state.screen = parsed.screen;
+  state.openDriveId = parsed.screen === "dr" ? parsed.id : null;
+  state.openChargeId = parsed.screen === "ch" ? parsed.id : null;
+  state.openPlaceId = parsed.screen === "pl" ? parsed.id : null;
+  return true;
+}
+
 async function boot() {
   consumeUrlCredentials();
   if (!auth.hasToken || !auth.vin) return renderGate();
+  applyHashToState(); // land on the screen encoded in the URL, if any
   try {
     await verifyToken(auth.vin);
     await renderApp();
@@ -378,8 +425,9 @@ function renderShell() {
           </div>
           <div class="tm-sidemeta">
             VIN ${esc(auth.vin.slice(-6))}
-            &nbsp;·&nbsp;<button data-action="logout" style="background:none;border:none;color:inherit;font:inherit;cursor:pointer;padding:0;text-decoration:underline;">disconnect</button>
+            &nbsp;·&nbsp;<button data-action="logout" class="tm-link-btn">disconnect</button>
           </div>
+          <div class="tm-sidemeta" style="padding-top:0;" title="See CHANGELOG.md">v${esc(APP_VERSION)}</div>
         </div>
       </aside>
       <div class="tm-nav-backdrop" data-action="nav-close"></div>
@@ -391,7 +439,7 @@ function renderShell() {
           <div class="tm-header-live" id="tm-sync-label">
             <span class="tm-dot tm-dot-live"></span>
             <span id="tm-sync-text">loading…</span>
-            <button data-action="refresh" title="Refresh" style="margin-left:8px;background:none;border:none;color:var(--sub);cursor:pointer;font-size:13px;">&#8635;</button>
+            <button data-action="refresh" title="Refresh" aria-label="Refresh" class="tm-icon-btn" style="margin-left:8px;">&#8635;</button>
           </div>
         </header>
         <div class="tm-scroll"><div class="tm-page" id="tm-content"></div></div>
@@ -411,8 +459,16 @@ function renderShell() {
       open.forEach((c) => { c.classList.remove("tm-map-full"); const b = c.querySelector(".tm-map-expand"); if (b) { b.innerHTML = "&#10530;"; b.title = "Expand map"; } });
       setTimeout(() => invalidateMaps(), 80);
     });
+    window.addEventListener("popstate", () => {
+      if (!applyHashToState()) return; // an unrelated/foreign hash — leave state as-is
+      renderShell();
+      showScreen();
+    });
     shellBound = true;
   }
+  // Normalize the address bar to the current screen on first paint, so a plain
+  // load without a hash (or a stale/invalid one) still gets a matching, shareable URL.
+  if (location.hash !== stateToHash()) { try { history.replaceState(null, "", stateToHash()); } catch { /* sandboxed */ } }
   refreshSideBudget();
 }
 
@@ -448,6 +504,7 @@ function onRootClick(e) {
     state.openDriveId = null;
     state.openChargeId = null;
     state.openPlaceId = null;
+    pushHistory();
     renderShell();
     showScreen();
   } else if (action === "theme") {
@@ -471,19 +528,56 @@ function onRootClick(e) {
   } else if (action === "driver-filter") {
     state.driverFilter = t.dataset.driver;
     renderDrives();
+  } else if (action === "media-driver-filter") {
+    state.mediaDriverFilter = t.dataset.driver;
+    const byDriver = state.cache.media_by_driver;
+    const target = document.getElementById("tm-media-by-driver");
+    if (byDriver?.drivers && target) target.innerHTML = mediaByDriverHtml(byDriver.drivers);
   } else if (action === "edit-driver") {
     if (!t.querySelector(".tm-driver-edit")) beginDriverEdit(t, Number(t.dataset.id));
   } else if (action === "open-place") {
     state.openPlaceId = Number(t.dataset.id);
+    pushHistory();
     renderPlaceDetail();
   } else if (action === "back-places") {
     state.openPlaceId = null;
+    pushHistory();
     renderPlaces();
+  } else if (action === "save-suggested-location") {
+    const input = document.getElementById(t.dataset.input);
+    const name = input ? input.value.trim() : "";
+    if (!name) { input?.focus(); return; }
+    const lat = Number(t.dataset.lat), lon = Number(t.dataset.lon);
+    t.disabled = true;
+    t.textContent = "Saving…";
+    data.saveLocation({ name, lat, lon }).then(() => {
+      delete state.cache.locations;
+      delete state.cache.suggested_locations;
+      t.textContent = "Saved ✓";
+      setTimeout(() => { if (state.screen === "pl") renderPlaces(); }, 700);
+    }).catch(() => {
+      t.disabled = false;
+      t.textContent = "Failed";
+    });
+  } else if (action === "quick-assign") {
+    // One-tap self-assign: reuses the same assign-driver write the manual
+    // input/Save flow already uses, just skipping the typing.
+    const id = Number(t.dataset.id);
+    const name = t.dataset.driver || "";
+    t.disabled = true;
+    data.assignDriver(id, name).then(() => {
+      delete state.cache.all_drives;
+      showScreen();
+    }).catch(() => {
+      t.disabled = false;
+      t.textContent = "Failed";
+    });
   } else if (action === "open-drive") {
     // Opening a drive is a navigation into the Drives section — keep the left-nav
     // highlight + header in sync (the detail can be reached from Overview/Timeline too).
     state.openDriveId = Number(t.dataset.id);
     state.screen = "dr";
+    pushHistory();
     renderShell();
     renderDriveDetail();
   } else if (action === "save-driver") {
@@ -497,17 +591,21 @@ function onRootClick(e) {
     }).catch(() => { t.textContent = "Failed"; });
   } else if (action === "back-drives") {
     state.openDriveId = null;
+    pushHistory();
     renderDrives();
   } else if (action === "open-charge") {
     state.openChargeId = Number(t.dataset.id);
     state.screen = "ch";
+    pushHistory();
     renderShell();
     renderChargeDetail();
   } else if (action === "back-charges") {
     state.openChargeId = null;
+    pushHistory();
     renderCharges();
   } else if (action === "goto-bh") {
     state.screen = "bh";
+    pushHistory();
     renderShell();
     showScreen();
   } else if (action === "load-live") {
@@ -522,11 +620,20 @@ function onRootClick(e) {
   } else if (action === "predict-run") {
     runRangePrediction();
   } else if (action === "view-cert") {
-    loadDriveCertificate(Number(t.dataset.id));
+    const prevLabel = t.textContent;
+    t.disabled = true;
+    t.textContent = "Loading…";
+    loadDriveCertificate(Number(t.dataset.id)).finally(() => { t.disabled = false; t.textContent = prevLabel; });
   } else if (action === "copy-cert") {
     copyToClipboard(t.dataset.text || "", t);
   } else if (action === "print-report") {
-    openPrintableReport(Number(t.dataset.id));
+    const prevLabel = t.innerHTML;
+    t.disabled = true;
+    t.textContent = "Preparing…";
+    openPrintableReport(Number(t.dataset.id))
+      .then(() => { t.textContent = "Opened ✓"; })
+      .catch(() => { t.textContent = "Couldn't open"; })
+      .finally(() => { setTimeout(() => { t.disabled = false; t.innerHTML = prevLabel; }, 1300); });
   } else if (action === "map-expand") {
     const card = t.closest(".tm-map-card");
     if (card) {
@@ -548,11 +655,16 @@ function setContent(html) {
 function loadingHtml() {
   return `<div class="tm-empty"><div class="tm-spinner"></div><div>Loading…</div></div>`;
 }
+/** Whole-screen/whole-card empty state: icon badge + title + optional detail. */
 function emptyHtml(title, sub) {
-  return `<div class="tm-card"><div class="tm-empty"><div class="tm-empty-title">${esc(title)}</div>${sub ? `<div>${esc(sub)}</div>` : ""}</div></div>`;
+  return `<div class="tm-card"><div class="tm-empty"><div class="tm-empty-icon">–</div><div class="tm-empty-title">${esc(title)}</div>${sub ? `<div>${esc(sub)}</div>` : ""}</div></div>`;
 }
 function errorHtml(message) {
-  return `<div class="tm-card"><div class="tm-empty"><div class="tm-empty-title" style="color:var(--bad);">Couldn't load this</div><div>${esc(message)}</div></div></div>`;
+  return `<div class="tm-card"><div class="tm-empty"><div class="tm-empty-icon" style="color:var(--bad);">!</div><div class="tm-empty-title" style="color:var(--bad);">Couldn't load this</div><div>${esc(message)}</div></div></div>`;
+}
+/** Single-line empty note inside an already-titled card/chart (e.g. "No SoC history yet"). */
+function miniEmptyHtml(text) {
+  return `<div class="tm-mini-empty">${esc(text)}</div>`;
 }
 
 // ---------------------------------------------------------------------------
@@ -593,6 +705,8 @@ function skeletonHtml(screen) {
       return cards3;
     case "map":
       return `<div class="tm-flex-row" style="gap:8px;">${skel("height:24px;width:120px;border-radius:999px;").repeat(3)}</div>${mapCard(560)}`;
+    case "md":
+      return `<div class="tm-card tm-card-pad-lg tm-flex-row" style="gap:16px;">${skel("height:56px;width:56px;border-radius:10px;")}${skel("height:16px;width:40%;")}</div>${metrics}${table(8)}`;
     case "bh":
       return `<div class="tm-grid-3col"><div class="tm-card tm-card-pad-lg" style="display:flex;align-items:center;justify-content:center;">${skel("height:132px;width:132px;border-radius:50%;")}</div>${metric.repeat(2)}</div>${chart}`;
     case "cs":
@@ -623,6 +737,7 @@ async function showScreen() {
       case "dv": await renderDrivers(); break;
       case "pl": await renderPlaces(); break;
       case "map": await renderLifetimeMapScreen(); break;
+      case "md": await renderMedia(); break;
       case "ch": await renderCharges(); break;
       case "cs": await renderChargingStats(); break;
       case "bh": await renderBatteryHealth(); break;
@@ -689,11 +804,28 @@ async function loadLiveVehicleData() {
   await renderOverview();
 }
 
-/** Tesla API spend card: month-to-date vs the free-tier poll cap, with a bar. */
+/** Month-end forecast line shared by budgetCard() and sideBudgetHtml(). */
+function budgetForecastNote(b, compact) {
+  const f = b.forecast;
+  if (!f || f.method === "insufficient_data") return "";
+  const overBudget = f.projected_over_budget === true;
+  const warn = overBudget || f.budget_exhausted_in_days != null;
+  const text = f.budget_exhausted_in_days != null
+    ? `At this rate, runs out in ~${fmt1(f.budget_exhausted_in_days)} day${f.budget_exhausted_in_days === 1 ? "" : "s"} — before month-end`
+    : overBudget
+      ? `Projected ≈ $${fmt2(f.projected_month_usd)} by month-end — over the $${fmt0(b.poll_budget_usd)} cap`
+      : `On track — projected ≈ $${fmt2(f.projected_month_usd)} by month-end`;
+  return compact
+    ? `<div style="font-size:10.5px;color:${warn ? "var(--warn)" : "var(--faint)"};margin-top:3px;">${esc(text)}</div>`
+    : `<div class="tm-stat-note" style="${warn ? "color:var(--warn);" : ""}">${esc(text)}</div>`;
+}
+
+/** Tesla API spend card: month-to-date vs the free-tier poll cap, with a bar + month-end forecast. */
 function budgetCard(b) {
   if (!b || typeof b !== "object") return "";
   const pct = b.poll_budget_usd > 0 ? Math.min(100, (b.spent_usd / b.poll_budget_usd) * 100) : 0;
-  const color = !b.poll_allowed ? "var(--warn)" : "var(--good)";
+  const atRisk = !b.poll_allowed || b.forecast?.projected_over_budget === true || b.forecast?.budget_exhausted_in_days != null;
+  const color = atRisk ? "var(--warn)" : "var(--good)";
   const note = !b.poll_allowed ? "polling paused — resumes on the 1st" : "of free-tier cap · never charged";
   return `
     <div class="tm-card tm-card-pad-metric">
@@ -703,22 +835,25 @@ function budgetCard(b) {
         <div style="position:absolute;inset:0 auto 0 0;width:${pct.toFixed(1)}%;background:${color};border-radius:999px;"></div>
       </div>
       <div class="tm-stat-note">${esc(note)}</div>
+      ${budgetForecastNote(b, false)}
     </div>`;
 }
 
-/** Compact Tesla API spend for the sidebar (calls + $ spend, above the theme toggle). */
+/** Compact Tesla API spend for the sidebar (calls + $ spend + a one-line forecast, above the theme toggle). */
 function sideBudgetHtml(b) {
   if (!b || typeof b !== "object") return "";
   const cap = b.poll_budget_usd > 0 ? b.poll_budget_usd : null;
   const pct = cap ? Math.min(100, (b.spent_usd / cap) * 100) : 0;
-  const color = b.poll_allowed === false ? "var(--warn)" : "var(--good)";
+  const atRisk = b.poll_allowed === false || b.forecast?.projected_over_budget === true || b.forecast?.budget_exhausted_in_days != null;
+  const color = atRisk ? "var(--warn)" : "var(--good)";
   const calls = [b.reads, b.billed_reads, b.count, b.calls].find((v) => typeof v === "number");
   return `
     <div class="tm-sidebudget-top">
       <span>Tesla API${calls != null ? ` · ${fmt0(calls)} calls` : ""}</span>
       <span class="tm-mono">$${fmt2(b.spent_usd)}${cap ? ` <span style="color:var(--faint);">/ ${fmt0(cap)}</span>` : ""}</span>
     </div>
-    ${cap ? `<div class="tm-sidebudget-bar"><div style="width:${pct.toFixed(1)}%;background:${color};"></div></div>` : ""}`;
+    ${cap ? `<div class="tm-sidebudget-bar"><div style="width:${pct.toFixed(1)}%;background:${color};"></div></div>` : ""}
+    ${budgetForecastNote(b, true)}`;
 }
 function updateSideBudget(b) {
   if (b) state.apiBudget = b;
@@ -765,6 +900,7 @@ function tpmsCard(t) {
     return typeof tr === "number" && tr < -0.15;
   };
   const anyWarn = WHEELS.some(([w]) => flag(w));
+  const bal = t?.balance ?? null;
   return `
     <div class="tm-card tm-card-pad-metric">
       <div class="tm-stat-label" style="display:flex;align-items:baseline;">Tyre pressure
@@ -778,6 +914,10 @@ function tpmsCard(t) {
           </div>`).join("")}
       </div>
       <div class="tm-stat-note">${latest?.ts != null ? `as of ${fmtDateTime(latest.ts)}` : "no TPMS samples yet"}</div>
+      ${bal ? `<div class="tm-stat-note" style="${bal.asymmetric ? "color:var(--warn);" : ""}">
+        ${bal.asymmetric ? "Persistent side-to-side gap — " : "Well balanced — "}
+        FL–FR ${bal.fl_fr_bar >= 0 ? "+" : ""}${bal.fl_fr_bar} · RL–RR ${bal.rl_rr_bar >= 0 ? "+" : ""}${bal.rl_rr_bar} bar avg (${bal.paired_samples} samples)
+      </div>` : ""}
     </div>`;
 }
 
@@ -801,7 +941,7 @@ function tyreStatusHtml(t) {
     const tr = trend?.[c.w];
     return typeof tr === "number" && tr < -0.15;
   });
-  if (bad.length === 0 && nums.length === 4) return `<span style="color:var(--good);">&#10003; OK</span>`;
+  if (bad.length === 0 && nums.length === 4) return `<span style="color:var(--good);">&#10003; Good</span>`;
   const c = bad[0];
   const val = c.v != null ? `${fmt0(c.v * 14.5038)} PSI` : "no reading";
   return `<span style="color:var(--warn);">${c.label} ${val}${bad.length > 1 ? ` +${bad.length - 1}` : ""}</span>`;
@@ -930,20 +1070,21 @@ async function renderOverview() {
         <div class="tm-stat-label">Avg efficiency</div>
         <div class="tm-stat-value">${summary?.avg_efficiency_wh_km != null ? fmt0(summary.avg_efficiency_wh_km) : "—"} <span class="tm-stat-unit">Wh/km</span></div>
       </div>
+      ${budgetCard(summary?.api_budget)}
     </div>
 
     <div class="tm-grid-2">
       <div class="tm-card tm-card-pad">
-        <div class="tm-flex-row" style="align-items:baseline;margin-bottom:18px;">
-          <div style="font-size:14px;font-weight:600;">Charge level</div>
-          <div style="font-size:12px;color:var(--faint);">last 7 days</div>
+        <div class="tm-card-head">
+          <div class="tm-card-head-title">Charge level</div>
+          <div class="tm-card-head-sub">last 7 days</div>
         </div>
         ${socChart.length > 1 ? svgLineChart({
           series: [{ points: socChart, area: true }],
           yTicks: [0, 25, 50, 75, 100].map((v) => ({ value: v, label: String(v) })),
           xTicks: buildDayTicks(socChart),
           yDomain: [0, 100],
-        }) : `<div class="tm-empty">No SoC history yet</div>`}
+        }) : miniEmptyHtml("No SoC history yet")}
       </div>
       <div class="tm-card tm-card-pad">
         <div style="font-size:14px;font-weight:600;margin-bottom:14px;">Recent activity</div>
@@ -959,7 +1100,7 @@ async function renderOverview() {
             <span class="tm-activity-time">${fmtTime(e.ts)}</span>
             ${link ? `<span class="tm-activity-chev">&#8250;</span>` : ""}
           </div>`;
-        }).join("") : `<div class="tm-empty">Nothing recorded yet</div>`}
+        }).join("") : miniEmptyHtml("Nothing recorded yet")}
       </div>
     </div>
   `);
@@ -1105,9 +1246,9 @@ function efficiencyByTempCard(et) {
   const pts = bins.map((b) => [(b.t_min + b.t_max) / 2, b.avg_wh_km]);
   return `
     <div class="tm-card tm-card-pad">
-      <div class="tm-flex-row" style="align-items:baseline;margin-bottom:18px;">
-        <div style="font-size:14px;font-weight:600;">Efficiency vs temperature</div>
-        <div style="font-size:12px;color:var(--faint);">avg Wh/km per 5 °C bin${totalDrives ? ` · ${totalDrives} drives` : ""}</div>
+      <div class="tm-card-head">
+        <div class="tm-card-head-title">Efficiency vs temperature</div>
+        <div class="tm-card-head-sub">avg Wh/km per 5 °C bin${totalDrives ? ` · ${totalDrives} drives` : ""}</div>
       </div>
       ${pts.length >= 2 ? svgLineChart({
         series: [{
@@ -1117,7 +1258,7 @@ function efficiencyByTempCard(et) {
         }],
         yTicks: autoTicks(pts.map((p) => p[1]), 4),
         xTicks: pts.map((p) => ({ value: p[0], label: `${fmt0(p[0])}°` })),
-      }) : `<div class="tm-empty">Not enough temperature-tagged drives yet — this fills in as drives with outside-temperature samples accumulate.</div>`}
+      }) : miniEmptyHtml("Not enough temperature-tagged drives yet — this fills in as drives with outside-temperature samples accumulate.")}
     </div>`;
 }
 
@@ -1148,12 +1289,46 @@ function monthlyReportTable(rows) {
     </div>`;
 }
 
+/** ADAS feature adoption (idea #62/#70) — how much your driving interacts with the car's own safety systems. */
+function safetyFeaturesCard(s) {
+  if (!s || s.has_data === false) return "";
+  return `
+    <div class="tm-card tm-card-pad">
+      <div class="tm-card-head"><div class="tm-card-head-title">Safety feature usage</div><div class="tm-card-head-sub">last ${s.days} days</div></div>
+      <div class="tm-grid-half" style="gap:14px;">
+        <div><div class="tm-readout-label">AEB disabled</div><div class="tm-readout-value" style="${s.aeb_disabled_pct > 0 ? "color:var(--warn);" : ""}">${s.aeb_disabled_pct != null ? fmt0(s.aeb_disabled_pct) + "%" : "—"}</div></div>
+        <div><div class="tm-readout-label">Blind-spot chimes</div><div class="tm-readout-value">${fmt0(s.blind_spot_chime_count)}</div></div>
+        <div><div class="tm-readout-label">Lane departure</div><div class="tm-readout-value" style="font-size:14px;">${esc(s.lane_departure_setting || "—")}</div></div>
+        <div><div class="tm-readout-label">Forward collision warning</div><div class="tm-readout-value" style="font-size:14px;">${esc(s.forward_collision_warning_setting || "—")}</div></div>
+      </div>
+    </div>`;
+}
+
+/** Climate/comfort habits (idea #33/#38) — the same signal the driver auto-assign fingerprint uses, as its own report. */
+function climateHabitsCard(c) {
+  if (!c || c.has_data === false) return "";
+  return `
+    <div class="tm-card tm-card-pad">
+      <div class="tm-card-head"><div class="tm-card-head-title">Climate habits</div><div class="tm-card-head-sub">last ${c.days} days</div></div>
+      <div class="tm-grid-half" style="gap:14px;">
+        <div><div class="tm-readout-label">Auto climate · L</div><div class="tm-readout-value">${c.auto_climate_left_pct != null ? fmt0(c.auto_climate_left_pct) + "%" : "—"}</div></div>
+        <div><div class="tm-readout-label">Auto climate · R</div><div class="tm-readout-value">${c.auto_climate_right_pct != null ? fmt0(c.auto_climate_right_pct) + "%" : "—"}</div></div>
+        <div><div class="tm-readout-label">Seat heater · L / R</div><div class="tm-readout-value">${c.avg_seat_heater_left ?? "—"} / ${c.avg_seat_heater_right ?? "—"}</div></div>
+        <div><div class="tm-readout-label">Seat cooling · L / R</div><div class="tm-readout-value">${c.avg_seat_cool_left ?? "—"} / ${c.avg_seat_cool_right ?? "—"}</div></div>
+      </div>
+      ${c.seat_heater_divergence != null && c.seat_heater_divergence >= 1 ? `<div class="tm-stat-note" style="margin-top:12px;">Driver/passenger seat-heater habits diverge by ${c.seat_heater_divergence} levels on average.</div>` : ""}
+    </div>`;
+}
+
 async function renderStatistics() {
-  const [drives, charges, effTemp, monthlyRes] = await Promise.all([
+  const [drives, charges, effTemp, monthlyRes, tires, safetyFeatures, climateHabits] = await Promise.all([
     safe(cached("all_drives", () => data.drives(vin(), 2000)), []),
     safe(cached("all_charges", () => data.chargeSessions(vin(), 2000)), []),
     safe(cached("eff_temp", () => data.efficiencyByTemp(vin())), null),
     safe(cached("monthly", () => data.monthly(vin(), 12)), null),
+    safe(cached("tires_90", () => data.tires(vin(), 90)), null), // distinct key from Overview's 30-day "tires" cache
+    safe(cached("safety_features", () => data.safetyFeatures(vin(), 90)), null),
+    safe(cached("climate_habits", () => data.climateHabits(vin(), 90)), null),
   ]);
   const monthlyRows = monthlyRes?.months || []; // most recent first (server contract)
 
@@ -1196,13 +1371,13 @@ async function renderStatistics() {
       <div class="tm-card tm-card-pad-metric"><div class="tm-stat-label">Charging cost</div><div class="tm-stat-value">${money(totalCost, cur, 0)}</div></div>
     </div>
     <div class="tm-card tm-card-pad">
-      <div class="tm-flex-row" style="align-items:baseline;margin-bottom:18px;">
-        <div style="font-size:14px;font-weight:600;">Distance driven</div>
-        <div style="font-size:12px;color:var(--faint);">km per month</div>
+      <div class="tm-card-head">
+        <div class="tm-card-head-title">Distance driven</div>
+        <div class="tm-card-head-sub">km per month</div>
       </div>
       ${monthlyRows.length ? svgBarChart({ bars: monthlyRows.slice().reverse().map((m) => ({ label: monthShort(m.month), value: m.distance_km || 0 })) })
         : months.length ? svgBarChart({ bars: months.map((m) => ({ label: m.m, value: m.km })) })
-        : `<div class="tm-empty">No monthly data yet</div>`}
+        : miniEmptyHtml("No monthly data yet")}
     </div>
     ${efficiencyByTempCard(effTemp)}
     ${monthlyRows.length ? monthlyReportTable(monthlyRows) : `
@@ -1222,6 +1397,8 @@ async function renderStatistics() {
           </div>`).join("")}
       </div>
     </div>`}
+    ${tires?.balance || tires?.latest ? `<div class="tm-grid-3col">${tpmsCard(tires)}</div>` : ""}
+    ${(safetyFeatures?.has_data || climateHabits?.has_data) ? `<div class="tm-grid-2">${safetyFeaturesCard(safetyFeatures)}${climateHabitsCard(climateHabits)}</div>` : ""}
   `);
 }
 
@@ -1248,14 +1425,19 @@ function isSyntheticDrive(d) {
 
 const SYNTHETIC_TITLE = "Reconstructed from the odometer — this drive happened between polls, so distance & endpoints are known but there's no GPS trace. Live capture needs more frequent polling or telemetry streaming.";
 
-/** Muted "recovered · no route" pill for odometer-reconstructed drives. */
+/** Muted "reconstructed · no route" pill for odometer-reconstructed drives. */
 function syntheticBadgeHtml() {
-  return `<span class="tm-pill tm-pill-chip" style="font-size:10.5px;" title="${esc(SYNTHETIC_TITLE)}">recovered · no route</span>`;
+  return `<span class="tm-pill tm-pill-chip" style="font-size:10.5px;" title="${esc(SYNTHETIC_TITLE)}">reconstructed · no route</span>`;
 }
 
 /** Driver cell body: assigned name, or the classifier's guess (muted, "?"-suffixed), or —. */
 function driverCellHtml(d) {
-  if (d.driver) return esc(d.driver);
+  if (d.driver) {
+    const auto = d.driver_source === "auto"
+      ? `<span class="tm-pill tm-pill-chip" style="font-size:9.5px;padding:1px 6px;margin-left:5px;vertical-align:1px;" title="Assigned automatically from place, time and climate-profile patterns — click to correct it if it's wrong.">auto</span>`
+      : "";
+    return esc(d.driver) + auto;
+  }
   if (d.suggested_driver) return `<span class="tm-driver-suggested">${esc(d.suggested_driver)}?</span>`;
   return `<span style="color:var(--faint);">—</span>`;
 }
@@ -1265,8 +1447,19 @@ function beginDriverEdit(cell, id) {
   const drives = state.cache.all_drives || [];
   const row = drives.find((d) => d.id === id);
   const current = row?.driver || "";
-  cell.innerHTML = `<input class="tm-driver-edit" list="tm-driver-names" value="${esc(current)}" placeholder="${esc(row?.suggested_driver ? row.suggested_driver + "?" : "driver…")}" autocomplete="off">`;
+  // Roster chips let a driver self-assign in one tap instead of typing their
+  // own name — reuses whatever roster renderDrives() already loaded.
+  const roster = state.cache.drivers_roster?.drivers || knownDrivers(drives).map((name) => ({ name, source: "tagged" }));
+  const quickNames = [...new Set(roster.map(rosterName).filter(Boolean))].sort((a, b) => a.localeCompare(b)).filter((n) => n !== current);
+  cell.innerHTML = `
+    <input class="tm-driver-edit" list="tm-driver-names" value="${esc(current)}" placeholder="${esc(row?.suggested_driver ? row.suggested_driver + "?" : "driver…")}" autocomplete="off">
+    ${quickNames.length ? `<div class="tm-quick-assign">${quickNames.map((n) => `<button type="button" class="tm-quick-chip" data-action="quick-assign" data-id="${id}" data-driver="${esc(n)}">${esc(n)}</button>`).join("")}</div>` : ""}
+  `;
   const input = cell.querySelector("input");
+  // A click on a quick chip would otherwise blur the input first (finishing
+  // the edit with whatever was typed) before the chip's own click fires —
+  // keep focus on the input so only the chip's quick-assign action runs.
+  cell.querySelector(".tm-quick-assign")?.addEventListener("mousedown", (e) => e.preventDefault());
   let done = false;
   const finish = (save) => {
     if (done) return;
@@ -1345,7 +1538,7 @@ async function renderDrives() {
           <div class="tm-table-row" data-action="open-drive" data-id="${d.id}" style="grid-template-columns:${cols};">
             <div data-role="when" style="font-size:12.5px;color:var(--sub);">${fmtDateTime(d.start_ts)}</div>
             <div data-role="route" class="tm-ellipsis" style="font-size:13.5px;font-weight:500;"><bdi>${esc(driveEndpoint(d, "start", locations))}</bdi> <span style="color:var(--faint);">→</span> <bdi>${esc(driveEndpoint(d, "end", locations))}</bdi>${isSyntheticDrive(d) ? " " + syntheticBadgeHtml() : ""}</div>
-            <div data-k="Driver" class="tm-ellipsis" data-action="edit-driver" data-id="${d.id}" title="Click to assign driver" style="font-size:12.5px;">${driverCellHtml(d)}</div>
+            <div data-k="Driver" class="tm-ellipsis tm-edit-cell" data-action="edit-driver" data-id="${d.id}" title="Click to assign driver" style="font-size:12.5px;">${driverCellHtml(d)}</div>
             <div data-k="Distance" class="tm-right tm-mono">${d.distance_km != null ? fmt1(d.distance_km) : "—"} km</div>
             <div data-k="Duration" class="tm-right tm-mono" style="color:var(--sub);">${fmtDurationMin(d.duration_min)}</div>
             <div data-k="Speed" class="tm-right tm-mono" style="color:var(--sub);">${d.avg_speed != null ? fmt0(d.avg_speed) : "—"} km/h</div>
@@ -1361,7 +1554,7 @@ async function renderDrives() {
 async function renderDriveDetail() {
   const detail = await data.drive(state.openDriveId);
   if (detail.error) return setContent(errorHtml(detail.error));
-  const { drive: d, path } = detail;
+  const { drive: d, path, media = [] } = detail;
   const locations = await safe(cached("locations", () => data.locations()), []);
   const roster = await loadDriverRoster();
   const locName = (id) => (id == null ? "Unknown" : locations.find((l) => l.id === id)?.name || "Unknown");
@@ -1420,8 +1613,9 @@ async function renderDriveDetail() {
   const totalSec = Math.max(1, lastTs - t0);
   const totalMin = totalSec / 60;
   const avgPower = powSeries.length ? powSeries.reduce((s, p) => s + p[1], 0) / powSeries.length : null;
+  const trackMarkers = media.map((m) => ({ t: (m.ts - t0) / 60, title: m.title, artist: m.artist }));
   const chart = speedPts.length > 1
-    ? svgDriveChart({ speedPts, elevPts, events, durationMin: totalMin })
+    ? svgDriveChart({ speedPts, elevPts, events, tracks: trackMarkers, durationMin: totalMin })
     : { html: "", plot: null };
 
   const routePlaceholder = `
@@ -1451,6 +1645,13 @@ async function renderDriveDetail() {
         <button class="tm-chip-btn" style="padding:5px 12px;" data-action="save-driver" data-id="${d.id}">Save</button>
       </div>
     </div>
+    ${(() => {
+      const quickNames = [...new Set(roster.map(rosterName).filter(Boolean))].sort((a, b) => a.localeCompare(b)).filter((n) => n !== (d.driver || ""));
+      return quickNames.length ? `<div class="tm-flex-row" style="gap:8px;align-items:baseline;flex-wrap:wrap;">
+        <span style="font-size:12px;color:var(--sub);">${d.driver ? "Not right? Reassign to:" : "Or assign to:"}</span>
+        <div class="tm-quick-assign" style="margin-top:0;">${quickNames.map((n) => `<button type="button" class="tm-quick-chip" data-action="quick-assign" data-id="${d.id}" data-driver="${esc(n)}">${esc(n)}</button>`).join("")}</div>
+      </div>` : "";
+    })()}
     ${rosterHintHtml(roster)}
     <div style="font-size:12px;color:var(--faint);">${esc(DRIVER_MANUAL_NOTE)}${!d.driver && d.suggested_driver ? ` Looks like <span class="tm-driver-suggested">${esc(d.suggested_driver)}</span> drove this — pick a name and Save to confirm.` : ""}</div>
 
@@ -1479,11 +1680,12 @@ async function renderDriveDetail() {
           <span><i style="background:var(--bad);"></i>hard brake</span>
           <span><i style="background:var(--warn);"></i>hard accel</span>
           <span><i class="tm-dash"></i>elevation</span>
+          ${trackMarkers.length ? `<span><i style="background:#8A63D2;"></i>♪ track change</span>` : ""}
         </div>
         <div style="margin-left:auto;font-size:11.5px;color:var(--faint);">${d.outside_temp_avg != null ? `outside ${fmt1(d.outside_temp_avg)} °C` : "Speed km/h · tap chart to scrub"}</div>
       </div>
       <div id="tm-drive-chart">${chart.html}</div>
-    </div>` : `<div class="tm-card tm-card-pad"><div class="tm-empty">No speed samples recorded for this drive</div></div>`}
+    </div>` : `<div class="tm-card tm-card-pad">${miniEmptyHtml("No speed samples recorded for this drive")}</div>`}
 
     ${d.behavior_score != null || d.max_decel_ms2 != null ? `
     <div class="tm-grid-metrics">
@@ -1628,9 +1830,11 @@ async function renderDrivers() {
   setContent(`
     <div class="tm-card tm-card-pad" style="background:color-mix(in oklab, var(--accent) 5%, var(--card));">
       <div style="font-size:13px;color:var(--sub);line-height:1.5;">
-        <b>How this works.</b> Tesla exposes no way to know <i>who</i> is driving, so assign each trip to a driver on the
-        <b>Drives</b> page — then their profile aggregates here. Speed, speeding %, night-driving and mileage are always
-        reliable; <b>harsh braking / acceleration / g-force need ~1-second sampling</b> to be meaningful, so at the current
+        <b>How this works.</b> Tesla exposes no way to know <i>who</i> is driving, so the system infers it from place,
+        time-of-day and climate-profile patterns — confidently-matched trips are tagged automatically
+        (<span class="tm-pill tm-pill-chip" style="font-size:9.5px;padding:1px 6px;">auto</span>), weaker matches are
+        left as a one-tap suggestion on the <b>Drives</b> page, and you can always correct either one. Speed, speeding %,
+        night-driving and mileage are always reliable; <b>harsh braking / acceleration / g-force need ~1-second sampling</b> to be meaningful, so at the current
         logging cadence those show as low-fidelity. ${hasScores ? "" : "No behaviour scores yet — they populate as multi-sample drives accumulate."}
       </div>
       ${baselineNote ? `<div style="font-size:12px;color:var(--faint);line-height:1.5;margin-top:10px;border-top:1px solid var(--line2);padding-top:10px;"><b>Baseline.</b> ${esc(baselineNote)}</div>` : ""}
@@ -1727,22 +1931,21 @@ async function renderPlaces() {
   setContent(`
     ${suggestions.length ? `
     <div class="tm-card tm-card-pad">
-      <div class="tm-flex-row" style="align-items:baseline;margin-bottom:6px;">
-        <div style="font-size:14px;font-weight:600;">Suggested places</div>
-        <div style="font-size:12px;color:var(--faint);">frequent stops that aren't saved yet</div>
+      <div class="tm-card-head" style="margin-bottom:6px;">
+        <div class="tm-card-head-title">Suggested places</div>
+        <div class="tm-card-head-sub">frequent stops that aren't saved yet — name one to save it</div>
       </div>
-      <div style="font-size:12px;color:var(--faint);margin-bottom:8px;">
-        Locations are managed with the worker's <code>set_location</code> MCP tool — this dashboard is read-only, so ask
-        Claude to save one (name + coordinates below) and it'll appear in the list.
-      </div>
-      ${suggestions.map((s) => `
-        <div class="tm-activity-row">
+      ${suggestions.map((s, i) => `
+        <div class="tm-suggest-row">
           <span class="tm-dot" style="background:var(--warn);"></span>
-          <div style="min-width:0;">
+          <div class="tm-suggest-info">
             <div class="tm-activity-title">${esc(s.label || "Unnamed spot")}</div>
-            <div class="tm-activity-meta">${s.lat != null && s.lon != null ? `${fmt1(s.lat)}, ${fmt1(s.lon)}` : ""}</div>
+            <div class="tm-activity-meta">${s.lat != null && s.lon != null ? `${fmt1(s.lat)}, ${fmt1(s.lon)}` : ""}${s.visits != null ? ` · ${s.visits} visit${s.visits === 1 ? "" : "s"}` : ""}</div>
           </div>
-          <span class="tm-activity-time">${s.visits != null ? `${s.visits} visit${s.visits === 1 ? "" : "s"}` : ""}</span>
+          <div class="tm-suggest-form">
+            <input class="tm-gate-input tm-suggest-input" id="tm-suggest-name-${i}" type="text" placeholder="Name this place…" autocomplete="off" maxlength="120">
+            <button class="tm-chip-btn" data-action="save-suggested-location" data-lat="${s.lat}" data-lon="${s.lon}" data-input="tm-suggest-name-${i}">Save</button>
+          </div>
         </div>`).join("")}
     </div>` : ""}
     ${locations.length ? `
@@ -1759,7 +1962,7 @@ async function renderPlaces() {
           </div>`).join("")}
         <div class="tm-foot-note">${locations.length} saved place${locations.length === 1 ? "" : "s"} · click one for its stats.</div>
       </div>
-    </div>` : emptyHtml("No saved places yet", "Save geofence locations (home, work, …) with the set_location MCP tool and drives/charges will auto-label against them.")}
+    </div>` : emptyHtml("No saved places yet", suggestions.length ? "Name one of the frequent stops above to save it — drives and charges will start labeling against it automatically." : "Once a spot has been visited a few times it'll show up above as a suggestion you can name and save.")}
   `);
 }
 
@@ -1832,6 +2035,169 @@ async function renderLifetimeMapScreen() {
     }));
     requestAnimationFrame(() => renderLifetimeMap(document.getElementById("tm-lifetime-map"), paths.filter((p) => p.length > 1)));
   }
+}
+
+// ---------------------------------------------------------------------------
+// Media — "most played" from Fleet Telemetry's MediaNowPlaying* fields
+// ---------------------------------------------------------------------------
+
+// Tesla exposes no cover art at all — this looks it up from Apple's free,
+// unauthenticated iTunes Search API using the track/artist TEXT the car does
+// report, purely for visual polish. Never persisted (in-memory only, one
+// lookup per distinct title+artist per session); silently absent if the
+// lookup fails or the environment blocks the request — same "enhance, don't
+// depend on" posture as the rest of the app's optional network calls.
+const COVER_ART_CACHE = new Map();
+function fetchCoverArt(title, artist) {
+  const key = `${title}|||${artist || ""}`;
+  if (COVER_ART_CACHE.has(key)) return COVER_ART_CACHE.get(key);
+  const p = (async () => {
+    try {
+      const term = encodeURIComponent([title, artist].filter(Boolean).join(" "));
+      const res = await fetch(`https://itunes.apple.com/search?term=${term}&media=music&limit=1`);
+      if (!res.ok) return null;
+      const j = await res.json();
+      return j?.results?.[0]?.artworkUrl100 || null;
+    } catch { return null; }
+  })();
+  COVER_ART_CACHE.set(key, p);
+  return p;
+}
+/** Fills a `.tm-media-cover` placeholder once the (async, non-blocking) art lookup resolves. */
+function loadCoverInto(elId, title, artist) {
+  if (!title) return;
+  fetchCoverArt(title, artist).then((url) => {
+    if (!url) return;
+    const el = document.getElementById(elId);
+    if (el) el.innerHTML = `<img src="${esc(url)}" alt="" loading="lazy">`;
+  });
+}
+
+function nowPlayingCard(latest) {
+  const title = latest?.media_title, artist = latest?.media_artist, album = latest?.media_album;
+  const station = latest?.media_station, source = latest?.media_source, status = latest?.media_status;
+  const volume = latest?.media_volume;
+  if (!title && !station) {
+    return `<div class="tm-card tm-card-pad-lg"><div class="tm-empty" style="padding:10px 0;">
+      <div class="tm-empty-icon">♪</div>
+      <div class="tm-empty-title">Nothing playing right now</div>
+      <div>Shows up here the moment the car streams a Media* field and something's on.</div>
+    </div></div>`;
+  }
+  const playing = typeof status === "string" && /playing/i.test(status);
+  return `
+    <div class="tm-card tm-card-pad-lg tm-flex-row" style="gap:16px;align-items:center;">
+      <div class="tm-media-cover tm-media-cover-lg" id="tm-np-cover">♪</div>
+      <div style="min-width:0;flex:1;">
+        <div class="tm-flex-row" style="gap:8px;">
+          <span class="tm-pill ${playing ? "tm-pill-good" : "tm-pill-chip"}">${playing ? "▶ Playing" : esc(status || "Now playing")}</span>
+          ${source ? `<span class="tm-pill tm-pill-chip">${esc(source)}</span>` : ""}
+        </div>
+        <div class="tm-ellipsis" style="font-size:17px;font-weight:600;margin-top:8px;">${esc(title || station || "—")}</div>
+        <div class="tm-ellipsis" style="font-size:13px;color:var(--sub);margin-top:2px;">${esc([artist, album].filter(Boolean).join(" · ") || (station ? "Radio" : ""))}</div>
+      </div>
+      ${volume != null ? `<div style="text-align:right;flex:none;"><div class="tm-readout-label">Volume</div><div class="tm-readout-value">${fmt0(volume)}</div></div>` : ""}
+    </div>`;
+}
+
+/** Ranked list row for a leaderboard (tracks get cover art; artists/sources/stations don't). */
+function mediaListHtml(rows, key, opts = {}) {
+  if (!rows || !rows.length) return miniEmptyHtml("Nothing yet");
+  return `<div class="tm-flex-col" style="gap:0;">${rows.map((r, i) => {
+    const coverId = opts.cover ? `tm-cover-${key}-${i}` : null;
+    return `
+    <div class="tm-media-row">
+      <span class="tm-media-rank">${i + 1}</span>
+      ${coverId ? `<div class="tm-media-cover" id="${coverId}">♪</div>` : ""}
+      <div class="tm-ellipsis" style="flex:1;min-width:0;font-size:13px;font-weight:500;">${esc(r[key])}</div>
+      <span class="tm-mono" style="font-size:12px;color:var(--sub);white-space:nowrap;">${r.plays} play${r.plays === 1 ? "" : "s"}</span>
+      ${r.minutes != null ? `<span class="tm-mono tm-right" style="font-size:12px;color:var(--faint);width:60px;">${fmt0(r.minutes)} min</span>` : ""}
+    </div>`;
+  }).join("")}</div>`;
+}
+
+async function renderMedia() {
+  const [stats, latest] = await Promise.all([
+    safe(cached("media", () => data.media(vin(), 90)), null),
+    safe(cached("latest", () => data.latest(vin())), null),
+  ]);
+
+  if (!stats || stats.has_data === false) {
+    return setContent(emptyHtml(
+      "No media data yet",
+      stats?.note || "Stream MediaNowPlayingTitle/MediaNowPlayingArtist/MediaPlaybackSource via configure_telemetry to start tracking what's played in the car.",
+    ));
+  }
+
+  setContent(`
+    ${nowPlayingCard(latest)}
+    <div class="tm-grid-metrics">
+      <div class="tm-card tm-card-pad-metric"><div class="tm-stat-label">Plays · ${stats.days} days</div><div class="tm-stat-value">${fmt0(stats.total_plays)}</div></div>
+      <div class="tm-card tm-card-pad-metric"><div class="tm-stat-label">Listening time</div><div class="tm-stat-value">${fmt1(stats.total_listening_hours)} <span class="tm-stat-unit">h</span></div></div>
+      <div class="tm-card tm-card-pad-metric"><div class="tm-stat-label">Distinct tracks</div><div class="tm-stat-value">${fmt0(stats.top_tracks.length)}</div></div>
+      <div class="tm-card tm-card-pad-metric"><div class="tm-stat-label">Distinct artists</div><div class="tm-stat-value">${fmt0(stats.top_artists.length)}</div></div>
+    </div>
+    <div class="tm-card tm-card-pad">
+      <div class="tm-card-head"><div class="tm-card-head-title">Most played tracks</div><div class="tm-card-head-sub">by play count · last ${stats.days} days</div></div>
+      ${mediaListHtml(stats.top_tracks, "title", { cover: true })}
+    </div>
+    <div class="tm-grid-2">
+      <div class="tm-card tm-card-pad">
+        <div class="tm-card-head"><div class="tm-card-head-title">Top artists</div></div>
+        ${mediaListHtml(stats.top_artists, "artist")}
+      </div>
+      <div class="tm-card tm-card-pad">
+        <div class="tm-card-head"><div class="tm-card-head-title">Top sources</div></div>
+        ${mediaListHtml(stats.top_sources, "source")}
+      </div>
+    </div>
+    ${stats.top_stations.length ? `
+    <div class="tm-card tm-card-pad">
+      <div class="tm-card-head"><div class="tm-card-head-title">Top stations</div></div>
+      ${mediaListHtml(stats.top_stations, "station")}
+    </div>` : ""}
+    ${stats.traffic_mood && (stats.traffic_mood.heavy.length || stats.traffic_mood.light.length) ? `
+    <div class="tm-card tm-card-pad">
+      <div class="tm-card-head"><div class="tm-card-head-title">Traffic mood</div><div class="tm-card-head-sub">what's playing when traffic bites vs. when the road's clear</div></div>
+      <div class="tm-grid-2">
+        <div><div class="tm-stat-label" style="margin-bottom:8px;color:var(--warn);">Heavy traffic (10+ min delay)</div>${mediaListHtml(stats.traffic_mood.heavy, "title")}</div>
+        <div><div class="tm-stat-label" style="margin-bottom:8px;color:var(--good);">Clear roads (≤5 min delay)</div>${mediaListHtml(stats.traffic_mood.light, "title")}</div>
+      </div>
+    </div>` : ""}
+    <div id="tm-media-by-driver"></div>
+  `);
+
+  // Cover art loads in after first paint — an external lookup must never block render.
+  if (latest?.media_title) loadCoverInto("tm-np-cover", latest.media_title, latest.media_artist);
+  stats.top_tracks.forEach((r, i) => loadCoverInto(`tm-cover-title-${i}`, r.title, null));
+
+  renderMediaByDriver();
+}
+
+/** Fills #tm-media-by-driver in place once the per-driver breakdown loads (skips silently if there's nothing to add). */
+async function renderMediaByDriver() {
+  const byDriver = await safe(cached("media_by_driver", () => data.mediaByDriver(vin(), 90)), null);
+  const target = document.getElementById("tm-media-by-driver"); // re-check: user may have navigated away while this loaded
+  if (!target || !byDriver || byDriver.has_data === false || !byDriver.drivers?.length) return;
+  if (!state.mediaDriverFilter || !byDriver.drivers.some((d) => d.driver === state.mediaDriverFilter)) {
+    state.mediaDriverFilter = byDriver.drivers[0].driver;
+  }
+  target.innerHTML = mediaByDriverHtml(byDriver.drivers);
+}
+
+function mediaByDriverHtml(drivers) {
+  const active = drivers.find((d) => d.driver === state.mediaDriverFilter) || drivers[0];
+  return `
+    <div class="tm-card tm-card-pad">
+      <div class="tm-card-head"><div class="tm-card-head-title">Most played by driver</div><div class="tm-card-head-sub">who listens to what</div></div>
+      <div class="tm-flex-row" style="gap:8px;flex-wrap:wrap;margin-bottom:14px;">
+        ${drivers.map((d) => `<button class="tm-chip-btn ${d.driver === active.driver ? "active" : ""}" data-action="media-driver-filter" data-driver="${esc(d.driver)}">${esc(d.driver)}<span class="n">${d.total_plays}</span></button>`).join("")}
+      </div>
+      <div class="tm-grid-2">
+        <div><div class="tm-stat-label" style="margin-bottom:8px;">Top tracks</div>${mediaListHtml(active.top_tracks, "title")}</div>
+        <div><div class="tm-stat-label" style="margin-bottom:8px;">Top artists</div>${mediaListHtml(active.top_artists, "artist")}</div>
+      </div>
+    </div>`;
 }
 
 // ---------------------------------------------------------------------------
@@ -1912,7 +2278,7 @@ async function renderChargeDetail() {
         ],
         yTicks: (c.charge_type === "DC" ? [0, 40, 80, 120, 160] : [0, 3, 6, 9, 12]).map((v) => ({ value: v, label: String(v) })),
         xTicks: [0, Math.round((c.duration_min || 0) / 2), Math.round(c.duration_min || 0)].map((v) => ({ value: v, label: `${v} min` })),
-      }) : `<div class="tm-empty">No power samples recorded for this session</div>`}
+      }) : miniEmptyHtml("No power samples recorded for this session")}
     </div>
   `);
 }
@@ -1921,9 +2287,32 @@ async function renderChargeDetail() {
 // Charging stats
 // ---------------------------------------------------------------------------
 
+/** Lifetime charging power-delivery curve (avg/peak kW per 5% SoC bin) — idea #51: the taper profile across every session, not just one. */
+function chargeTaperCard(taper) {
+  const bins = taper?.bins || [];
+  const pts = bins.map((b) => [(b.soc_min + b.soc_max) / 2, b.avg_power_kw]);
+  return `
+    <div class="tm-card tm-card-pad">
+      <div class="tm-card-head">
+        <div class="tm-card-head-title">Charging taper curve</div>
+        <div class="tm-card-head-sub">lifetime avg power by state of charge</div>
+      </div>
+      ${pts.length >= 2 ? svgLineChart({
+        series: [{
+          points: pts,
+          markers: true,
+          titles: bins.map((b) => `${b.soc_min}–${b.soc_max}% · avg ${fmt0(b.avg_power_kw)} kW · peak ${fmt0(b.max_power_kw)} kW · ${b.samples} samples`),
+        }],
+        yTicks: autoTicks(pts.map((p) => p[1]), 4),
+        xTicks: pts.map((p) => ({ value: p[0], label: `${fmt0(p[0])}%` })),
+      }) : miniEmptyHtml(taper?.note || "Not enough charge sessions yet to draw a taper curve.")}
+    </div>`;
+}
+
 async function renderChargingStats() {
   const charges = await cached("all_charges", () => data.chargeSessions(vin(), 2000));
   const locations = await safe(cached("locations", () => data.locations()), []);
+  const taper = await safe(cached("charge_taper", () => data.chargeTaperCurve(vin())), null);
   const complete = charges.filter((c) => c.status === "complete" || c.energy_added_kwh != null);
 
   if (!complete.length) return setContent(emptyHtml("No completed charge sessions yet", "Lifetime charging stats will appear here once sessions have been logged."));
@@ -1968,11 +2357,11 @@ async function renderChargingStats() {
     </div>
     <div class="tm-grid-2">
       <div class="tm-card tm-card-pad">
-        <div class="tm-flex-row" style="align-items:baseline;margin-bottom:18px;">
-          <div style="font-size:14px;font-weight:600;">Energy charged</div>
-          <div style="font-size:12px;color:var(--faint);">kWh per month</div>
+        <div class="tm-card-head">
+          <div class="tm-card-head-title">Energy charged</div>
+          <div class="tm-card-head-sub">kWh per month</div>
         </div>
-        ${months.length ? svgBarChart({ bars: months.map((m) => ({ label: m.m, value: m.kwh })) }) : `<div class="tm-empty">No monthly data yet</div>`}
+        ${months.length ? svgBarChart({ bars: months.map((m) => ({ label: m.m, value: m.kwh })) }) : miniEmptyHtml("No monthly data yet")}
       </div>
       <div class="tm-card tm-card-pad tm-flex-col">
         <div style="font-size:14px;font-weight:600;">AC vs DC</div>
@@ -1993,14 +2382,15 @@ async function renderChargingStats() {
       <div style="font-size:14px;font-weight:600;margin-bottom:16px;">Top locations</div>
       <div class="tm-flex-col" style="gap:14px;">
         ${topLocs.map((l) => `
-          <div style="display:grid;grid-template-columns:220px 1fr 110px 110px;gap:16px;align-items:center;">
+          <div class="tm-bar-row">
             <div class="tm-ellipsis" style="font-size:13px;font-weight:500;">${esc(l.name)}</div>
-            <div style="height:8px;border-radius:999px;background:var(--chip);position:relative;"><div style="position:absolute;inset:0 auto 0 0;width:${((l.kwh / maxLocKwh) * 100).toFixed(1)}%;border-radius:999px;background:var(--accent);opacity:0.85;"></div></div>
+            <div class="tm-bar-track"><div class="tm-bar-fill" style="width:${((l.kwh / maxLocKwh) * 100).toFixed(1)}%;"></div></div>
             <div class="tm-mono tm-right" style="font-size:12.5px;">${fmt0(l.kwh)} kWh</div>
             <div class="tm-right" style="font-size:12px;color:var(--faint);">${l.n} sessions</div>
           </div>`).join("")}
       </div>
     </div>
+    ${chargeTaperCard(taper)}
   `);
 }
 
@@ -2013,7 +2403,7 @@ async function renderBatteryHealth() {
   const summary = await cached("summary", () => data.summary(vin()));
 
   if (!deg.series?.length || deg.degradation_pct == null) {
-    return setContent(emptyHtml("Not enough data yet", deg.note || "Battery health needs at least two charge sessions ending above 50% state of charge."));
+    return setContent(emptyHtml("Not enough data yet", deg.note || "Battery health tracking needs at least two charges that ended above 50% — check back after a couple more, and the trend will start filling in."));
   }
 
   const health = Math.max(0, 100 - deg.degradation_pct);
@@ -2034,15 +2424,15 @@ async function renderBatteryHealth() {
       </div>
     </div>
     <div class="tm-card tm-card-pad">
-      <div class="tm-flex-row" style="align-items:baseline;margin-bottom:18px;">
-        <div style="font-size:14px;font-weight:600;">Projected range @ 100%</div>
-        <div style="font-size:12px;color:var(--faint);">km vs time, from completed charges</div>
+      <div class="tm-card-head">
+        <div class="tm-card-head-title">Projected range @ 100%</div>
+        <div class="tm-card-head-sub">km vs time, from completed charges</div>
       </div>
       ${pts.length > 1 ? svgLineChart({
         series: [{ points: pts, area: true }],
         yTicks: autoTicks(pts.map((p) => p[1]), 4),
         xTicks: [pts[0], pts[pts.length - 1]].map((p) => ({ value: p[0], label: new Date(p[0] * 1000).toLocaleDateString(undefined, { month: "short", year: "2-digit" }) })),
-      }) : `<div class="tm-empty">Need more charge sessions to plot a trend</div>`}
+      }) : miniEmptyHtml("Need more charge sessions to plot a trend")}
     </div>
   `);
 }
@@ -2147,7 +2537,7 @@ function rosterHintHtml(roster) {
   </div>`;
 }
 
-const DRIVER_MANUAL_NOTE = "Tesla can't auto-detect who drove — assignment is manual/assisted.";
+const DRIVER_MANUAL_NOTE = "Tesla exposes no way to know who's driving — the system assigns a driver itself when confident (place/time/climate patterns), otherwise it suggests one for you to confirm. You can always correct it below.";
 
 // --- Claims-grade drive report: risk certificate + printable report ---------
 
@@ -2515,7 +2905,7 @@ function batteryForecastCard(f) {
   if (!f || f.current_pct == null) {
     return `<div class="tm-card tm-card-pad">
       <div style="font-size:14px;font-weight:600;margin-bottom:4px;">Battery forecast</div>
-      <div class="tm-empty">${esc(f?.note || "Not enough data yet — the degradation forecast needs a run of charge sessions before it can project a slope. Check back once more charges are logged, or once the forecast endpoint is deployed.")}</div>
+      ${miniEmptyHtml(f?.note || "Not enough data yet — the degradation forecast needs a run of charge sessions before it can project a slope. Check back once more charges are logged, or once the forecast endpoint is deployed.")}
     </div>`;
   }
   const slope = f.slope_pct_per_year;
@@ -2548,7 +2938,7 @@ function batteryForecastCard(f) {
           <div style="font-size:12.5px;font-weight:600;color:var(--sub);">Projected health</div>
           <div style="font-size:11.5px;color:var(--faint);margin-left:auto;">% vs year</div>
         </div>
-        <div id="tm-forecast-chart">${f.projected_pct?.length > 1 ? "" : `<div class="tm-empty" style="padding:24px;">No projection points yet</div>`}</div>
+        <div id="tm-forecast-chart">${f.projected_pct?.length > 1 ? "" : miniEmptyHtml("No projection points yet")}</div>
       </div>
       ${f.note ? `<div class="tm-stat-note">${esc(f.note)}</div>` : ""}
     </div>`;
@@ -2594,8 +2984,8 @@ function rangePredictorCard(model, roster) {
         <div style="font-size:14px;font-weight:600;">Range predictor</div>
         <div style="font-size:12px;color:var(--faint);margin-left:auto;">${trust ? esc(trust) : "trained on your drives"}</div>
       </div>
-      ${model && !ready ? `<div class="tm-empty" style="padding:20px;">${esc(model?.note || "Not enough data yet — the range model needs more completed drives before it can predict. Keep driving (and logging) and this fills in.")}</div>` : ""}
-      ${!model ? `<div class="tm-empty" style="padding:20px;">The range-prediction endpoint isn't available on this worker yet — it hasn't been deployed. Once it is, enter a trip below to estimate energy use.</div>` : ""}
+      ${model && !ready ? miniEmptyHtml(model?.note || "Not enough data yet — the range model needs more completed drives before it can predict. Keep driving (and logging) and this fills in.") : ""}
+      ${!model ? miniEmptyHtml("The range-prediction endpoint isn't available on this worker yet — it hasn't been deployed. Once it is, enter a trip below to estimate energy use.") : ""}
       <div class="tm-predict-form" style="${model && !ready ? "opacity:0.5;" : ""}">
         <div class="tm-predict-grid">
           <label class="tm-predict-field"><span>Distance (km)</span><input id="tm-pr-distance" class="tm-gate-input" type="number" inputmode="decimal" min="0" step="1" placeholder="e.g. 120"></label>
