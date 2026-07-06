@@ -5,7 +5,7 @@ import { destroyMaps, renderPointMap, renderRouteMap, renderLifetimeMap, createR
 // Bump on every change to this dashboard (UI, features, or the /data/*
 // endpoints it depends on) and add a matching entry to CHANGELOG.md — see
 // the versioning policy in the repo's CLAUDE.md. Shown in the sidebar footer.
-const APP_VERSION = "1.2.0";
+const APP_VERSION = "1.2.1";
 
 const root = document.getElementById("app");
 let shellBound = false; // guards one-time attach of the root click handler + sync timer
@@ -2085,6 +2085,14 @@ function nowPlayingCard(latest) {
     </div></div>`;
   }
   const playing = typeof status === "string" && /playing/i.test(status);
+  // Tesla reports a fixed 18,000,000 ms (5h) sentinel for radio/stations with
+  // no real track length — a progress bar for that is meaningless, so only
+  // show one for an actual, bounded track duration.
+  const durationMs = latest?.media_duration_ms;
+  const elapsedMs = latest?.media_elapsed_ms;
+  const hasProgress = typeof durationMs === "number" && durationMs > 0 && durationMs !== 18_000_000
+    && typeof elapsedMs === "number" && elapsedMs >= 0;
+  const progressPct = hasProgress ? Math.min(100, (elapsedMs / durationMs) * 100) : 0;
   return `
     <div class="tm-card tm-card-pad-lg tm-flex-row" style="gap:16px;align-items:center;">
       <div class="tm-media-cover tm-media-cover-lg" id="tm-np-cover">♪</div>
@@ -2095,6 +2103,13 @@ function nowPlayingCard(latest) {
         </div>
         <div class="tm-ellipsis" style="font-size:17px;font-weight:600;margin-top:8px;">${esc(title || station || "—")}</div>
         <div class="tm-ellipsis" style="font-size:13px;color:var(--sub);margin-top:2px;">${esc([artist, album].filter(Boolean).join(" · ") || (station ? "Radio" : ""))}</div>
+        ${hasProgress ? `
+        <div style="margin-top:10px;">
+          <div class="tm-progress"><div class="tm-progress-fill" style="width:${progressPct.toFixed(1)}%;"></div></div>
+          <div class="tm-flex-row" style="margin-top:4px;font-size:11px;color:var(--faint);">
+            <span>${fmtClock(elapsedMs / 1000)}</span><span style="margin-left:auto;">${fmtClock(durationMs / 1000)}</span>
+          </div>
+        </div>` : ""}
       </div>
       ${volume != null ? `<div style="text-align:right;flex:none;"><div class="tm-readout-label">Volume</div><div class="tm-readout-value">${fmt0(volume)}</div></div>` : ""}
     </div>`;

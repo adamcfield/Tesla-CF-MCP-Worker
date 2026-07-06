@@ -9,6 +9,28 @@ feature or screen, the **patch** version for fixes/tweaks/copy changes, and the
 configured. See `CLAUDE.md` at the repo root for the policy on keeping this file
 and `APP_VERSION` (in `app.js`) in sync.
 
+## 1.2.1 — 2026-07-06
+
+Closed the real gaps in the field-mapping pass from 1.1.0/1.2.0 — fields that
+should have been mapped the first time and were just missed, as opposed to
+the ones deliberately left out (powertrain diagnostics, Semi-truck/Cybertruck-
+only, static config, the one CSV-documented-broken field).
+
+- Now tracking: `LifetimeEnergyUsed`, `ChargeCurrentRequestMax`,
+  `MediaAudioVolumeIncrement`/`Max`, `MediaNowPlayingDuration`/`Elapsed`, and
+  the software-update fields (`SoftwareUpdateVersion`,
+  `SoftwareUpdateDownloadPercentComplete`,
+  `SoftwareUpdateExpectedDurationMinutes`, `SoftwareUpdateScheduledStartTime`)
+  — all EAV-only, same storage posture as the rest of the "track everything"
+  pass. No dedicated report/UI for the software-update fields yet.
+- Now playing card shows a real progress bar (elapsed/duration) when the car
+  reports a genuine track length — Tesla's documented 5-hour sentinel value
+  for radio/no-duration sources is explicitly excluded rather than rendered
+  as a meaningless bar.
+- Re-confirmed `LifetimeEnergyUsedDrive`, `ChargePort` and `DCDCEnable` stay
+  excluded (Semi-truck-only despite its "Driving" category, static hardware
+  descriptor, and a low-level electrical-system diagnostic, respectively).
+
 ## 1.2.0 — 2026-07-06
 
 A shortlist from a user-supplied "100 telemetry ideas" brainstorm — picked

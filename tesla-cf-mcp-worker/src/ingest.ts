@@ -52,6 +52,7 @@ const FIELD_MAP: Record<string, string> = {
   ChargingState: "charging_state",
   ChargeAmps: "charger_current",
   ChargeCurrentRequest: "charge_current_request",
+  ChargeCurrentRequestMax: "charge_current_request_max",
   ChargeLimitSoc: "charge_limit",
   ChargerVoltage: "charger_voltage",
   ACChargingPower: "ac_charging_power",
@@ -112,6 +113,11 @@ const FIELD_MAP: Record<string, string> = {
   MediaPlaybackSource: "media_source",
   MediaPlaybackStatus: "media_status",
   MediaAudioVolume: "media_volume",
+  MediaAudioVolumeIncrement: "media_volume_increment",
+  MediaAudioVolumeMax: "media_volume_max",
+  // Track length + playback position — powers the Now Playing progress bar.
+  MediaNowPlayingDuration: "media_duration_ms",
+  MediaNowPlayingElapsed: "media_elapsed_ms",
 
   // ---------------------------------------------------------------------
   // "Track everything (reasonable)" pass — verified against the full Fleet
@@ -254,6 +260,16 @@ const FIELD_MAP: Record<string, string> = {
   TpmsLastSeenPressureTimeFr: "tpms_seen_fr",
   TpmsLastSeenPressureTimeRl: "tpms_seen_rl",
   TpmsLastSeenPressureTimeRr: "tpms_seen_rr",
+
+  // --- Lifetime energy + software update history (closing gaps from the
+  // first "track everything" pass — genuinely useful, just missed the first
+  // time). LifetimeEnergyUsedDrive (its Semi-truck-only sibling) stays
+  // excluded, same as the rest of the Semi-truck-only fields.
+  LifetimeEnergyUsed: "lifetime_energy_used_kwh",
+  SoftwareUpdateVersion: "software_update_version",
+  SoftwareUpdateDownloadPercentComplete: "software_update_download_pct",
+  SoftwareUpdateExpectedDurationMinutes: "software_update_duration_min",
+  SoftwareUpdateScheduledStartTime: "software_update_scheduled_ts",
 };
 
 /** Canonical fields that live only on `current` for derivation — never stored to EAV. */
