@@ -9,6 +9,20 @@ feature or screen, the **patch** version for fixes/tweaks/copy changes, and the
 configured. See `CLAUDE.md` at the repo root for the policy on keeping this file
 and `APP_VERSION` (in `app.js`) in sync.
 
+## 1.5.0 — 2026-07-06
+
+Places: add a spot proactively instead of only naming ones the car already
+visited, and a clearer failure when saving a location goes wrong.
+
+- New "Add a place" card on the Places screen: search an address (reuses the
+  worker's existing `/geocode` endpoint — GovMap with a Nominatim fallback,
+  previously unused by the dashboard), pick a result, name it, save it. Works
+  for anywhere, not just a spot the car has already visited enough times to
+  be "suggested".
+- A failed location save (suggested-place or address-search) now surfaces
+  the worker's actual error message (hover the "Failed" button) instead of a
+  bare, undiagnosable "Failed".
+
 ## 1.4.0 — 2026-07-06
 
 API usage drill-down, and decluttering the Overview page.
