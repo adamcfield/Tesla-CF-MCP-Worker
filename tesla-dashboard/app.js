@@ -310,6 +310,10 @@ function renderShell() {
   // known if "Load live data" has been used on the Overview screen.
   const vd = state.vehicleData;
   const online = vd?.vehicle_state != null; // a successful read implies the car answered
+  // VIN position 4 encodes the model line — gives a real name ("Model 3") even
+  // before a live vehicle_data read, instead of a generic "Vehicle".
+  const vinModel = { S: "Model S", "3": "Model 3", X: "Model X", Y: "Model Y" }[(auth.vin || "")[3]] || "Vehicle";
+  const carName = vd?.display_name || vinModel;
   const initial = "T";
 
   root.innerHTML = `
@@ -318,10 +322,10 @@ function renderShell() {
         <div class="tm-brand">
           <div class="tm-brand-badge">${esc(initial)}</div>
           <div style="min-width:0;">
-            <div class="tm-brand-name tm-ellipsis">${esc(vd?.vehicle_config ? [vd.vehicle_config.car_type, vd.vehicle_config.trim_badging].filter(Boolean).join(" ") : "Vehicle")}</div>
+            <div class="tm-brand-name tm-ellipsis">${esc(carName)}</div>
             <div class="tm-brand-status">
               <span class="tm-dot ${online ? "tm-dot-live" : ""}" style="background:${online ? "var(--good)" : "var(--faint)"};"></span>
-              ${online ? "Online" : "Unknown"}
+              ${online ? "Online" : "Connecting…"}
             </div>
           </div>
         </div>
@@ -752,7 +756,7 @@ async function renderOverview() {
           <div class="tm-flex-row">
             <span class="tm-pill ${connState === "online" ? "tm-pill-good" : "tm-pill-chip"}">
               <span class="tm-dot" style="background:${connState === "online" ? "var(--good)" : "var(--faint)"};"></span>
-              ${esc(connState)}
+              ${esc({ online: "Online", reporting: "Reporting", unknown: "Offline" }[connState] || connState)}
             </span>
             ${chargeLimit != null ? `<span style="margin-left:auto;font-size:11.5px;color:var(--faint);">Charge limit ${chargeLimit}%</span>` : ""}
           </div>
@@ -1213,20 +1217,20 @@ async function renderDrives() {
     <datalist id="tm-driver-names">${[...new Set([...drivers, ...roster.map(rosterName)].filter(Boolean))].sort((a, b) => a.localeCompare(b)).map((n) => `<option value="${esc(n)}"></option>`).join("")}</datalist>
     ${filtered.length ? `
     <div class="tm-card tm-table-wrap">
-      <div style="min-width:960px;">
+      <div class="tm-drives-grid" style="min-width:960px;">
         <div class="tm-table-head" style="grid-template-columns:${cols};">
           <div>When</div><div>Route</div><div>Driver</div><div class="tm-right">Distance</div><div class="tm-right">Duration</div><div class="tm-right">Avg speed</div><div class="tm-right">Consumption</div><div class="tm-right">Battery</div>
         </div>
         ${filtered.map((d) => `
           <div class="tm-table-row" data-action="open-drive" data-id="${d.id}" style="grid-template-columns:${cols};">
-            <div style="font-size:12.5px;color:var(--sub);">${fmtDateTime(d.start_ts)}</div>
-            <div class="tm-ellipsis" style="font-size:13.5px;font-weight:500;">${esc(driveEndpoint(d, "start", locations))} <span style="color:var(--faint);">→</span> ${esc(driveEndpoint(d, "end", locations))}${isSyntheticDrive(d) ? " " + syntheticBadgeHtml() : ""}</div>
-            <div class="tm-ellipsis" data-action="edit-driver" data-id="${d.id}" title="Click to assign driver" style="font-size:12.5px;">${driverCellHtml(d)}</div>
-            <div class="tm-right tm-mono">${d.distance_km != null ? fmt1(d.distance_km) : "—"} km</div>
-            <div class="tm-right tm-mono" style="color:var(--sub);">${fmtDurationMin(d.duration_min)}</div>
-            <div class="tm-right tm-mono" style="color:var(--sub);">${d.avg_speed != null ? fmt0(d.avg_speed) : "—"} km/h</div>
-            <div class="tm-right tm-mono">${d.efficiency_wh_km != null ? fmt0(d.efficiency_wh_km) : "—"} Wh/km</div>
-            <div class="tm-right tm-mono" style="color:var(--sub);">${d.start_soc != null && d.end_soc != null ? `${d.start_soc} → ${d.end_soc}` : "—"} %</div>
+            <div data-role="when" style="font-size:12.5px;color:var(--sub);">${fmtDateTime(d.start_ts)}</div>
+            <div data-role="route" class="tm-ellipsis" style="font-size:13.5px;font-weight:500;"><bdi>${esc(driveEndpoint(d, "start", locations))}</bdi> <span style="color:var(--faint);">→</span> <bdi>${esc(driveEndpoint(d, "end", locations))}</bdi>${isSyntheticDrive(d) ? " " + syntheticBadgeHtml() : ""}</div>
+            <div data-k="Driver" class="tm-ellipsis" data-action="edit-driver" data-id="${d.id}" title="Click to assign driver" style="font-size:12.5px;">${driverCellHtml(d)}</div>
+            <div data-k="Distance" class="tm-right tm-mono">${d.distance_km != null ? fmt1(d.distance_km) : "—"} km</div>
+            <div data-k="Duration" class="tm-right tm-mono" style="color:var(--sub);">${fmtDurationMin(d.duration_min)}</div>
+            <div data-k="Speed" class="tm-right tm-mono" style="color:var(--sub);">${d.avg_speed != null ? fmt0(d.avg_speed) : "—"} km/h</div>
+            <div data-k="Wh/km" class="tm-right tm-mono">${d.efficiency_wh_km != null ? fmt0(d.efficiency_wh_km) : "—"} Wh/km</div>
+            <div data-k="Battery" class="tm-right tm-mono" style="color:var(--sub);">${d.start_soc != null && d.end_soc != null ? `${fmt0(d.start_soc)} → ${fmt0(d.end_soc)}` : "—"} %</div>
           </div>`).join("")}
         <div class="tm-foot-note">${filtered.length} drive${filtered.length === 1 ? "" : "s"} in range. Click a driver cell to assign; <span class="tm-driver-suggested">italic?</span> names are unconfirmed suggestions. ${esc(DRIVER_MANUAL_NOTE)}</div>
       </div>
@@ -1254,7 +1258,7 @@ async function renderDriveDetail() {
     ${driverDatalistHtml(roster, "tm-driver-names-detail")}
     <div class="tm-flex-row" style="gap:14px;flex-wrap:wrap;">
       <button class="tm-back-btn" data-action="back-drives">← Drives</button>
-      <div style="font-size:15px;font-weight:600;">${esc(driveEndpoint(d, "start", locations))} <span style="color:var(--faint);">→</span> ${esc(driveEndpoint(d, "end", locations))}</div>
+      <div style="font-size:15px;font-weight:600;"><bdi>${esc(driveEndpoint(d, "start", locations))}</bdi> <span style="color:var(--faint);">→</span> <bdi>${esc(driveEndpoint(d, "end", locations))}</bdi></div>
       <div style="font-size:12.5px;color:var(--faint);">${fmtDateTime(d.start_ts)}</div>
       ${synthetic ? syntheticBadgeHtml() : ""}
       <div class="tm-flex-row" style="margin-left:auto;gap:6px;">
@@ -1304,7 +1308,7 @@ async function renderDriveDetail() {
         <div class="tm-card" style="padding:18px 20px;"><div class="tm-stat-label">Avg · top speed</div><div style="font-size:19px;font-weight:600;margin-top:5px;" class="tm-mono">${d.avg_speed != null ? fmt0(d.avg_speed) : "—"} · ${d.max_speed != null ? fmt0(d.max_speed) : "—"} <span style="font-size:12px;color:var(--sub);">km/h</span></div></div>
         <div class="tm-card" style="padding:18px 20px;"><div class="tm-stat-label">Consumption</div><div style="font-size:19px;font-weight:600;margin-top:5px;" class="tm-mono">${d.efficiency_wh_km != null ? fmt0(d.efficiency_wh_km) : "—"} <span style="font-size:12px;color:var(--sub);">Wh/km</span></div></div>
         <div class="tm-card" style="padding:18px 20px;"><div class="tm-stat-label">Energy used</div><div style="font-size:19px;font-weight:600;margin-top:5px;" class="tm-mono">${d.energy_used_kwh != null ? fmt2(d.energy_used_kwh) : "—"} kWh</div></div>
-        <div class="tm-card" style="padding:18px 20px;"><div class="tm-stat-label">Battery</div><div style="font-size:19px;font-weight:600;margin-top:5px;" class="tm-mono">${d.start_soc != null && d.end_soc != null ? `${d.start_soc} → ${d.end_soc}` : "—"} %</div></div>
+        <div class="tm-card" style="padding:18px 20px;"><div class="tm-stat-label">Battery</div><div style="font-size:19px;font-weight:600;margin-top:5px;" class="tm-mono">${d.start_soc != null && d.end_soc != null ? `${fmt0(d.start_soc)} → ${fmt0(d.end_soc)}` : "—"} %</div></div>
       </div>
     </div>
     <div class="tm-card tm-card-pad">
@@ -2041,7 +2045,7 @@ async function openPrintableReport(id) {
     ${row("Avg · top speed", `${d.avg_speed != null ? fmt0(d.avg_speed) : "—"} · ${d.max_speed != null ? fmt0(d.max_speed) : "—"} km/h`)}
     ${row("Consumption", `${d.efficiency_wh_km != null ? fmt0(d.efficiency_wh_km) : "—"} Wh/km`)}
     ${row("Energy used", `${d.energy_used_kwh != null ? fmt2(d.energy_used_kwh) : "—"} kWh`)}
-    ${row("Battery", `${d.start_soc != null && d.end_soc != null ? `${d.start_soc} → ${d.end_soc}` : "—"} %`)}
+    ${row("Battery", `${d.start_soc != null && d.end_soc != null ? `${fmt0(d.start_soc)} → ${fmt0(d.end_soc)}` : "—"} %`)}
   </table>
 
   <div class="sec">Risk summary</div>

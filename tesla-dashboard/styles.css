@@ -8,13 +8,13 @@ body {
 
 [data-tm-root] {
   --ui: "Helvetica Neue", Helvetica, Arial, sans-serif;
-  --mono: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
-  --bg: #F5F6F8; --card: #FFFFFF; --text: #181B20; --sub: #5F6670; --faint: #98A0AA;
+  --mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+  --bg: #F5F6F8; --card: #FFFFFF; --text: #181B20; --sub: #5F6670; --faint: #6B7280;
   --line: rgba(18,24,38,0.09); --line2: rgba(18,24,38,0.05); --chip: #EDEFF2;
   --good: #0F9960; --warn: #C97A0A; --bad: #D6453D; --accent: #2E62E8;
 }
 [data-tm-root][data-theme="dark"] {
-  --bg: #0E0F12; --card: #16181D; --text: #EFF1F4; --sub: #9AA2AD; --faint: #646C77;
+  --bg: #0E0F12; --card: #16181D; --text: #EFF1F4; --sub: #9AA2AD; --faint: #8A929E;
   --line: rgba(230,238,255,0.09); --line2: rgba(230,238,255,0.05); --chip: #1F2229;
 }
 
@@ -64,6 +64,13 @@ body {
 }
 .tm-navitem:hover { background: color-mix(in oklab, var(--text) 5%, transparent); }
 .tm-navitem.active { font-weight: 600; color: var(--text); background: color-mix(in oklab, var(--text) 7%, transparent); }
+
+/* Visible keyboard focus for all interactive controls (a11y). */
+.tm-navitem:focus-visible, .tm-chip-btn:focus-visible, .tm-segbtn:focus-visible,
+.tm-back-btn:focus-visible, .tm-ask-send:focus-visible, .tm-gate-btn:focus-visible,
+.tm-replay-btn:focus-visible, [data-action]:focus-visible {
+  outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 8px;
+}
 
 .tm-sidefoot { margin-top: auto; padding-top: 16px; }
 .tm-segment { display: flex; background: var(--chip); border-radius: 9px; padding: 3px; gap: 2px; }
@@ -184,7 +191,12 @@ body {
 
 /* ---------- map card ---------- */
 .tm-map-card { overflow: hidden; position: relative; min-height: 280px; }
-.tm-map-canvas { position: absolute; inset: 0; width: 100%; height: 100%; background: var(--chip); }
+/* Shimmer while Leaflet fetches tiles, instead of a flat grey block. Tiles paint over it. */
+.tm-map-canvas {
+  position: absolute; inset: 0; width: 100%; height: 100%;
+  background: linear-gradient(90deg, var(--chip) 30%, color-mix(in oklab, var(--chip) 55%, var(--card)) 50%, var(--chip) 70%);
+  background-size: 200% 100%; animation: tmShimmer 1.6s ease-in-out infinite;
+}
 .tm-map-overlay {
   position: absolute; left: 14px; right: 14px; bottom: 14px; background: var(--card);
   border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px;
@@ -431,4 +443,28 @@ select.tm-gate-input { font-family: var(--ui); cursor: pointer; }
   .tm-ask-card { height: calc(100vh - 150px); }
   .tm-ask-msg { max-width: 90%; }
   .tm-ask-inputbar { padding: 12px; }
+
+  /* Touch targets: lift interactive controls to ~44px per iOS/WCAG guidance. */
+  .tm-navitem { padding: 11px 12px; min-height: 44px; font-size: 15px; }
+  .tm-chip-btn { padding: 9px 14px; min-height: 40px; }
+  .tm-segbtn { padding: 10px 0; }
+
+  /* Drives: the 8-column table would force a 960px horizontal scroll. On mobile
+     restack each row into a labelled card (route as title, stats wrap below). */
+  .tm-drives-grid { min-width: 0 !important; }
+  .tm-drives-grid .tm-table-head { display: none; }
+  .tm-drives-grid .tm-table-row {
+    display: flex; flex-wrap: wrap; gap: 4px 14px; padding: 14px 16px;
+    align-items: baseline; grid-template-columns: none !important;
+  }
+  .tm-drives-grid .tm-table-row > * { text-align: left !important; min-width: 0; }
+  .tm-drives-grid .tm-table-row > [data-role="when"]  { flex-basis: 100%; order: 0; font-size: 11.5px; color: var(--faint); }
+  .tm-drives-grid .tm-table-row > [data-role="route"] { flex-basis: 100%; order: 1; font-size: 14px; white-space: normal; }
+  .tm-drives-grid .tm-table-row > [data-k] { order: 2; font-size: 12px; white-space: nowrap; color: var(--text); }
+  .tm-drives-grid .tm-table-row > [data-k]::before {
+    content: attr(data-k); color: var(--faint); font-size: 9.5px; font-weight: 700;
+    text-transform: uppercase; letter-spacing: 0.05em; margin-right: 4px;
+  }
+  /* The Household hint duplicates the driver-filter chips on a small screen. */
+  .tm-roster-hint { display: none; }
 }
