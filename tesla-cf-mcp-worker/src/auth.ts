@@ -212,9 +212,14 @@ export async function handleAuthCallback(request: Request, env: Env): Promise<Re
 // Partner setup (one-time, per region)
 // ---------------------------------------------------------------------------
 
-/** POST /setup/register-partner — registers this Worker's domain with the Fleet API. */
-export async function handleRegisterPartner(env: Env): Promise<Response> {
-  const domain = new URL(env.PUBLIC_ORIGIN).hostname;
+/**
+ * POST /setup/register-partner — registers a domain with the Fleet API.
+ * Defaults to PUBLIC_ORIGIN's hostname; pass ?domain= to register an additional
+ * partner domain (e.g. a Fleet Telemetry host's registrable domain). The public
+ * key must already be reachable at /.well-known/appspecific/... on that domain.
+ */
+export async function handleRegisterPartner(env: Env, domainOverride?: string): Promise<Response> {
+  const domain = domainOverride?.trim() || new URL(env.PUBLIC_ORIGIN).hostname;
   const token = await getPartnerToken(env);
   const resp = await fetch(`${fleetBase(env)}/api/1/partner_accounts`, {
     method: "POST",

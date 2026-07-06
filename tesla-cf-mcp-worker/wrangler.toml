@@ -16,6 +16,16 @@ name = "tesla-cf-mcp-worker"
 main = "src/index.ts"
 compatibility_date = "2025-05-05"
 
+# Keep the workers.dev URL live (dashboard, poller, device tokens all use it) …
+workers_dev = true
+# … and also serve on rightcraft.io so the fleet-telemetry hostname
+# (telemetry.rightcraft.io) sits under a registered Tesla partner domain. A plain
+# route (not custom_domain) needs no DNS-write permission; a proxied apex record
+# provides the traffic. The worker serves /.well-known/appspecific/…public-key.pem.
+routes = [
+  { pattern = "rightcraft.io/*", zone_name = "rightcraft.io" },
+]
+
 
 [[kv_namespaces]]
 binding = "TESLA_KV"

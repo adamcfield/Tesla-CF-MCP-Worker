@@ -481,7 +481,7 @@ export default {
         return json({ ok: true, note: "poll scheduler armed — self-rearms every ~90s (10s while driving)" });
       }
       if (path === "/setup/register-partner" && request.method === "POST") {
-        return handleRegisterPartner(env);
+        return handleRegisterPartner(env, url.searchParams.get("domain") ?? undefined);
       }
       if (path === "/setup/partner-public-key") return handlePartnerPublicKey(env);
       if (path === "/setup/backfill-charges" && request.method === "POST") {
