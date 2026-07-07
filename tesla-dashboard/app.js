@@ -5,7 +5,7 @@ import { destroyMaps, renderPointMap, renderRouteMap, renderLifetimeMap, createR
 // Bump on every change to this dashboard (UI, features, or the /data/*
 // endpoints it depends on) and add a matching entry to CHANGELOG.md — see
 // the versioning policy in the repo's CLAUDE.md. Shown in the sidebar footer.
-const APP_VERSION = "1.6.2";
+const APP_VERSION = "1.6.3";
 
 const root = document.getElementById("app");
 let shellBound = false; // guards one-time attach of the root click handler + sync timer
@@ -201,6 +201,7 @@ const state = {
   syncing: false,
   lastSync: null,
   apiBudget: null, // Tesla API spend snapshot, surfaced in the sidebar
+  connStatus: undefined, // sidebar connection badge: undefined = not fetched yet (optimistic green), null = no data ever, number = last_seen_ts
   placeSearch: { suggestions: [], roster: [], results: null, selected: null, error: null }, // "Add a place" modal state
   cache: {}, // per-screen fetched payloads, cleared on manual refresh
   askTranscript: [], // Ask-Tessa chat history — in-memory only, never persisted
@@ -234,6 +235,8 @@ const TITLES = {
 };
 
 const EVENT_COLOR = { drive: "var(--accent)", charge: "var(--good)", sleep: "var(--faint)", update: "#8A63D2" };
+// vehicle_states vocabulary (see tracking.ts timelineState/recordConnectivityState) → Overview's "Status" readout.
+const STATUS_LABEL = { driving: "Driving", charging: "Charging", updating: "Updating", online: "Parked", asleep: "Asleep", offline: "Offline" };
 
 // ---------------------------------------------------------------------------
 // Boot / auth gate
@@ -391,11 +394,7 @@ async function renderApp() {
 function renderShell() {
   destroyMaps();
   document.querySelector('meta[name="theme-color"]')?.setAttribute("content", state.theme === "dark" ? "#0E0F12" : "#F5F6F8");
-  // Vehicle identity/state can't be fetched cross-origin (list_vehicles is an
-  // MCP tool call — see verifyToken's comment in api.js), so it only becomes
-  // known if "Load live data" has been used on the Overview screen.
   const vd = state.vehicleData;
-  const online = vd?.vehicle_state != null; // a successful read implies the car answered
   // VIN position 4 encodes the model line — gives a real name ("Model 3") even
   // before a live vehicle_data read, instead of a generic "Vehicle".
   const vinModel = { S: "Model S", "3": "Model 3", X: "Model X", Y: "Model Y" }[(auth.vin || "")[3]] || "Vehicle";
@@ -409,10 +408,7 @@ function renderShell() {
           <div class="tm-brand-badge">${esc(initial)}</div>
           <div style="min-width:0;">
             <div class="tm-brand-name tm-ellipsis">${esc(carName)}</div>
-            <div class="tm-brand-status">
-              <span class="tm-dot ${online ? "tm-dot-live" : ""}" style="background:${online ? "var(--good)" : "var(--faint)"};"></span>
-              ${online ? "Online" : "Connecting…"}
-            </div>
+            <div class="tm-brand-status" id="tm-conn-status">${connStatusHtml(state.connStatus)}</div>
           </div>
         </div>
         ${NAV.map((g) => `
@@ -475,6 +471,7 @@ function renderShell() {
   // load without a hash (or a stale/invalid one) still gets a matching, shareable URL.
   if (location.hash !== stateToHash()) { try { history.replaceState(null, "", stateToHash()); } catch { /* sandboxed */ } }
   refreshSideBudget();
+  refreshConnStatus();
 }
 
 function tickSyncLabel() {
@@ -581,6 +578,9 @@ function onRootClick(e) {
     renderPlaces();
   } else if (action === "open-add-place") {
     openAddPlaceModal();
+  } else if (action === "save-current-place") {
+    const lat = Number(t.dataset.lat), lon = Number(t.dataset.lon);
+    openAddPlaceModal({ label: t.dataset.label || "Current location", lat, lon });
   } else if (action === "place-search") {
     const input = document.getElementById("tm-place-search-input");
     const q = input ? input.value.trim() : "";
@@ -667,6 +667,8 @@ function onRootClick(e) {
     t.disabled = true;
     data.assignDriver(id, name).then(() => {
       delete state.cache.all_drives;
+      delete state.cache.ov_recent;
+      delete state.cache.tl_feed;
       showScreen();
     }).catch(() => {
       t.disabled = false;
@@ -951,6 +953,42 @@ async function refreshSideBudget() {
 }
 
 // ---------------------------------------------------------------------------
+// Connection status (sidebar, top-left) — the ONE status-with-a-dot indicator
+// in the app (previously duplicated by an Overview-local "Online/Reporting"
+// pill, now removed). Optimistic by default (green) since the worker never
+// auto-polls/auto-wakes — this reflects whether telemetry is actually
+// flowing, not whether an on-demand live read has been done this session.
+// Only flips off-green when data is genuinely missing or stale.
+// ---------------------------------------------------------------------------
+
+const STALE_AFTER_S = 6 * 3600; // beyond a typical idle/cron-throttled gap — likely actually broken, not just parked
+
+/** `lastSeenTs` (unix seconds) or null/undefined for "not loaded yet" (optimistic default). */
+function connStatusHtml(lastSeenTs) {
+  let label = "Online", color = "var(--good)", live = true, title = "";
+  if (lastSeenTs === null) {
+    label = "No data yet"; color = "var(--faint)"; live = false;
+  } else if (typeof lastSeenTs === "number") {
+    const ageS = Math.floor(Date.now() / 1000) - lastSeenTs;
+    if (ageS > STALE_AFTER_S) { label = "Stale"; color = "var(--warn)"; live = false; }
+    title = `Last car data: ${fmtDateTime(lastSeenTs)} (${agoLabel(lastSeenTs * 1000)})`;
+  }
+  return `
+    <span class="tm-dot ${live ? "tm-dot-live" : ""}" style="background:${color};"></span>
+    <span title="${esc(title)}">${esc(label)}</span>`;
+}
+function updateConnStatus(lastSeenTs) {
+  state.connStatus = lastSeenTs;
+  const el = document.getElementById("tm-conn-status");
+  if (el) el.innerHTML = connStatusHtml(lastSeenTs);
+}
+async function refreshConnStatus() {
+  if (!vin()) return;
+  const s = await safe(cached("summary", () => data.summary(vin())), null);
+  updateConnStatus(s ? s.last_seen_ts ?? null : undefined);
+}
+
+// ---------------------------------------------------------------------------
 // API usage — drill-down behind the sidebar spend widget
 // ---------------------------------------------------------------------------
 
@@ -1120,7 +1158,6 @@ async function renderOverview() {
   const inside = cl?.inside_temp ?? latest?.inside_temp ?? null;
   const outside = cl?.outside_temp ?? latest?.outside_temp ?? null;
   const tyres = readTyres(vs) ?? readTyres(latest);
-  const locked = vs?.locked ?? latest?.locked ?? null;
   // vs.odometer (live read) is miles; summary/latest are already-normalized km.
   const odometer = typeof vs?.odometer === "number" ? vs.odometer * MI : summary?.odometer_km ?? latest?.odometer ?? null;
   const swVersion = vs?.car_version ?? latest?.software_version ?? null;
@@ -1129,9 +1166,6 @@ async function renderOverview() {
   const modelSub = vc ? [vc.car_type, vc.trim_badging].filter(Boolean).join(" · ") : "";
 
   const hasLive = soc != null || range != null;
-  // get_vehicle_data only succeeds for an online vehicle (it 408s otherwise, and
-  // this worker never wakes on a read), so a loaded vd implies "online" at fetch time.
-  const connState = vd ? "online" : latest?.updated_at ? "reporting" : "unknown";
 
   const socChart = await cached("ov_soc7", async () => {
     try {
@@ -1149,17 +1183,31 @@ async function renderOverview() {
 
   const nearestLoc = lat != null && lon != null ? nearestLocation(locations, lat, lon) : null;
 
+  // Current activity/status (driving/charging/parked/asleep/offline), from the
+  // same state-timeline the Timeline screen uses — the most recent row is
+  // either still open (end_ts null, bypassing the hours window server-side)
+  // or the last-closed one, so this is "what's the car doing right now"
+  // without needing an on-demand live read.
+  const states = await safe(cached("ov_states", () => data.states(vin(), 3)), []);
+  const currentStatus = STATUS_LABEL[states[0]?.state] || null;
+
+  // Reverse-geocoded address for the current point, only when it isn't
+  // already a named saved place (nearestLoc) — cached per-coordinate so a
+  // later refresh at a different spot doesn't show a stale address.
+  let currentAddress = null;
+  if (!nearestLoc && lat != null && lon != null) {
+    const latR = Math.round(lat * 1000) / 1000, lonR = Math.round(lon * 1000) / 1000;
+    const rg = await safe(cached(`ov_revgeo:${latR},${lonR}`, () => data.reverseGeocode(lat, lon)), null);
+    currentAddress = rg?.label || null;
+  }
+  // "Not a saved place, and not currently driving" — offer to save it.
+  const offerSavePlace = !nearestLoc && lat != null && lon != null && states[0]?.state !== "driving";
+
   setContent(`
     <div class="tm-grid-2-wide">
       <div class="tm-card tm-card-pad-lg tm-flex-col">
         ${hasLive ? `
-          <div class="tm-flex-row">
-            <span class="tm-pill ${connState === "online" ? "tm-pill-good" : "tm-pill-chip"}">
-              <span class="tm-dot" style="background:${connState === "online" ? "var(--good)" : "var(--faint)"};"></span>
-              ${esc({ online: "Online", reporting: "Reporting", unknown: "Offline" }[connState] || connState)}
-            </span>
-            ${chargeLimit != null ? `<span style="margin-left:auto;font-size:11.5px;color:var(--faint);">Charge limit ${fmt0(chargeLimit)}%</span>` : ""}
-          </div>
+          ${chargeLimit != null ? `<div class="tm-flex-row"><span style="font-size:11.5px;color:var(--faint);">Charge limit ${fmt0(chargeLimit)}%</span></div>` : ""}
           <div style="display:flex;align-items:flex-end;justify-content:space-between;gap:20px;">
             <div>
               <div class="tm-battery-num">${soc != null ? fmt0(soc) : "—"}<span class="tm-battery-pct">%</span></div>
@@ -1179,12 +1227,12 @@ async function renderOverview() {
             <div><div class="tm-readout-label">Inside</div><div class="tm-readout-value">${inside != null ? fmt1(inside) + " °C" : "—"}</div></div>
             <div><div class="tm-readout-label">Outside</div><div class="tm-readout-value">${outside != null ? fmt1(outside) + " °C" : "—"}</div></div>
             <div><div class="tm-readout-label">Tyres</div><div class="tm-readout-value">${tyreStatusHtml(tires)}</div></div>
-            <div><div class="tm-readout-label">Security</div><div class="tm-readout-value">${locked == null ? "—" : locked ? "Locked" : "Unlocked"}</div></div>
+            <div><div class="tm-readout-label">Status</div><div class="tm-readout-value">${esc(currentStatus || "—")}</div></div>
           </div>
         ` : `
           <div class="tm-empty" style="padding:12px 0 4px;">
             <div class="tm-empty-title">No live data loaded yet</div>
-            <div>Telemetry isn't streaming in yet, so live battery/climate/lock state isn't cached. Load a one-time on-demand read from the car (this is a billed Tesla API call, and only runs when you click it).</div>
+            <div>Telemetry isn't streaming in yet, so live battery/climate state isn't cached. Load a one-time on-demand read from the car (this is a billed Tesla API call, and only runs when you click it).</div>
             <button class="tm-gate-btn" style="margin-top:8px;width:auto;padding:8px 16px;" data-action="load-live">Load live data</button>
           </div>
         `}
@@ -1195,9 +1243,10 @@ async function renderOverview() {
         ${lat != null && lon != null ? `
         <div class="tm-map-overlay">
           <div style="min-width:0;">
-            <div class="tm-map-overlay-title">${esc(nearestLoc ? nearestLoc.name : "Current location")}</div>
-            <div class="tm-map-overlay-meta">${fmt1(lat)}, ${fmt1(lon)}</div>
+            <div class="tm-map-overlay-title">${esc(nearestLoc ? nearestLoc.name : currentAddress || "Current location")}</div>
+            ${currentStatus ? `<div class="tm-map-overlay-meta">${esc(currentStatus)}</div>` : ""}
           </div>
+          ${offerSavePlace ? `<button class="tm-chip-btn" style="flex:none;padding:5px 12px;" data-action="save-current-place" data-lat="${lat}" data-lon="${lon}" data-label="${esc(currentAddress || "")}">Save this place</button>` : ""}
         </div>` : `<div class="tm-empty" style="height:100%;">No location data yet</div>`}
       </div>
     </div>
@@ -1243,7 +1292,7 @@ async function renderOverview() {
             <span class="tm-dot" style="background:${EVENT_COLOR[e.type]};"></span>
             <div style="min-width:0;">
               <div class="tm-activity-title">${esc(e.title)}</div>
-              <div class="tm-activity-meta">${esc(e.meta)}</div>
+              <div class="tm-activity-meta">${e.meta}</div>
             </div>
             <span class="tm-activity-time">${fmtTime(e.ts)}</span>
             ${link ? `<span class="tm-activity-chev">&#8250;</span>` : ""}
@@ -1256,7 +1305,7 @@ async function renderOverview() {
   updateSideBudget(summary?.api_budget);
 
   if (lat != null && lon != null) {
-    requestAnimationFrame(() => renderPointMap(document.getElementById("tm-ov-map"), lat, lon, esc(nearestLoc?.name || "Current location")));
+    requestAnimationFrame(() => renderPointMap(document.getElementById("tm-ov-map"), lat, lon, esc(nearestLoc?.name || currentAddress || "Current location")));
   }
 }
 
@@ -1300,21 +1349,36 @@ function nearestLocation(locations, lat, lon, maxM = 300) {
 // ---------------------------------------------------------------------------
 
 async function buildEventFeed(locations, driveLimit = 200) {
-  const [drives, charges, states] = await Promise.all([
+  const [drives, charges, states, roster] = await Promise.all([
     safe(data.drives(vin(), driveLimit), []),
     safe(data.chargeSessions(vin(), driveLimit), []),
     safe(data.states(vin(), 24 * 21), []), // last 3 weeks
+    loadDriverRoster(),
   ]);
   const locName = (id) => (id == null ? null : locations.find((l) => l.id === id)?.name);
+  const quickAssignHtml = (d) => {
+    const quickNames = [...new Set(roster.map(rosterName).filter(Boolean))].sort((a, b) => a.localeCompare(b)).filter((n) => n !== (d.driver || ""));
+    if (!quickNames.length) return "";
+    return `<span class="tm-quick-assign" style="margin-top:4px;">${quickNames.map((n) => `<button type="button" class="tm-quick-chip" data-action="quick-assign" data-id="${d.id}" data-driver="${esc(n)}">${esc(n)}</button>`).join("")}</span>`;
+  };
 
   const events = [];
   for (const d of drives) {
     if (d.start_ts == null) continue;
+    const stats = `${d.distance_km != null ? fmt1(d.distance_km) + " km" : "—"} · ${fmtDurationMin(d.duration_min)}${d.efficiency_wh_km != null ? " · " + fmt0(d.efficiency_wh_km) + " Wh/km" : ""}`;
+    // Driver + score when assigned; a one-tap quick-assign row when not —
+    // "meta" is raw HTML from here on (unlike the other event types, which
+    // stay plain interpolated numbers), so render sites must NOT re-escape it.
+    const driverBit = d.driver
+      ? ` · ${esc(d.driver)}${d.behavior_score != null ? ` <span style="color:${scoreColor(d.behavior_score)};">(${d.behavior_score}/100)</span>` : ""}`
+      : d.suggested_driver
+        ? ` · <span class="tm-driver-suggested">${esc(d.suggested_driver)}?</span>`
+        : "";
     events.push({
       ts: d.start_ts,
       type: "drive",
       title: `${driveEndpoint(d, "start", locations)} → ${driveEndpoint(d, "end", locations)}`,
-      meta: `${d.distance_km != null ? fmt1(d.distance_km) + " km" : "—"} · ${fmtDurationMin(d.duration_min)}${d.efficiency_wh_km != null ? " · " + fmt0(d.efficiency_wh_km) + " Wh/km" : ""}`,
+      meta: `${esc(stats)}${driverBit}${!d.driver ? quickAssignHtml(d) : ""}`,
       raw: d,
     });
   }
@@ -1324,16 +1388,16 @@ async function buildEventFeed(locations, driveLimit = 200) {
       ts: c.start_ts,
       type: "charge",
       title: `Charged at ${chargeLocName(c, locations)}`,
-      meta: `${c.energy_added_kwh != null ? "+" + fmt1(c.energy_added_kwh) + " kWh" : "—"}${c.start_soc != null && c.end_soc != null ? ` · ${fmt0(c.start_soc)} → ${fmt0(c.end_soc)}%` : ""}${c.cost != null ? ` · ${money(c.cost, c.currency)}` : ""}`,
+      meta: esc(`${c.energy_added_kwh != null ? "+" + fmt1(c.energy_added_kwh) + " kWh" : "—"}${c.start_soc != null && c.end_soc != null ? ` · ${fmt0(c.start_soc)} → ${fmt0(c.end_soc)}%` : ""}${c.cost != null ? ` · ${money(c.cost, c.currency)}` : ""}`),
       raw: c,
     });
   }
   for (const s of states) {
     if (s.start_ts == null) continue;
     if (s.state === "asleep" || s.state === "offline") {
-      events.push({ ts: s.start_ts, type: "sleep", title: s.state === "asleep" ? "Asleep" : "Offline", meta: fmtDurationSec(s.duration_s) });
+      events.push({ ts: s.start_ts, type: "sleep", title: s.state === "asleep" ? "Asleep" : "Offline", meta: esc(fmtDurationSec(s.duration_s)) });
     } else if (s.state === "updating") {
-      events.push({ ts: s.start_ts, type: "update", title: "Software update", meta: fmtDurationSec(s.duration_s) });
+      events.push({ ts: s.start_ts, type: "update", title: "Software update", meta: esc(fmtDurationSec(s.duration_s)) });
     }
   }
   events.sort((a, b) => b.ts - a.ts);
@@ -1371,7 +1435,7 @@ async function renderTimeline() {
                 <span class="tm-dot" style="background:${EVENT_COLOR[e.type]};"></span>
                 <div style="min-width:0;">
                   <div class="tm-timeline-title">${esc(e.title)}</div>
-                  <div class="tm-timeline-meta">${esc(e.meta)}</div>
+                  <div class="tm-timeline-meta">${e.meta}</div>
                 </div>
                 ${link ? `<span class="tm-activity-chev" style="margin-left:auto;">&#8250;</span>` : ""}
               </div>`;
@@ -2146,11 +2210,12 @@ function refreshAddPlaceModal() {
 }
 
 /** Opens the modal, fetching suggestions + the driver roster once. */
-async function openAddPlaceModal() {
-  state.placeSearch = { suggestions: [], roster: [], results: null, selected: null, error: null };
-  openModal(addPlaceModalHtml()); // instant empty shell while the fetch is in flight
+/** `preselected` (optional {label, lat, lon}) skips straight to the name/tag/save step — used by "Save this place" on Overview's current-location card. */
+async function openAddPlaceModal(preselected = null) {
+  state.placeSearch = { suggestions: [], roster: [], results: null, selected: preselected, error: null };
+  openModal(addPlaceModalHtml()); // instant shell while the fetch is in flight
   const [suggestedRes, roster] = await Promise.all([
-    safe(cached("suggested_locations", () => data.suggestedLocations(vin())), null),
+    preselected ? null : safe(cached("suggested_locations", () => data.suggestedLocations(vin())), null),
     loadDriverRoster(),
   ]);
   state.placeSearch.suggestions = suggestedRes?.suggestions || [];

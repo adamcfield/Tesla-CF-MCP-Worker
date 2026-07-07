@@ -113,7 +113,14 @@ describe("getBudgetForecast — month-end spend projection", () => {
 
   it("regresses a multi-day spend series and flags an over-budget projection", async () => {
     const env = makeEnv();
-    await recordSpend(env, "vehicle_data", 1); // ensures api_spend_daily exists
+    // Ensures api_spend_daily exists WITHOUT seeding a spend row on the real
+    // "today" — recordSpend(vehicle_data, 1) used to do this, but that added a
+    // third, low-value data point on whatever today's actual date happens to
+    // be, which (unless today is the 1st/2nd) sits between/after the two
+    // hand-seeded days below and drags the OLS slope down enough to flip
+    // projected_over_budget to false — a real date-dependent flake, not
+    // something about the two seeded days themselves.
+    await getBudgetStatus(env);
     const month = `${new Date().getUTCFullYear()}-${String(new Date().getUTCMonth() + 1).padStart(2, "0")}`;
     // Seed two distinct earlier days with a clearly accelerating daily spend
     // ($1 then $2) so the regression has an unambiguous positive slope. Mirror

@@ -9,6 +9,36 @@ feature or screen, the **patch** version for fixes/tweaks/copy changes, and the
 configured. See `CLAUDE.md` at the repo root for the policy on keeping this file
 and `APP_VERSION` (in `app.js`) in sync.
 
+## 1.6.3 — 2026-07-07
+
+Five more small fixes from the BugDrop feedback backlog (issues #15, #16,
+#17, #19, #20).
+
+- **#15/current location**: Overview's map card now shows a real reverse-
+  geocoded address instead of raw lat/lon when the car isn't at a saved
+  place (new `GET /data/reverse-geocode` route, reusing the same
+  Nominatim-backed, grid-cached lookup drive endpoints already use). When
+  parked somewhere unsaved, a "Save this place" button opens the Add-a-
+  place modal pre-filled with that point.
+- **#16/car status**: the "Security" readout (Locked/Unlocked) is now
+  "Status" (Driving/Charging/Parked/Asleep/Offline/Updating), from the same
+  state-timeline the Timeline screen uses — no live read required.
+- **#17/recent activity detail**: drive entries in Recent Activity now show
+  the assigned driver + their per-drive score, or a one-tap quick-assign
+  row when nobody's assigned yet (same affordance already on the Drives
+  list/detail).
+- **#19+#20/connection status**: there were three different status-with-a-
+  dot indicators (sidebar, an Overview-only "Online/Reporting" pill, and
+  the header's sync heartbeat) — consolidated to one, in the sidebar.
+  It's optimistic (green) by default, matching that this worker never
+  auto-polls/wakes, and only flips off-green when there's genuinely no
+  telemetry or it's gone stale (>6h); hover shows the last-data timestamp.
+  The redundant Overview pill is gone.
+- Also fixed a pre-existing, date-dependent test flake in
+  `getBudgetForecast`'s regression test (unrelated to the above — found
+  while verifying the gate; it seeded a spend row on the real "today" which
+  only worked when run on the 1st/2nd of a month).
+
 ## 1.6.2 — 2026-07-07
 
 Overview's "Battery health" metric card showed the literal text "see detail"
