@@ -5,7 +5,7 @@ import { destroyMaps, renderPointMap, renderRouteMap, renderLifetimeMap, createR
 // Bump on every change to this dashboard (UI, features, or the /data/*
 // endpoints it depends on) and add a matching entry to CHANGELOG.md — see
 // the versioning policy in the repo's CLAUDE.md. Shown in the sidebar footer.
-const APP_VERSION = "1.6.3";
+const APP_VERSION = "1.7.0";
 
 const root = document.getElementById("app");
 let shellBound = false; // guards one-time attach of the root click handler + sync timer
@@ -232,6 +232,7 @@ const TITLES = {
   pr: ["Predictions", "battery forecast & range predictor"],
   vd: ["Vampire drain", "standby losses"],
   api: ["API usage", "Tesla Fleet API call log & cost — click the sidebar widget to get here"],
+  cl: ["Changelog", "what's shipped, version by version — click the version number to get here"],
 };
 
 const EVENT_COLOR = { drive: "var(--accent)", charge: "var(--good)", sleep: "var(--faint)", update: "#8A63D2" };
@@ -426,7 +427,7 @@ function renderShell() {
             VIN ${esc(auth.vin.slice(-6))}
             &nbsp;·&nbsp;<button data-action="logout" class="tm-link-btn">disconnect</button>
           </div>
-          <div class="tm-sidemeta" style="padding-top:0;" title="See CHANGELOG.md">v${esc(APP_VERSION)}</div>
+          <div class="tm-sidemeta tm-sidebudget-click" style="padding-top:0;" title="See changelog" data-action="nav" data-screen="cl">v${esc(APP_VERSION)}</div>
         </div>
       </aside>
       <div class="tm-nav-backdrop" data-action="nav-close"></div>
@@ -817,6 +818,10 @@ function skeletonHtml(screen) {
       return `${metrics}${table(6)}`;
     case "api":
       return `${metrics}${table(10)}`;
+    case "cl": {
+      const clCard = `<div class="tm-card tm-card-pad">${skel("height:16px;width:110px;")}${skel("height:11px;width:160px;margin-top:8px;")}${skel("height:12px;margin-top:16px;")}${skel("height:12px;width:85%;margin-top:8px;")}${skel("height:12px;width:70%;margin-top:8px;")}</div>`;
+      return `<div class="tm-flex-col" style="gap:16px;">${clCard.repeat(4)}</div>`;
+    }
     default:
       return loadingHtml();
   }
@@ -848,6 +853,7 @@ async function showScreen() {
       case "pr": await renderPredictions(); break;
       case "vd": await renderVampireDrain(); break;
       case "api": await renderApiUsage(); break;
+      case "cl": await renderChangelog(); break;
     }
     state.renderedScreen = state.screen;
     state.lastSync = Date.now();
@@ -1047,6 +1053,77 @@ async function renderApiUsage() {
           </div>`).join("") : `<div class="tm-empty" style="padding:20px 22px;">No call log entries in this window yet.</div>`}
         <div class="tm-foot-note">One row per day + call kind, not one row per call — reload this screen to see today's row grow. This is a cost summary, not a live call feed: the "synced Xs ago" you see elsewhere is the dashboard re-reading already-stored data (free), separate from the worker's own, much slower Tesla API poll cadence that this screen tracks.</div>
       </div>
+    </div>
+  `);
+}
+
+/** Light inline-markdown rendering for changelog prose: `code`, **bold**, [text](url). Escapes first, so this is safe against the raw CHANGELOG.md text. */
+function mdInline(text) {
+  return esc(text)
+    .replace(/`([^`]+)`/g, "<code>$1</code>")
+    .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
+    .replace(/\[([^\]]+)\]\(([^)]+)\)/g, (_m, label, url) => {
+      const safeUrl = /^https?:\/\//i.test(url) ? esc(url) : "#";
+      return `<a href="${safeUrl}" target="_blank" rel="noopener noreferrer">${label}</a>`;
+    });
+}
+
+/**
+ * Parses CHANGELOG.md's known, consistent structure: `## X.Y.Z — YYYY-MM-DD`
+ * headers, an optional intro paragraph, then `- ` bullets (which may wrap
+ * onto indented continuation lines). Anything before the first `## ` header
+ * (the title + versioning-policy blurb) is ignored — this screen is a
+ * version timeline, not a copy of the whole file.
+ */
+function parseChangelog(md) {
+  const lines = md.split("\n");
+  const versions = [];
+  let current = null;
+  for (const line of lines) {
+    const h = line.match(/^##\s+([\d.]+)\s+—\s+(\d{4}-\d{2}-\d{2})\s*$/);
+    if (h) {
+      current = { version: h[1], date: h[2], intro: [], bullets: [] };
+      versions.push(current);
+      continue;
+    }
+    if (!current) continue;
+    const b = line.match(/^-\s+(.*)$/);
+    if (b) {
+      current.bullets.push(b[1]);
+    } else if (/^\s+\S/.test(line) && current.bullets.length) {
+      // Indented continuation of the previous bullet.
+      current.bullets[current.bullets.length - 1] += " " + line.trim();
+    } else if (line.trim()) {
+      current.intro.push(line.trim());
+    }
+  }
+  return versions;
+}
+
+async function renderChangelog() {
+  let md;
+  try {
+    const resp = await fetch("./CHANGELOG.md");
+    if (!resp.ok) throw new Error(`fetch failed (${resp.status})`);
+    md = await resp.text();
+  } catch (e) {
+    return setContent(errorHtml(`Couldn't load the changelog: ${e.message || e}`));
+  }
+  const versions = parseChangelog(md);
+  if (!versions.length) {
+    return setContent(emptyHtml("No changelog entries found", "CHANGELOG.md didn't parse into any versions."));
+  }
+  setContent(`
+    <div class="tm-flex-col" style="gap:16px;max-width:760px;">
+      ${versions.map((v, i) => `
+        <div class="tm-card tm-card-pad">
+          <div class="tm-flex-row" style="justify-content:space-between;align-items:baseline;">
+            <div style="font-size:16px;font-weight:600;">v${esc(v.version)}${i === 0 ? ' <span class="tm-badge tm-badge-ac" style="margin-left:6px;">current</span>' : ""}</div>
+            <div style="font-size:12px;color:var(--faint);">${esc(v.date)}</div>
+          </div>
+          ${v.intro.length ? `<div style="margin-top:8px;color:var(--sub);font-size:13px;">${v.intro.map((p) => `<p>${mdInline(p)}</p>`).join("")}</div>` : ""}
+          ${v.bullets.length ? `<ul class="tm-changelog-list">${v.bullets.map((b) => `<li>${mdInline(b)}</li>`).join("")}</ul>` : ""}
+        </div>`).join("")}
     </div>
   `);
 }

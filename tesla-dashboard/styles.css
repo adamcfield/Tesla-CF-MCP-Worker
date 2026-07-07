@@ -183,6 +183,9 @@ body {
 .tm-mono { font-family: var(--mono); }
 .tm-ellipsis { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .tm-foot-note { padding: 12px 22px; font-size: 11.5px; color: var(--faint); }
+.tm-changelog-list { margin: 10px 0 0; padding-left: 18px; font-size: 13px; color: var(--sub); }
+.tm-changelog-list li { margin-top: 6px; line-height: 1.5; }
+.tm-changelog-list code { font-family: var(--mono); font-size: 12px; background: var(--line2); padding: 1px 5px; border-radius: 4px; }
 
 /* ---------- lists (activity / timeline) ---------- */
 .tm-activity-row {

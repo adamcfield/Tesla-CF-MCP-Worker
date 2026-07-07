@@ -9,6 +9,15 @@ feature or screen, the **patch** version for fixes/tweaks/copy changes, and the
 configured. See `CLAUDE.md` at the repo root for the policy on keeping this file
 and `APP_VERSION` (in `app.js`) in sync.
 
+## 1.7.0 — 2026-07-07
+
+New changelog viewer: clicking the version number in the sidebar now opens a
+timeline screen listing every version in this file, most recent first, each
+as a card with its date, intro, and bullet points (with `code`, **bold**, and
+link markdown lightly rendered). It's a same-origin `fetch("./CHANGELOG.md")`
+parse at render time, not a build step — so this file stays the single
+source of truth for what shipped when.
+
 ## 1.6.3 — 2026-07-07
 
 Five more small fixes from the BugDrop feedback backlog (issues #15, #16,
