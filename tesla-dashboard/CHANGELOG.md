@@ -9,6 +9,15 @@ feature or screen, the **patch** version for fixes/tweaks/copy changes, and the
 configured. See `CLAUDE.md` at the repo root for the policy on keeping this file
 and `APP_VERSION` (in `app.js`) in sync.
 
+## 1.6.1 — 2026-07-06
+
+Fixed raw, unrounded SoC percentages (e.g. "78.71022247254293%") showing on
+the Overview recent-activity feed, the Charges list, and the charge-detail
+page — all three read `start_soc`/`end_soc` straight off the API response
+without rounding. The Drives equivalents were already correctly rounded
+(`fmt0`); these three just missed it. Also fixed the Overview "Charge limit"
+chip the same way.
+
 ## 1.6.0 — 2026-07-06
 
 Places: adding one is now a popup instead of always-on-page clutter, and a
