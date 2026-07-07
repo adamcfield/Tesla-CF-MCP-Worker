@@ -5,7 +5,7 @@ import { destroyMaps, renderPointMap, renderRouteMap, renderLifetimeMap, createR
 // Bump on every change to this dashboard (UI, features, or the /data/*
 // endpoints it depends on) and add a matching entry to CHANGELOG.md — see
 // the versioning policy in the repo's CLAUDE.md. Shown in the sidebar footer.
-const APP_VERSION = "1.6.0";
+const APP_VERSION = "1.6.1";
 
 const root = document.getElementById("app");
 let shellBound = false; // guards one-time attach of the root click handler + sync timer
@@ -1156,7 +1156,7 @@ async function renderOverview() {
               <span class="tm-dot" style="background:${connState === "online" ? "var(--good)" : "var(--faint)"};"></span>
               ${esc({ online: "Online", reporting: "Reporting", unknown: "Offline" }[connState] || connState)}
             </span>
-            ${chargeLimit != null ? `<span style="margin-left:auto;font-size:11.5px;color:var(--faint);">Charge limit ${chargeLimit}%</span>` : ""}
+            ${chargeLimit != null ? `<span style="margin-left:auto;font-size:11.5px;color:var(--faint);">Charge limit ${fmt0(chargeLimit)}%</span>` : ""}
           </div>
           <div style="display:flex;align-items:flex-end;justify-content:space-between;gap:20px;">
             <div>
@@ -1322,7 +1322,7 @@ async function buildEventFeed(locations, driveLimit = 200) {
       ts: c.start_ts,
       type: "charge",
       title: `Charged at ${chargeLocName(c, locations)}`,
-      meta: `${c.energy_added_kwh != null ? "+" + fmt1(c.energy_added_kwh) + " kWh" : "—"}${c.start_soc != null && c.end_soc != null ? ` · ${c.start_soc} → ${c.end_soc}%` : ""}${c.cost != null ? ` · ${money(c.cost, c.currency)}` : ""}`,
+      meta: `${c.energy_added_kwh != null ? "+" + fmt1(c.energy_added_kwh) + " kWh" : "—"}${c.start_soc != null && c.end_soc != null ? ` · ${fmt0(c.start_soc)} → ${fmt0(c.end_soc)}%` : ""}${c.cost != null ? ` · ${money(c.cost, c.currency)}` : ""}`,
       raw: c,
     });
   }
@@ -2478,7 +2478,7 @@ async function renderCharges() {
             <div class="tm-ellipsis" style="font-size:13.5px;font-weight:500;">${esc(chargeLocName(c, locations))}</div>
             <div><span class="tm-badge ${c.charge_type === "DC" ? "tm-badge-dc" : "tm-badge-ac"}">${esc(c.charge_type || "AC")}</span></div>
             <div class="tm-right tm-mono">${c.energy_added_kwh != null ? "+" + fmt1(c.energy_added_kwh) : "—"} kWh</div>
-            <div class="tm-right tm-mono" style="color:var(--sub);">${c.start_soc != null && c.end_soc != null ? `${c.start_soc} → ${c.end_soc}` : "—"} %</div>
+            <div class="tm-right tm-mono" style="color:var(--sub);">${c.start_soc != null && c.end_soc != null ? `${fmt0(c.start_soc)} → ${fmt0(c.end_soc)}` : "—"} %</div>
             <div class="tm-right tm-mono" style="color:var(--sub);">${c.max_charger_power != null ? fmt0(c.max_charger_power) : "—"} kW</div>
             <div class="tm-right tm-mono" style="color:var(--sub);">${fmtDurationMin(c.duration_min)}</div>
             <div class="tm-right tm-mono">${money(c.cost, c.currency)}</div>
@@ -2510,7 +2510,7 @@ async function renderChargeDetail() {
     </div>
     <div class="tm-grid-metrics">
       <div class="tm-card" style="padding:18px 20px;"><div class="tm-stat-label">Energy added</div><div style="font-size:19px;font-weight:600;margin-top:5px;" class="tm-mono">${c.energy_added_kwh != null ? "+" + fmt1(c.energy_added_kwh) : "—"} kWh</div></div>
-      <div class="tm-card" style="padding:18px 20px;"><div class="tm-stat-label">Battery</div><div style="font-size:19px;font-weight:600;margin-top:5px;" class="tm-mono">${c.start_soc != null && c.end_soc != null ? `${c.start_soc} → ${c.end_soc}` : "—"} %</div></div>
+      <div class="tm-card" style="padding:18px 20px;"><div class="tm-stat-label">Battery</div><div style="font-size:19px;font-weight:600;margin-top:5px;" class="tm-mono">${c.start_soc != null && c.end_soc != null ? `${fmt0(c.start_soc)} → ${fmt0(c.end_soc)}` : "—"} %</div></div>
       <div class="tm-card" style="padding:18px 20px;"><div class="tm-stat-label">Peak power</div><div style="font-size:19px;font-weight:600;margin-top:5px;" class="tm-mono">${c.max_charger_power != null ? fmt0(c.max_charger_power) : "—"} <span style="font-size:12px;color:var(--sub);">kW</span></div></div>
       <div class="tm-card" style="padding:18px 20px;"><div class="tm-stat-label">Cost</div><div style="font-size:19px;font-weight:600;margin-top:5px;" class="tm-mono">${money(c.cost, c.currency)}${rate != null ? ` <span style="font-size:12px;color:var(--sub);">@ ${money(rate, c.currency)}/kWh</span>` : ""}</div></div>
     </div>
