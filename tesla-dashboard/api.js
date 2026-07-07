@@ -153,6 +153,8 @@ export const data = {
   locationStats: (id) => getJson("/data/location-stats", { id }),
   /** Forward-geocode an address to candidate {label, lat, lon, source} hits (GovMap, falling back to Nominatim). */
   geocode: (q, lang) => getJson("/geocode", { q, lang }),
+  /** Reverse-geocode a point to a short place label (Nominatim, 110m-grid cached server-side). New endpoint — may 404. */
+  reverseGeocode: (lat, lon) => getJson("/data/reverse-geocode", { lat, lon }),
   driverScores: (vin) => getJson("/data/driver-scores", { vin }),
   efficiencyByTemp: (vin) => getJson("/data/efficiency-by-temp", { vin }),
   tires: (vin, days) => getJson("/data/tires", { vin, days }),

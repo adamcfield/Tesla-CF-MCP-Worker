@@ -55,6 +55,7 @@ import { exportChargesCsv, exportDriveGpx, exportDrivesCsv } from "./export";
 import { getBatteryForecast, predictRange } from "./forecast";
 import { findSimilarDrives } from "./twin";
 import { handleGeocode, handleGovTile, probeGovmap } from "./govmap";
+import { reverseGeocode } from "./geocode";
 import { handleIngest } from "./ingest";
 import { handleMcp, SERVER_VERSION } from "./mcp";
 import { pollOnce } from "./poll";
@@ -407,6 +408,18 @@ export default {
         if (!q) return json({ error: "q query param required" }, 400);
         const results = await handleGeocode(env, q, url.searchParams.get("lang") ?? "he");
         return json({ query: q, results });
+      }
+
+      // --- Reverse geocode (coords → short place label), same Nominatim path
+      // drive endpoints already use (110m-grid cached) — lets the dashboard show
+      // a real address for the current location instead of raw lat/lon.
+      if (path === "/data/reverse-geocode") {
+        if (scope === null) return json({ error: "unauthorized" }, 401);
+        const lat = Number(url.searchParams.get("lat"));
+        const lon = Number(url.searchParams.get("lon"));
+        if (!Number.isFinite(lat) || !Number.isFinite(lon)) return json({ error: "lat/lon query params required" }, 400);
+        const label = await reverseGeocode(env, lat, lon);
+        return json({ lat, lon, label });
       }
 
       // --- driver assignment (benign metadata write; read scope suffices —
