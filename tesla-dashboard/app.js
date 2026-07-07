@@ -5,7 +5,7 @@ import { destroyMaps, renderPointMap, renderRouteMap, renderLifetimeMap, createR
 // Bump on every change to this dashboard (UI, features, or the /data/*
 // endpoints it depends on) and add a matching entry to CHANGELOG.md — see
 // the versioning policy in the repo's CLAUDE.md. Shown in the sidebar footer.
-const APP_VERSION = "1.6.1";
+const APP_VERSION = "1.6.2";
 
 const root = document.getElementById("app");
 let shellBound = false; // guards one-time attach of the root click handler + sync timer
@@ -1097,12 +1097,14 @@ function tyreStatusHtml(t) {
 async function renderOverview() {
   if (!vin()) return setContent(emptyHtml("No vehicle connected", "Disconnect and reconnect with a VIN."));
 
-  const [summary, latest, locations, tires] = await Promise.all([
+  const [summary, latest, locations, tires, degradation] = await Promise.all([
     safe(cached("summary", () => data.summary(vin())), null),
     safe(cached("latest", () => data.latest(vin())), null),
     safe(cached("locations", () => data.locations()), []),
     safe(cached("tires", () => data.tires(vin(), 30)), null),
+    safe(cached("degradation", () => data.degradation(vin())), null),
   ]);
+  const batteryHealthPct = degradation?.degradation_pct != null ? Math.max(0, 100 - degradation.degradation_pct) : null;
 
   const vd = state.vehicleData;
   const cs = vd?.charge_state, cl = vd?.climate_state, vs = vd?.vehicle_state, ds = vd?.drive_state, vc = vd?.vehicle_config;
@@ -1211,7 +1213,7 @@ async function renderOverview() {
       </div>
       <div class="tm-card tm-card-pad-metric tm-card-hover" data-action="goto-bh">
         <div class="tm-stat-label">Battery health</div>
-        <div class="tm-stat-value">${summary?.pack_kwh ? "see detail" : "—"}</div>
+        <div class="tm-stat-value">${batteryHealthPct != null ? fmt1(batteryHealthPct) : "—"}${batteryHealthPct != null ? `<span class="tm-stat-unit">%</span>` : ""}</div>
       </div>
       <div class="tm-card tm-card-pad-metric">
         <div class="tm-stat-label">Avg efficiency</div>

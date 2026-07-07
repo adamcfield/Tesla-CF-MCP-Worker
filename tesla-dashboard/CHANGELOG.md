@@ -9,6 +9,14 @@ feature or screen, the **patch** version for fixes/tweaks/copy changes, and the
 configured. See `CLAUDE.md` at the repo root for the policy on keeping this file
 and `APP_VERSION` (in `app.js`) in sync.
 
+## 1.6.2 — 2026-07-07
+
+Overview's "Battery health" metric card showed the literal text "see detail"
+instead of an actual number — fixed to show the real battery health %
+(fetched from the same degradation data the Battery Health page uses),
+still clickable through to that page for the full breakdown. (Reported via
+the new BugDrop feedback widget — issue #14.)
+
 ## 1.6.1 — 2026-07-06
 
 Fixed raw, unrounded SoC percentages (e.g. "78.71022247254293%") showing on
