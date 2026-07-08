@@ -798,6 +798,20 @@ const TOOLS: Tool[] = [
     handler: (env, a) => tracking.getStateTimeline(env, a.vin, a.hours ?? 168),
   },
   {
+    name: "get_battery_timeline",
+    description:
+      "SoC over time with a driving/charging/resting/connected-not-charging stage per point, plus per-stage " +
+      "segments and total hours — the data behind a stock-chart-style battery timeline. Finer-grained than " +
+      "get_state_timeline: splits idle into unplugged (resting) vs plugged-in-but-not-charging (connected), " +
+      "e.g. sitting at 80% after a charge limit stop. Free — reads logged data.",
+    inputSchema: {
+      type: "object",
+      properties: { ...vinProp, hours: { type: "number", default: 24 } },
+      required: ["vin"],
+    },
+    handler: (env, a) => tracking.getBatteryTimeline(env, a.vin, a.hours ?? 24),
+  },
+  {
     name: "get_api_call_log",
     description:
       "Tesla Fleet API spend breakdown by day and call kind (vehicle data reads, commands, wakes, telemetry " +
@@ -947,6 +961,7 @@ const READ_TOOLS = new Set([
   "get_vampire_drain",
   "get_sentry_log",
   "get_state_timeline",
+  "get_battery_timeline",
   "get_monthly_report",
   "get_efficiency_by_temp",
   "get_media_stats",

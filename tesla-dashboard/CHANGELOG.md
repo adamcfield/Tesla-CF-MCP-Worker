@@ -9,6 +9,22 @@ feature or screen, the **patch** version for fixes/tweaks/copy changes, and the
 configured. See `CLAUDE.md` at the repo root for the policy on keeping this file
 and `APP_VERSION` (in `app.js`) in sync.
 
+## 1.8.0 — 2026-07-11
+
+**#23**: new Battery timeline screen — a stock-chart-style SoC line over a
+chosen time scope (24 hours / 7 days / 30 days), with a stage strip and
+legend underneath showing how much of that window was spent driving,
+charging, resting (parked, unplugged), or connected but not charging
+(e.g. sitting at the charge limit after a session finished). Reached by
+clicking Overview's "Charge level" card.
+
+- Backend: new `getBatteryTimeline` derivation in `tracking.ts`, built
+  from `positions`' already-derived `activity` + `charging_state` (not
+  `vehicle_states`, which only tracks driving/charging/online/asleep/
+  updating and has no "plugged in but idle" state). New
+  `GET /data/battery-timeline?vin=&hours=` route and `get_battery_timeline`
+  MCP tool (read-scope).
+
 ## 1.7.3 — 2026-07-11
 
 API usage screen: stop hiding why the call log is missing. Reported as "the

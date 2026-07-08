@@ -69,6 +69,7 @@ import {
   backfillDriveAddresses,
   backfillSyntheticDrives,
   getBatteryDegradation,
+  getBatteryTimeline,
   getChargeCurve,
   getChargeSessions,
   getChargeTaperCurve,
@@ -208,7 +209,7 @@ async function handleHealth(request: Request, url: URL, env: Env): Promise<Respo
  *   /data/drives?vin=&limit=     /data/drive?id=
  *   /data/charge-sessions?vin=&limit=   /data/charge-curve?session_id=
  *   /data/degradation?vin=       /data/vampire?vin=&days=
- *   /data/states?vin=&hours=
+ *   /data/states?vin=&hours=     /data/battery-timeline?vin=&hours=
  *   /data/locations              /data/location-stats?id=
  */
 async function handleData(url: URL, env: Env): Promise<Response> {
@@ -279,6 +280,8 @@ async function handleData(url: URL, env: Env): Promise<Response> {
       return json(await getChargeSessions(env, vin, numParam("limit", 50)));
     case "/data/degradation":
       return json(await getBatteryDegradation(env, vin));
+    case "/data/battery-timeline":
+      return json(await getBatteryTimeline(env, vin, numParam("hours", 24)));
     case "/data/vampire":
       return json(await getVampireDrain(env, vin, numParam("days", 30)));
     case "/data/states":
