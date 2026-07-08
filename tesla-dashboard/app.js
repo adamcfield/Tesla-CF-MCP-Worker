@@ -5,7 +5,7 @@ import { destroyMaps, renderPointMap, renderRouteMap, renderLifetimeMap, createR
 // Bump on every change to this dashboard (UI, features, or the /data/*
 // endpoints it depends on) and add a matching entry to CHANGELOG.md — see
 // the versioning policy in the repo's CLAUDE.md. Shown in the sidebar footer.
-const APP_VERSION = "1.7.1";
+const APP_VERSION = "1.7.2";
 
 const root = document.getElementById("app");
 let shellBound = false; // guards one-time attach of the root click handler + sync timer
@@ -2238,7 +2238,7 @@ function addPlaceModalHtml() {
       </div>
       <div id="tm-place-modal-map" class="tm-map-canvas" style="height:160px;border-radius:10px;margin-bottom:14px;"></div>
       <div class="tm-driver-tags-scope">
-        <input class="tm-gate-input" id="tm-place-modal-name" type="text" placeholder="Name this place…" autocomplete="off" maxlength="120" style="width:100%;">
+        <input class="tm-gate-input" id="tm-place-modal-name" type="text" placeholder="Name this place…" autocomplete="off" maxlength="120" style="width:100%;" value="${esc(ps.selected.label || "")}">
         ${names.length ? `<div class="tm-stat-label" style="margin:12px 0 2px;">Whose place is this? <span style="font-weight:400;text-transform:none;letter-spacing:0;">(optional — leave blank to share)</span></div>${driverChipsHtml(names)}` : ""}
         ${ps.error ? `<div class="tm-suggest-error" style="margin-top:10px;">${esc(ps.error)}</div>` : ""}
         <div class="tm-flex-row" style="gap:14px;margin-top:16px;">
@@ -2282,7 +2282,10 @@ function refreshAddPlaceModal() {
   openModal(addPlaceModalHtml());
   if (state.placeSearch.selected) {
     const { lat, lon, label } = state.placeSearch.selected;
-    requestAnimationFrame(() => renderPointMap(document.getElementById("tm-place-modal-map"), lat, lon, esc(label || "")));
+    requestAnimationFrame(() => {
+      renderPointMap(document.getElementById("tm-place-modal-map"), lat, lon, esc(label || ""));
+      document.getElementById("tm-place-modal-name")?.select();
+    });
   }
 }
 
