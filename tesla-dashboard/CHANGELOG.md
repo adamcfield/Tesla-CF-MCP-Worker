@@ -9,6 +9,22 @@ feature or screen, the **patch** version for fixes/tweaks/copy changes, and the
 configured. See `CLAUDE.md` at the repo root for the policy on keeping this file
 and `APP_VERSION` (in `app.js`) in sync.
 
+## 1.10.0 — 2026-07-11
+
+New "Cabin climate" card on Overview — asked as "it's very hot outside, can
+we tell if the AC is working to keep the interior temp in check?".
+
+- A 24-hour inside-vs-outside temperature chart (solid = inside, dashed =
+  outside), so you can see at a glance whether the cabin is being held
+  below ambient (AC winning) or soaring above it (parked in the sun,
+  nothing running).
+- A one-line verdict underneath from the latest telemetry: AC on and
+  holding / on but still catching up / off while the cabin heats up
+  (with the Climate Keeper mode when it's active) — warning color when
+  the cabin is cooking.
+- The Inside/Outside readouts at the top of Overview click through to
+  this card.
+
 ## 1.9.2 — 2026-07-11
 
 Overview readouts are now click-through: Tyres (including when it shows a
