@@ -5,7 +5,7 @@ import { destroyMaps, renderPointMap, renderRouteMap, renderLifetimeMap, createR
 // Bump on every change to this dashboard (UI, features, or the /data/*
 // endpoints it depends on) and add a matching entry to CHANGELOG.md — see
 // the versioning policy in the repo's CLAUDE.md. Shown in the sidebar footer.
-const APP_VERSION = "1.9.1";
+const APP_VERSION = "1.9.2";
 
 const root = document.getElementById("app");
 let shellBound = false; // guards one-time attach of the root click handler + sync timer
@@ -569,6 +569,8 @@ function onRootClick(e) {
   } else if (action === "tf-cat") {
     state.tfCat = t.dataset.cat;
     renderTelemetryFields();
+  } else if (action === "ov-goto-climate") {
+    document.getElementById("tm-ov-climate")?.scrollIntoView({ behavior: "smooth", block: "start" });
   } else if (action === "driver-other-toggle") {
     const other = document.getElementById("tm-driver-other");
     if (other) {
@@ -1375,10 +1377,10 @@ async function renderOverview() {
             ${chargeLimit != null ? `<div class="tm-progress-mark" style="left:${chargeLimit}%;"></div>` : ""}
           </div>` : ""}
           <div class="tm-grid-metrics" style="grid-template-columns:repeat(auto-fit,minmax(90px,1fr));gap:14px;">
-            <div><div class="tm-readout-label">Inside</div><div class="tm-readout-value">${inside != null ? fmt1(inside) + " °C" : "—"}</div></div>
-            <div><div class="tm-readout-label">Outside</div><div class="tm-readout-value">${outside != null ? fmt1(outside) + " °C" : "—"}</div></div>
-            <div><div class="tm-readout-label">Tyres</div><div class="tm-readout-value">${tyreStatusHtml(tires)}</div></div>
-            <div><div class="tm-readout-label">Status</div><div class="tm-readout-value">${esc(currentStatus || "—")}</div></div>
+            <div class="tm-readout-click" data-action="ov-goto-climate" title="See inside vs outside temperature"><div class="tm-readout-label">Inside</div><div class="tm-readout-value">${inside != null ? fmt1(inside) + " °C" : "—"}</div></div>
+            <div class="tm-readout-click" data-action="ov-goto-climate" title="See inside vs outside temperature"><div class="tm-readout-label">Outside</div><div class="tm-readout-value">${outside != null ? fmt1(outside) + " °C" : "—"}</div></div>
+            <div class="tm-readout-click" data-action="nav" data-screen="st" title="Tyre pressures & trends on Statistics"><div class="tm-readout-label">Tyres</div><div class="tm-readout-value">${tyreStatusHtml(tires)}</div></div>
+            <div class="tm-readout-click" data-action="nav" data-screen="tl" title="Full state timeline"><div class="tm-readout-label">Status</div><div class="tm-readout-value">${esc(currentStatus || "—")}</div></div>
           </div>
         ` : `
           <div class="tm-empty" style="padding:12px 0 4px;">

@@ -9,6 +9,13 @@ feature or screen, the **patch** version for fixes/tweaks/copy changes, and the
 configured. See `CLAUDE.md` at the repo root for the policy on keeping this file
 and `APP_VERSION` (in `app.js`) in sync.
 
+## 1.9.2 — 2026-07-11
+
+Overview readouts are now click-through: Tyres (including when it shows a
+pressure warning) opens the Statistics screen's TPMS card, Status opens the
+state Timeline, and Inside/Outside jump to the new cabin-climate section —
+so an issue you can see is one click from the screen that explains it.
+
 ## 1.9.1 — 2026-07-11
 
 **#24**: the drive-detail page showed the driver in three separate spots (a
