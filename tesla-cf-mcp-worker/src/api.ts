@@ -20,7 +20,7 @@ import { Env, TeslaError, VehicleSummary, fleetBase } from "./types";
  * gate open while the app is actually hard-disabled. forceBudgetCeiling never
  * rejects, so awaiting it on this already-fatal path is free.
  */
-async function detectExceededLimit(env: Env, status: number, body: string): Promise<void> {
+export async function detectExceededLimit(env: Env, status: number, body: string): Promise<void> {
   if (status === 403 && /EXCEEDED_?LIMIT|billing.*limit|usage.*limit/i.test(body)) {
     await forceBudgetCeiling(env);
   }
@@ -55,7 +55,7 @@ async function fleetPost<T>(env: Env, path: string, body?: unknown): Promise<T> 
   });
   if (!resp.ok) {
     const text = await resp.text();
-    detectExceededLimit(env, resp.status, text);
+    await detectExceededLimit(env, resp.status, text);
     throw new TeslaError(`Fleet API POST ${path} failed (${resp.status})`, resp.status, text);
   }
   return ((await resp.json()) as { response: T }).response;

@@ -4,6 +4,7 @@
  * in-memory per isolate; a stale counter/epoch triggers one re-handshake.
  */
 
+import { detectExceededLimit } from "./api";
 import { getOwnerToken } from "./auth";
 import { getBudgetStatus, recordSpend } from "./budget";
 import {
@@ -72,9 +73,16 @@ async function sendRoutable(ctx: CommandContext, msg: Uint8Array): Promise<Uint8
     headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
     body: JSON.stringify({ routable_message: bytesToB64(msg) }),
   });
-  const body = (await resp.json().catch(() => null)) as { response?: string; error?: string } | null;
+  const raw = await resp.text().catch(() => "");
+  let body: { response?: string; error?: string } | null = null;
+  try {
+    body = JSON.parse(raw) as { response?: string; error?: string };
+  } catch {
+    // non-JSON error body — `raw` still carries it for detail/limit detection
+  }
   if (!resp.ok || !body?.response) {
-    const detail = body?.error ?? JSON.stringify(body);
+    await detectExceededLimit(ctx.env, resp.status, raw);
+    const detail = body?.error ?? raw;
     if (resp.status === 408) {
       throw new TeslaError(
         "Vehicle is asleep or unreachable. Call wake_vehicle first, then retry the command.",
