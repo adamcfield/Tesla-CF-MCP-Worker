@@ -149,6 +149,7 @@ export const data = {
   degradation: (vin) => getJson("/data/degradation", { vin }),
   vampire: (vin, days) => getJson("/data/vampire", { vin, days }),
   states: (vin, hours) => getJson("/data/states", { vin, hours }),
+  batteryTimeline: (vin, hours) => getJson("/data/battery-timeline", { vin, hours }),
   locations: () => getJson("/data/locations"),
   locationStats: (id) => getJson("/data/location-stats", { id }),
   /** Forward-geocode an address to candidate {label, lat, lon, source} hits (GovMap, falling back to Nominatim). */

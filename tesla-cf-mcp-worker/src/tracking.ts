@@ -1130,6 +1130,67 @@ export async function getStateTimeline(env: Env, vin: string, hours = 168): Prom
   return rs.results ?? [];
 }
 
+/** charging_state values that mean "plugged in" but not actively drawing power. */
+const CONNECTED_NOT_CHARGING = new Set(["Complete", "Stopped", "NoPower"]);
+
+/** Finer-grained than vehicle_states: splits "idle" into resting (unplugged) vs connected (plugged in, not charging). */
+function batteryStage(activity: string | null, chargingState: string | null): string {
+  if (activity === "driving") return "driving";
+  if (activity === "charging") return "charging";
+  return chargingState != null && CONNECTED_NOT_CHARGING.has(chargingState) ? "connected" : "resting";
+}
+
+/**
+ * SoC over time with a driving/charging/resting/connected-not-charging stage per
+ * sample, for a stock-chart-style timeline (issue: click-through from Overview's
+ * charge-level widget). Built from `positions` (already-derived activity +
+ * charging_state), not from vehicle_states, since vehicle_states only tracks
+ * driving/charging/online/asleep/updating — it has no "plugged in but idle" state.
+ *
+ * Points are downsampled evenly to <=2000 (same approach as getTirePressures) so
+ * a 30-day window stays payload-sane; segments are computed from the FULL,
+ * unsampled series first so short stage changes between kept points aren't lost.
+ */
+export async function getBatteryTimeline(env: Env, vin: string, hours = 24): Promise<unknown> {
+  await ensureSchema(env);
+  const since = Math.floor(Date.now() / 1000) - Math.round(hours * 3600);
+  const rs = await env.DB.prepare(
+    `SELECT ts, soc, activity, charging_state FROM positions
+     WHERE vin = ?1 AND ts >= ?2 AND soc IS NOT NULL ORDER BY ts ASC`,
+  )
+    .bind(vin, since)
+    .all<{ ts: number; soc: number; activity: string | null; charging_state: string | null }>();
+  const rows = rs.results ?? [];
+
+  const segments: { stage: string; start_ts: number; end_ts: number }[] = [];
+  const stageSeconds: Record<string, number> = { driving: 0, charging: 0, resting: 0, connected: 0 };
+  for (const r of rows) {
+    const stage = batteryStage(r.activity, r.charging_state);
+    const last = segments[segments.length - 1];
+    if (last && last.stage === stage) last.end_ts = r.ts;
+    else segments.push({ stage, start_ts: r.ts, end_ts: r.ts });
+  }
+  for (const seg of segments) stageSeconds[seg.stage] = (stageSeconds[seg.stage] ?? 0) + (seg.end_ts - seg.start_ts);
+
+  const step = Math.max(1, Math.ceil(rows.length / 2000));
+  const points = rows
+    .filter((_, i) => i % step === 0 || i === rows.length - 1)
+    .map((r) => ({ ts: r.ts, soc: round(r.soc, 1), stage: batteryStage(r.activity, r.charging_state) }));
+
+  return {
+    vin,
+    hours,
+    points,
+    segments,
+    stage_hours: {
+      driving: round((stageSeconds.driving ?? 0) / 3600, 2),
+      charging: round((stageSeconds.charging ?? 0) / 3600, 2),
+      resting: round((stageSeconds.resting ?? 0) / 3600, 2),
+      connected: round((stageSeconds.connected ?? 0) / 3600, 2),
+    },
+  };
+}
+
 // ---------------------------------------------------------------------------
 // Derived: degradation
 // ---------------------------------------------------------------------------

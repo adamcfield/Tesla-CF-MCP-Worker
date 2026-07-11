@@ -5,7 +5,7 @@ import { destroyMaps, renderPointMap, renderRouteMap, renderLifetimeMap, createR
 // Bump on every change to this dashboard (UI, features, or the /data/*
 // endpoints it depends on) and add a matching entry to CHANGELOG.md — see
 // the versioning policy in the repo's CLAUDE.md. Shown in the sidebar footer.
-const APP_VERSION = "1.7.3";
+const APP_VERSION = "1.8.0";
 
 const root = document.getElementById("app");
 let shellBound = false; // guards one-time attach of the root click handler + sync timer
@@ -191,6 +191,7 @@ const state = {
   vehicle: null, // { vin, display_name, state }
   vehicleData: null, // last on-demand get_vehicle_data snapshot
   driveFilter: 1, // 0=7d, 1=30d, 2=all
+  batteryTimelineRange: 0, // index into BATTERY_TIMELINE_RANGES (Battery timeline screen)
   driverFilter: "__all", // "__all" | "__none" (unassigned) | driver name
   mediaDriverFilter: null, // selected driver chip on the Media screen's per-driver breakdown
   openDriveId: null,
@@ -557,6 +558,9 @@ function onRootClick(e) {
   } else if (action === "drive-filter") {
     state.driveFilter = Number(t.dataset.filter);
     renderDrives();
+  } else if (action === "battery-timeline-range") {
+    state.batteryTimelineRange = Number(t.dataset.range);
+    renderBatteryTimeline();
   } else if (action === "driver-filter") {
     state.driverFilter = t.dataset.driver;
     renderDrives();
@@ -812,6 +816,8 @@ function skeletonHtml(screen) {
       return `<div class="tm-card tm-card-pad-lg tm-flex-row" style="gap:16px;">${skel("height:56px;width:56px;border-radius:10px;")}${skel("height:16px;width:40%;")}</div>${metrics}${table(8)}`;
     case "bh":
       return `<div class="tm-grid-3col"><div class="tm-card tm-card-pad-lg" style="display:flex;align-items:center;justify-content:center;">${skel("height:132px;width:132px;border-radius:50%;")}</div>${metric.repeat(2)}</div>${chart}`;
+    case "bt":
+      return `<div class="tm-flex-row" style="gap:8px;">${skel("height:30px;width:86px;border-radius:999px;").repeat(3)}</div>${chart}`;
     case "cs":
       return `${metrics}<div class="tm-grid-2">${chart}${chart}</div>`;
     case "vd":
@@ -850,6 +856,7 @@ async function showScreen() {
       case "ch": await renderCharges(); break;
       case "cs": await renderChargingStats(); break;
       case "bh": await renderBatteryHealth(); break;
+      case "bt": await renderBatteryTimeline(); break;
       case "pr": await renderPredictions(); break;
       case "vd": await renderVampireDrain(); break;
       case "api": await renderApiUsage(); break;
@@ -1397,10 +1404,10 @@ async function renderOverview() {
     </div>
 
     <div class="tm-grid-2">
-      <div class="tm-card tm-card-pad">
+      <div class="tm-card tm-card-pad tm-card-hover" data-action="nav" data-screen="bt">
         <div class="tm-card-head">
           <div class="tm-card-head-title">Charge level</div>
-          <div class="tm-card-head-sub">last 7 days</div>
+          <div class="tm-card-head-sub">last 7 days &middot; click for the full timeline</div>
         </div>
         ${socChart.length > 1 ? svgLineChart({
           series: [{ points: socChart, area: true }],
@@ -2889,6 +2896,73 @@ function autoTicks(values, n) {
   const out = [];
   for (let i = 0; i <= n; i++) out.push({ value: min + ((max - min) * i) / n, label: fmt0(min + ((max - min) * i) / n) });
   return out;
+}
+
+// ---------------------------------------------------------------------------
+// Battery timeline
+// ---------------------------------------------------------------------------
+
+const BATTERY_TIMELINE_RANGES = [["24 hours", 24], ["7 days", 24 * 7], ["30 days", 24 * 30]];
+const STAGE_COLOR = { driving: "var(--accent)", charging: "var(--good)", connected: "var(--warn)", resting: "var(--faint)" };
+const STAGE_LABEL = { driving: "Driving", charging: "Charging", connected: "Connected (not charging)", resting: "Resting" };
+const STAGE_ORDER = ["driving", "charging", "connected", "resting"];
+
+/** Colored strip under the SoC chart showing which stage was active when, time-positioned like the chart above it. */
+function batteryStageStripHtml(segments, x0, x1) {
+  if (!segments?.length || x1 <= x0) return "";
+  const segs = segments.map((seg) => {
+    const left = ((seg.start_ts - x0) / (x1 - x0)) * 100;
+    const width = Math.max(0.4, ((Math.max(seg.end_ts, seg.start_ts) - seg.start_ts) / (x1 - x0)) * 100);
+    return `<div class="tm-stage-seg" style="left:${left}%;width:${width}%;background:${STAGE_COLOR[seg.stage] || "var(--faint)"};" title="${esc(STAGE_LABEL[seg.stage] || seg.stage)}"></div>`;
+  }).join("");
+  return `<div class="tm-stage-strip">${segs}</div>`;
+}
+
+function batteryStageLegendHtml(stageHours) {
+  return `<div class="tm-flex-row" style="gap:16px;flex-wrap:wrap;margin-top:12px;">
+    ${STAGE_ORDER.map((k) => `
+      <div style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--sub);">
+        <span style="width:9px;height:9px;border-radius:2px;background:${STAGE_COLOR[k]};flex:none;"></span>
+        ${esc(STAGE_LABEL[k])} · ${fmt1(stageHours?.[k] ?? 0)}h
+      </div>`).join("")}
+  </div>`;
+}
+
+async function renderBatteryTimeline() {
+  const hours = BATTERY_TIMELINE_RANGES[state.batteryTimelineRange][1];
+  const tl = await safe(cached(`battery_timeline:${hours}`, () => data.batteryTimeline(vin(), hours)), null);
+
+  const rangeChips = `<div class="tm-flex-row" style="gap:8px;flex-wrap:wrap;">
+    <button class="tm-back-btn" data-action="nav" data-screen="ov">&larr; Overview</button>
+    ${BATTERY_TIMELINE_RANGES.map(([label], i) => `
+      <button class="tm-chip-btn ${state.batteryTimelineRange === i ? "active" : ""}" data-action="battery-timeline-range" data-range="${i}">${esc(label)}</button>
+    `).join("")}
+  </div>`;
+
+  if (!tl?.points?.length) {
+    return setContent(`${rangeChips}${emptyHtml("No battery data in this window", "Give the car some time to log driving/charging samples, or pick a wider range.")}`);
+  }
+
+  const socPts = tl.points.map((p) => [p.ts, p.soc]);
+  const x0 = tl.points[0].ts, x1 = tl.points[tl.points.length - 1].ts;
+
+  setContent(`
+    ${rangeChips}
+    <div class="tm-card tm-card-pad" style="margin-top:14px;">
+      <div class="tm-card-head">
+        <div class="tm-card-head-title">Battery level</div>
+        <div class="tm-card-head-sub">${esc(BATTERY_TIMELINE_RANGES[state.batteryTimelineRange][0])}</div>
+      </div>
+      ${socPts.length > 1 ? svgLineChart({
+        series: [{ points: socPts, area: true }],
+        yTicks: [0, 25, 50, 75, 100].map((v) => ({ value: v, label: String(v) })),
+        xTicks: buildDayTicks(socPts),
+        yDomain: [0, 100],
+      }) : miniEmptyHtml("Not enough samples yet to plot a line")}
+      ${batteryStageStripHtml(tl.segments, x0, x1)}
+      ${batteryStageLegendHtml(tl.stage_hours)}
+    </div>
+  `);
 }
 
 // ---------------------------------------------------------------------------

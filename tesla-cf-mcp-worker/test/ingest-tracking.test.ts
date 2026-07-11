@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { applyIngest, handleIngest } from "../src/ingest";
 import { getLatest, querySeries, resetSchemaCacheForTests } from "../src/store";
-import { getDrives, getStateTimeline, getChargeSessions } from "../src/tracking";
+import { getDrives, getStateTimeline, getChargeSessions, getBatteryTimeline } from "../src/tracking";
 import { FakeD1 } from "./helpers/d1";
 import { FakeKV } from "./helpers/kv";
 import type { Env } from "../src/types";
@@ -144,6 +144,49 @@ describe("state timeline derivation", () => {
     const seq = states.map((s) => s.state).reverse(); // query returns DESC
     expect(seq).toContain("driving");
     expect(seq[0]).toBe("online");
+  });
+});
+
+describe("battery timeline derivation", () => {
+  it("splits idle into resting (unplugged) vs connected (plugged in, not charging)", async () => {
+    const env = makeEnv();
+    const base = 1_700_040_000;
+    // parked, unplugged -> resting (two samples, so the segment has real duration)
+    await applyIngest(env, parsed(VIN, base, { Gear: "P", VehicleSpeed: 0, Soc: 50, ChargingState: "Disconnected" }));
+    await applyIngest(env, parsed(VIN, base + 60, { Gear: "P", VehicleSpeed: 0, Soc: 50, ChargingState: "Disconnected" }));
+    // driving
+    await applyIngest(env, parsed(VIN, base + 120, { Gear: "D", VehicleSpeed: 40, Odometer: 100, Soc: 51 }));
+    await applyIngest(env, parsed(VIN, base + 180, { Gear: "D", VehicleSpeed: 40, Odometer: 101, Soc: 51.5 }));
+    // parked again, unplugged -> a second, separate resting segment
+    await applyIngest(env, parsed(VIN, base + 240, { Gear: "P", VehicleSpeed: 0, Odometer: 102, Soc: 52, ChargingState: "Disconnected" }));
+    // plugged in and charging
+    await applyIngest(env, parsed(VIN, base + 300, { ChargingState: "Charging", Soc: 53, VehicleSpeed: 0, Gear: "P" }));
+    await applyIngest(env, parsed(VIN, base + 360, { ChargingState: "Charging", Soc: 60, VehicleSpeed: 0, Gear: "P" }));
+    // charge limit reached: still plugged in, no longer charging -> connected
+    await applyIngest(env, parsed(VIN, base + 420, { ChargingState: "Complete", Soc: 80, VehicleSpeed: 0, Gear: "P" }));
+
+    const tl = (await getBatteryTimeline(env, VIN, 24 * 366 * 100)) as any;
+    const stages = tl.points.map((p: any) => p.stage);
+    expect(stages).toEqual(["resting", "resting", "driving", "driving", "resting", "charging", "charging", "connected"]);
+    // stage_hours is rounded to 2dp, so 60s (0.016666h) rounds to 0.02.
+    expect(tl.stage_hours.driving).toBeCloseTo(60 / 3600, 2);
+    expect(tl.stage_hours.charging).toBeCloseTo(60 / 3600, 2);
+    expect(tl.stage_hours.resting).toBeCloseTo(60 / 3600, 2); // only the first resting segment has 2 samples
+    // Last point is still open (no later sample), so it contributes no duration yet.
+    expect(tl.stage_hours.connected).toBe(0);
+    expect(tl.segments.length).toBe(5); // resting, driving, resting, charging, connected
+  });
+
+  it("downsamples points but keeps segments computed from the full series", async () => {
+    const env = makeEnv();
+    const base = 1_700_050_000;
+    for (let i = 0; i < 50; i++) {
+      await applyIngest(env, parsed(VIN, base + i * 10, { Gear: "P", VehicleSpeed: 0, Soc: 60 + i * 0.1, ChargingState: "Disconnected" }));
+    }
+    const tl = (await getBatteryTimeline(env, VIN, 24 * 366 * 100)) as any;
+    expect(tl.points.length).toBeLessThanOrEqual(2000);
+    expect(tl.segments.length).toBe(1);
+    expect(tl.segments[0].stage).toBe("resting");
   });
 });
 
