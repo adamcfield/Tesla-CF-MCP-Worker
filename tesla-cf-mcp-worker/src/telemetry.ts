@@ -19,6 +19,7 @@
  *  - surface telemetry errors from /api/1/vehicles/{vin}/fleet_telemetry_errors
  */
 
+import { detectExceededLimit } from "./api";
 import { getOwnerToken } from "./auth";
 import { signTelemetryConfig } from "./fleetjws";
 import { Env, TeslaError, fleetBase } from "./types";
@@ -31,7 +32,9 @@ async function fleetRequest<T>(env: Env, method: string, path: string, body?: un
     body: body === undefined ? undefined : JSON.stringify(body),
   });
   if (!resp.ok) {
-    throw new TeslaError(`Fleet API ${method} ${path} failed (${resp.status})`, resp.status, await resp.text());
+    const text = await resp.text();
+    await detectExceededLimit(env, resp.status, text);
+    throw new TeslaError(`Fleet API ${method} ${path} failed (${resp.status})`, resp.status, text);
   }
   return ((await resp.json()) as { response: T }).response;
 }
