@@ -5,7 +5,7 @@ import { destroyMaps, renderPointMap, renderRouteMap, renderLifetimeMap, createR
 // Bump on every change to this dashboard (UI, features, or the /data/*
 // endpoints it depends on) and add a matching entry to CHANGELOG.md — see
 // the versioning policy in the repo's CLAUDE.md. Shown in the sidebar footer.
-const APP_VERSION = "1.9.0";
+const APP_VERSION = "1.10.0";
 
 const root = document.getElementById("app");
 let shellBound = false; // guards one-time attach of the root click handler + sync timer
@@ -569,6 +569,15 @@ function onRootClick(e) {
   } else if (action === "tf-cat") {
     state.tfCat = t.dataset.cat;
     renderTelemetryFields();
+  } else if (action === "ov-goto-climate") {
+    document.getElementById("tm-ov-climate")?.scrollIntoView({ behavior: "smooth", block: "start" });
+  } else if (action === "driver-other-toggle") {
+    const other = document.getElementById("tm-driver-other");
+    if (other) {
+      const open = other.style.display !== "none";
+      other.style.display = open ? "none" : "inline-flex";
+      if (!open) document.getElementById("tm-driver-input")?.focus();
+    }
   } else if (action === "driver-filter") {
     state.driverFilter = t.dataset.driver;
     renderDrives();
@@ -1318,6 +1327,18 @@ async function renderOverview() {
     } catch { return []; }
   });
 
+  // Cabin climate: inside vs outside over 24h ("is the AC keeping up?").
+  // Both are long-standing position columns, so this works on any worker build.
+  const climate = await cached("ov_climate24", async () => {
+    const grab = async (field) => {
+      try {
+        const pts = await data.series(vin(), field, 24);
+        return pts.filter((p) => typeof p.value === "number").map((p) => [p.ts, p.value]);
+      } catch { return []; }
+    };
+    return { insidePts: await grab("inside_temp"), outsidePts: await grab("outside_temp") };
+  });
+
   const recentFeed = await cached("ov_recent", async () => {
     try {
       const feed = await buildEventFeed(locations, 10);
@@ -1368,10 +1389,10 @@ async function renderOverview() {
             ${chargeLimit != null ? `<div class="tm-progress-mark" style="left:${chargeLimit}%;"></div>` : ""}
           </div>` : ""}
           <div class="tm-grid-metrics" style="grid-template-columns:repeat(auto-fit,minmax(90px,1fr));gap:14px;">
-            <div><div class="tm-readout-label">Inside</div><div class="tm-readout-value">${inside != null ? fmt1(inside) + " °C" : "—"}</div></div>
-            <div><div class="tm-readout-label">Outside</div><div class="tm-readout-value">${outside != null ? fmt1(outside) + " °C" : "—"}</div></div>
-            <div><div class="tm-readout-label">Tyres</div><div class="tm-readout-value">${tyreStatusHtml(tires)}</div></div>
-            <div><div class="tm-readout-label">Status</div><div class="tm-readout-value">${esc(currentStatus || "—")}</div></div>
+            <div class="tm-readout-click" data-action="ov-goto-climate" title="See inside vs outside temperature"><div class="tm-readout-label">Inside</div><div class="tm-readout-value">${inside != null ? fmt1(inside) + " °C" : "—"}</div></div>
+            <div class="tm-readout-click" data-action="ov-goto-climate" title="See inside vs outside temperature"><div class="tm-readout-label">Outside</div><div class="tm-readout-value">${outside != null ? fmt1(outside) + " °C" : "—"}</div></div>
+            <div class="tm-readout-click" data-action="nav" data-screen="st" title="Tyre pressures & trends on Statistics"><div class="tm-readout-label">Tyres</div><div class="tm-readout-value">${tyreStatusHtml(tires)}</div></div>
+            <div class="tm-readout-click" data-action="nav" data-screen="tl" title="Full state timeline"><div class="tm-readout-label">Status</div><div class="tm-readout-value">${esc(currentStatus || "—")}</div></div>
           </div>
         ` : `
           <div class="tm-empty" style="padding:12px 0 4px;">
@@ -1444,6 +1465,26 @@ async function renderOverview() {
         }).join("") : miniEmptyHtml("Nothing recorded yet")}
       </div>
     </div>
+
+    <div class="tm-card tm-card-pad" id="tm-ov-climate">
+      <div class="tm-card-head">
+        <div class="tm-card-head-title">Cabin climate</div>
+        <div class="tm-card-head-sub">inside vs outside · last 24h</div>
+      </div>
+      ${(climate.insidePts.length > 1 || climate.outsidePts.length > 1) ? svgLineChart({
+        series: [
+          { points: climate.outsidePts, color: "var(--faint)", dashed: true },
+          { points: climate.insidePts, color: "var(--accent)", width: 2.2 },
+        ].filter((s) => s.points.length > 1),
+        yTicks: autoTicks([...climate.insidePts, ...climate.outsidePts].map((p) => p[1]), 4),
+        xTicks: buildDayTicks(climate.insidePts.length > 1 ? climate.insidePts : climate.outsidePts),
+      }) : miniEmptyHtml("No cabin temperature samples in the last 24h")}
+      <div class="tm-flex-row" style="gap:16px;margin-top:10px;font-size:12px;color:var(--sub);">
+        <span style="display:flex;align-items:center;gap:6px;"><span style="width:14px;height:2px;background:var(--accent);flex:none;"></span>Inside</span>
+        <span style="display:flex;align-items:center;gap:6px;"><span style="width:14px;border-top:2px dashed var(--faint);flex:none;"></span>Outside</span>
+      </div>
+      ${climateVerdictHtml(latest, inside, outside)}
+    </div>
   `);
 
   updateSideBudget(summary?.api_budget);
@@ -1451,6 +1492,34 @@ async function renderOverview() {
   if (lat != null && lon != null) {
     requestAnimationFrame(() => renderPointMap(document.getElementById("tm-ov-map"), lat, lon, esc(nearestLoc?.name || currentAddress || "Current location")));
   }
+}
+
+/**
+ * One-line answer to "is the AC keeping the cabin in check?" from the latest
+ * merged state: AC on/off (hvac_ac_on may arrive as boolean, 0/1, or "true"
+ * depending on the ingest path), Climate Keeper mode, and the inside-vs-
+ * outside delta. Warn when the cabin is cooking with nothing running.
+ */
+function climateVerdictHtml(latest, inside, outside) {
+  const truthy = (v) => v === true || v === 1 || String(v).toLowerCase() === "true";
+  if (inside == null || outside == null) return "";
+  const acOn = truthy(latest?.hvac_ac_on) || truthy(latest?.hvac_power);
+  const keeper = latest?.climate_keeper_mode ? String(latest.climate_keeper_mode) : null;
+  const keeperOn = keeper && !/off|unknown/i.test(keeper);
+  const delta = inside - outside;
+  let text, warn = false;
+  if (acOn && delta <= 1) {
+    text = `AC is on and holding — cabin ${fmt1(inside)}°C vs ${fmt1(outside)}°C outside.`;
+  } else if (acOn) {
+    text = `AC is on but the cabin is still ${fmt1(delta)}°C above outside — likely just started, or fighting heavy sun load.`;
+    warn = delta > 4;
+  } else if (delta > 3) {
+    text = `AC is off and the cabin is ${fmt1(delta)}°C hotter than outside${keeperOn ? ` (Climate Keeper: ${keeper})` : ""} — heat is building up.`;
+    warn = true;
+  } else {
+    text = `AC is off — cabin is tracking the outside temperature${keeperOn ? ` (Climate Keeper: ${keeper})` : ""}.`;
+  }
+  return `<div class="tm-stat-note" style="margin-top:8px;${warn ? "color:var(--warn);" : ""}">${esc(text)}</div>`;
 }
 
 function buildDayTicks(points) {
@@ -1996,20 +2065,28 @@ async function renderDriveDetail() {
       ${synthetic ? syntheticBadgeHtml() : ""}
       <div class="tm-flex-row" style="margin-left:auto;gap:6px;">
         <a class="tm-chip-btn" style="padding:5px 12px;" href="${esc(exportUrl("/data/export/drive.gpx", { id: d.id }))}" target="_blank" rel="noopener" download>&#11015; GPX</a>
-        <span style="font-size:12px;color:var(--sub);">Driver:</span>
-        <input id="tm-driver-input" list="tm-driver-names-detail" class="tm-gate-input" style="width:140px;padding:5px 9px;font-family:var(--ui);" placeholder="${esc(d.suggested_driver ? `${d.suggested_driver}?` : "unassigned")}" value="${esc(d.driver || "")}" autocomplete="off">
-        <button class="tm-chip-btn" style="padding:5px 12px;" data-action="save-driver" data-id="${d.id}">Save</button>
       </div>
     </div>
     ${(() => {
-      const quickNames = [...new Set(roster.map(rosterName).filter(Boolean))].sort((a, b) => a.localeCompare(b)).filter((n) => n !== (d.driver || ""));
-      return quickNames.length ? `<div class="tm-flex-row" style="gap:8px;align-items:baseline;flex-wrap:wrap;">
-        <span style="font-size:12px;color:var(--sub);">${d.driver ? "Not right? Reassign to:" : "Or assign to:"}</span>
-        <div class="tm-quick-assign" style="margin-top:0;">${quickNames.map((n) => `<button type="button" class="tm-quick-chip" data-action="quick-assign" data-id="${d.id}" data-driver="${esc(n)}">${esc(n)}</button>`).join("")}</div>
-      </div>` : "";
+      // ONE driver control (was three: a header input+Save, a reassign-chip
+      // row, and a Household hint — issue #24). The roster chips ARE the
+      // API-derived household list; the current driver renders active; a
+      // suggested driver gets a "?" chip to confirm in one tap; "other…"
+      // reveals the free-text input for a name not on the roster.
+      const names = [...new Set([...roster.map(rosterName), d.driver].filter(Boolean))].sort((a, b) => a.localeCompare(b));
+      return `<div class="tm-flex-row" style="gap:8px;align-items:center;flex-wrap:wrap;">
+        <span style="font-size:12px;color:var(--sub);">Driver:</span>
+        <div class="tm-quick-assign" style="margin-top:0;">
+          ${names.map((n) => `<button type="button" class="tm-quick-chip ${n === d.driver ? "active" : ""}" data-action="quick-assign" data-id="${d.id}" data-driver="${esc(n)}" ${n === d.driver ? 'title="Currently assigned"' : ""}>${esc(n)}${!d.driver && n === d.suggested_driver ? "?" : ""}</button>`).join("")}
+        </div>
+        <button type="button" class="tm-link-btn" data-action="driver-other-toggle" style="font-size:12px;">other…</button>
+        <span id="tm-driver-other" style="display:none;gap:6px;align-items:center;">
+          <input id="tm-driver-input" list="tm-driver-names-detail" class="tm-gate-input" style="width:140px;padding:5px 9px;font-family:var(--ui);" placeholder="name…" value="${esc(d.driver || "")}" autocomplete="off">
+          <button class="tm-chip-btn" style="padding:5px 12px;" data-action="save-driver" data-id="${d.id}">Save</button>
+        </span>
+      </div>
+      <div style="font-size:12px;color:var(--faint);">${!d.driver && d.suggested_driver ? `Looks like <span class="tm-driver-suggested">${esc(d.suggested_driver)}</span> drove this — tap their name to confirm. ` : ""}${esc(DRIVER_MANUAL_NOTE)}</div>`;
     })()}
-    ${rosterHintHtml(roster)}
-    <div style="font-size:12px;color:var(--faint);">${esc(DRIVER_MANUAL_NOTE)}${!d.driver && d.suggested_driver ? ` Looks like <span class="tm-driver-suggested">${esc(d.suggested_driver)}</span> drove this — pick a name and Save to confirm.` : ""}</div>
 
     <div class="tm-grid-2-wide">
       <div class="tm-drive-livegrid">

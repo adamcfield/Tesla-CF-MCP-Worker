@@ -166,6 +166,8 @@ body {
 
 .tm-readout-label { font-size: 11px; color: var(--faint); text-transform: uppercase; letter-spacing: 0.07em; font-weight: 600; }
 .tm-readout-value { font-size: 15px; font-weight: 600; margin-top: 4px; font-family: var(--mono); }
+.tm-readout-click { cursor: pointer; border-radius: 8px; margin: -4px; padding: 4px; }
+.tm-readout-click:hover { background: var(--chip); }
 
 /* ---------- battery timeline stage strip ---------- */
 .tm-stage-strip { position: relative; height: 8px; border-radius: 4px; overflow: hidden; background: var(--chip); margin-top: 6px; }
@@ -281,6 +283,7 @@ body {
   background: var(--chip); color: var(--sub); cursor: pointer; font-family: var(--ui);
 }
 .tm-quick-chip:hover { background: color-mix(in oklab, var(--accent) 16%, var(--chip)); color: var(--text); }
+.tm-quick-chip.active { background: var(--accent); color: #fff; }
 
 /* ---------- toggleable driver-tag chips (which driver(s) a place belongs to) ---------- */
 .tm-driver-tags { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0; }

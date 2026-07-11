@@ -9,6 +9,40 @@ feature or screen, the **patch** version for fixes/tweaks/copy changes, and the
 configured. See `CLAUDE.md` at the repo root for the policy on keeping this file
 and `APP_VERSION` (in `app.js`) in sync.
 
+## 1.10.0 — 2026-07-11
+
+New "Cabin climate" card on Overview — asked as "it's very hot outside, can
+we tell if the AC is working to keep the interior temp in check?".
+
+- A 24-hour inside-vs-outside temperature chart (solid = inside, dashed =
+  outside), so you can see at a glance whether the cabin is being held
+  below ambient (AC winning) or soaring above it (parked in the sun,
+  nothing running).
+- A one-line verdict underneath from the latest telemetry: AC on and
+  holding / on but still catching up / off while the cabin heats up
+  (with the Climate Keeper mode when it's active) — warning color when
+  the cabin is cooking.
+- The Inside/Outside readouts at the top of Overview click through to
+  this card.
+
+## 1.9.2 — 2026-07-11
+
+Overview readouts are now click-through: Tyres (including when it shows a
+pressure warning) opens the Statistics screen's TPMS card, Status opens the
+state Timeline, and Inside/Outside jump to the new cabin-climate section —
+so an issue you can see is one click from the screen that explains it.
+
+## 1.9.1 — 2026-07-11
+
+**#24**: the drive-detail page showed the driver in three separate spots (a
+header input + Save, a "Not right? Reassign to:" chip row, and a Household
+hint row). Consolidated to ONE control: a single "Driver:" chip row built
+from the Tesla-account roster — the assigned driver is highlighted, a
+system-suggested driver shows with a "?" for one-tap confirmation, and an
+"other…" link reveals the free-text input for names not on the roster. The
+system still finds the driver on its own when it's confident (unchanged
+auto-assignment), so usually there's nothing to do here at all.
+
 ## 1.9.0 — 2026-07-11
 
 New "Telemetry fields" screen (Data section in the sidebar): every attribute
