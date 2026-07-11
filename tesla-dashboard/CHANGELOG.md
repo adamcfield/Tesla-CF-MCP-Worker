@@ -9,6 +9,15 @@ feature or screen, the **patch** version for fixes/tweaks/copy changes, and the
 configured. See `CLAUDE.md` at the repo root for the policy on keeping this file
 and `APP_VERSION` (in `app.js`) in sync.
 
+## 1.14.1 — 2026-07-12
+
+Fix: no way to rename a place — 1.14.0 shipped an address editor but
+missed the name itself, the more obvious thing to want to correct.
+
+- Places list and place-detail header both get a ✎ next to the name —
+  inline rename, same pattern as the address editor (Enter/blur to save,
+  Escape to cancel, blank input reverts since a name is required).
+
 ## 1.14.0 — 2026-07-12
 
 Places grew up: addresses you can correct, usage stats, and a full

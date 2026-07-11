@@ -5,7 +5,7 @@ import { destroyMaps, renderPointMap, renderRouteMap, renderLifetimeMap, createR
 // Bump on every change to this dashboard (UI, features, or the /data/*
 // endpoints it depends on) and add a matching entry to CHANGELOG.md — see
 // the versioning policy in the repo's CLAUDE.md. Shown in the sidebar footer.
-const APP_VERSION = "1.14.0";
+const APP_VERSION = "1.14.1";
 
 const root = document.getElementById("app");
 let shellBound = false; // guards one-time attach of the root click handler + sync timer
@@ -622,6 +622,17 @@ function onRootClick(e) {
   } else if (action === "edit-place-address") {
     const cell = t.closest(".tm-place-address");
     if (cell && !cell.querySelector("input")) beginPlaceAddressEdit(cell, Number(t.dataset.id));
+  } else if (action === "edit-place-name") {
+    const cell = t.closest(".tm-place-name");
+    if (!cell || cell.querySelector("input")) { /* no-op */ }
+    else if (state.openPlaceId != null) {
+      // Detail-page header: renderPlaceDetail stashed its loaded location here.
+      const loc = state.cache.current_place;
+      if (loc && loc.id === state.openPlaceId) beginPlaceNameEdit(cell, loc, () => renderPlaceDetail());
+    } else {
+      const loc = (state.cache.locations || []).find((l) => l.id === Number(t.dataset.id));
+      if (loc) beginPlaceNameEdit(cell, loc, () => renderPlaces());
+    }
   } else if (action === "back-places") {
     state.openPlaceId = null;
     state.editingPlaceTags = false;
@@ -2640,9 +2651,12 @@ async function renderPlaces() {
         </div>
         ${locations.map((l) => `
           <div class="tm-table-row" data-action="open-place" data-id="${l.id}" style="grid-template-columns:1fr 1.4fr 64px 130px 130px 64px;">
-            <div style="min-width:0;">
-              <div class="tm-ellipsis" style="font-size:13.5px;font-weight:500;">${esc(l.name)}</div>
-              ${l.drivers?.length ? `<div style="margin-top:4px;">${l.drivers.map((d) => `<span class="tm-place-tag" style="margin-right:4px;">${esc(d)}</span>`).join("")}</div>` : ""}
+            <div class="tm-place-name" style="min-width:0;display:flex;align-items:center;gap:6px;">
+              <div style="min-width:0;">
+                <div class="tm-ellipsis" style="font-size:13.5px;font-weight:500;">${esc(l.name)}</div>
+                ${l.drivers?.length ? `<div style="margin-top:4px;">${l.drivers.map((d) => `<span class="tm-place-tag" style="margin-right:4px;">${esc(d)}</span>`).join("")}</div>` : ""}
+              </div>
+              <button type="button" class="tm-link-btn" data-action="edit-place-name" data-id="${l.id}" title="Rename">✎</button>
             </div>
             <div class="tm-place-address" style="min-width:0;display:flex;align-items:center;gap:6px;">
               <span class="tm-ellipsis" style="font-size:12.5px;color:var(--sub);">${l.address ? esc(l.address) : `<span style="color:var(--faint);">no address yet</span>`}</span>
@@ -2653,10 +2667,38 @@ async function renderPlaces() {
             <div class="tm-right tm-mono" style="color:var(--sub);font-size:12px;">${l.last_visit_ts ? esc(fmtDateTime(l.last_visit_ts)) : "—"}</div>
             <div class="tm-right tm-mono" style="color:var(--sub);">${l.radius_m != null ? fmt0(l.radius_m) + " m" : "—"}</div>
           </div>`).join("")}
-        <div class="tm-foot-note">${locations.length} saved place${locations.length === 1 ? "" : "s"} · click one for its full history. Addresses come from the geocoder — click ✎ to correct one.</div>
+        <div class="tm-foot-note">${locations.length} saved place${locations.length === 1 ? "" : "s"} · click one for its full history, or ✎ to rename/correct its address.</div>
       </div>
     </div>` : emptyHtml("No saved places yet", suggestionCount ? "Add one of the frequent stops the car's already visited, or search an address." : "Add a place by address, or wait for a frequent-stop suggestion once a spot's been visited a few times.")}
   `);
+}
+
+/** Inline name (rename) editor — used on both the Places list and the place
+ * detail header. Name is required, so a blank/whitespace entry just reverts.
+ * `refresh` is called after a successful save (invalidating whatever cache
+ * the caller owns and re-rendering its own screen). */
+function beginPlaceNameEdit(cell, loc, refresh) {
+  const current = loc.name;
+  cell.innerHTML = `<input class="tm-driver-edit" style="width:100%;font-weight:500;" value="${esc(current)}" placeholder="place name…" maxlength="120" autocomplete="off">`;
+  const input = cell.querySelector("input");
+  input.focus();
+  input.select();
+  let done = false;
+  const finish = (save) => {
+    if (done) return;
+    done = true;
+    const v = input.value.trim();
+    if (!save || !v || v === current) { refresh(); return; }
+    cell.innerHTML = `<span style="color:var(--faint);">saving…</span>`;
+    data.saveLocation({ id: loc.id, name: v, lat: loc.lat, lon: loc.lon, radius_m: loc.radius_m })
+      .then(() => { state.cache.locations = null; refresh(); })
+      .catch(() => { cell.innerHTML = `<span style="color:var(--bad);">failed</span>`; });
+  };
+  input.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") finish(true);
+    else if (e.key === "Escape") finish(false);
+  });
+  input.addEventListener("blur", () => finish(true));
 }
 
 /** Inline address editor on the Places list (mirrors beginDriverEdit). */
@@ -2698,6 +2740,7 @@ async function renderPlaceDetail() {
       ${errorHtml(stats?.error || "Couldn't load this location")}`);
   }
   const l = stats.location;
+  state.cache.current_place = l; // lets edit-place-name find this place's row/lat/lon
   // Location stats carry no currency of their own — borrow the dominant one
   // from any already-loaded charge sessions (falls back to € in money()).
   const cur = dominantCurrency(state.cache.all_charges || []);
@@ -2705,9 +2748,12 @@ async function renderPlaceDetail() {
   const names = [...new Set(roster.map(rosterName).filter(Boolean))].sort((a, b) => a.localeCompare(b));
 
   setContent(`
-    <div class="tm-flex-row" style="gap:14px;flex-wrap:wrap;">
+    <div class="tm-flex-row" style="gap:14px;flex-wrap:wrap;align-items:center;">
       <button class="tm-back-btn" data-action="back-places">← Places</button>
-      <div style="font-size:15px;font-weight:600;">${esc(l.name)}</div>
+      <div class="tm-place-name" style="display:flex;align-items:center;gap:6px;">
+        <div style="font-size:15px;font-weight:600;">${esc(l.name)}</div>
+        <button type="button" class="tm-link-btn" data-action="edit-place-name" data-id="${l.id}" title="Rename">✎</button>
+      </div>
       <div style="font-size:12.5px;color:var(--faint);">${fmt1(l.lat)}, ${fmt1(l.lon)} · ${l.radius_m != null ? fmt0(l.radius_m) + " m radius" : ""}</div>
     </div>
     ${l.address ? `<div style="font-size:12.5px;color:var(--sub);margin-top:4px;">${esc(l.address)} <span style="color:var(--faint);">· edit on the Places list</span></div>` : ""}
