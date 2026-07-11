@@ -9,6 +9,18 @@ feature or screen, the **patch** version for fixes/tweaks/copy changes, and the
 configured. See `CLAUDE.md` at the repo root for the policy on keeping this file
 and `APP_VERSION` (in `app.js`) in sync.
 
+## 1.13.1 — 2026-07-11
+
+Media Now-Playing honesty + driver-page deep links.
+
+- **Now Playing card**: when the car reports active playback but the app
+  doesn't expose track names (YouTube Music sends blank title/artist until
+  a track change), the card now shows "▶ Playing · <source>" with a note —
+  instead of claiming "Nothing playing right now".
+- **Driver detail page**: now history/deep-link aware — `#dv/<name>` in the
+  URL, so browser back/forward and bookmarks land on the right driver
+  (follow-up to 1.13.0, which didn't encode the open driver in the hash).
+
 ## 1.13.0 — 2026-07-11
 
 **#39**: clicking a driver card on the Drivers screen now opens that
@@ -16,6 +28,19 @@ driver's detail page — their stats (avg/top speed, speeding %, night %,
 braking), a map of their recent routes, and their drives list (each row
 opens the full drive detail). Quick-assign and auto-assignment are
 unchanged; this is the read side.
+
+## 1.12.1 — 2026-07-11
+
+Budget display split: percentages in the chrome, dollars on the API screen.
+
+- **Sidebar API widget**: now shows **% of the poll cap used** (e.g. `77%`)
+  instead of dollar figures; the compact month-end forecast line speaks in
+  % of the cap too. Clicking through to the API screen is unchanged.
+- **API screen**: keeps (and remains the only place for) actual dollar
+  figures — month spend, cap, per-day/per-kind call costs.
+- Pairs with the worker-side poll-budget raise `$7 → $9.50`
+  (`BUDGET_POLL_USD` in wrangler.toml; hard ceiling stays $9.70).
+>>>>>>> main
 
 ## 1.12.0 — 2026-07-11
 

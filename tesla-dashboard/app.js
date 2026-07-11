@@ -5,7 +5,7 @@ import { destroyMaps, renderPointMap, renderRouteMap, renderLifetimeMap, createR
 // Bump on every change to this dashboard (UI, features, or the /data/*
 // endpoints it depends on) and add a matching entry to CHANGELOG.md — see
 // the versioning policy in the repo's CLAUDE.md. Shown in the sidebar footer.
-const APP_VERSION = "1.13.0";
+const APP_VERSION = "1.13.1";
 
 const root = document.getElementById("app");
 let shellBound = false; // guards one-time attach of the root click handler + sync timer
@@ -305,16 +305,19 @@ function hashToState(hash) {
   if (!raw) return null;
   const [screen, idStr] = raw.split("/");
   if (!TITLES[screen]) return null;
+  // "dv" carries a driver NAME (URI-encoded string); the others carry numeric ids.
+  if (screen === "dv") return { screen, id: null, name: idStr ? decodeURIComponent(idStr) : null };
   const id = idStr ? Number(idStr) : null;
-  return { screen, id: Number.isFinite(id) ? id : null };
+  return { screen, id: Number.isFinite(id) ? id : null, name: null };
 }
 function stateToHash() {
   if (state.screen === "dr" && state.openDriveId != null) return `#dr/${state.openDriveId}`;
   if (state.screen === "ch" && state.openChargeId != null) return `#ch/${state.openChargeId}`;
   if (state.screen === "pl" && state.openPlaceId != null) return `#pl/${state.openPlaceId}`;
+  if (state.screen === "dv" && state.openDriverName != null) return `#dv/${encodeURIComponent(state.openDriverName)}`;
   return `#${state.screen}`;
 }
-/** Call after any change to state.screen/openDriveId/openChargeId/openPlaceId. */
+/** Call after any change to state.screen/openDriveId/openChargeId/openPlaceId/openDriverName. */
 function pushHistory() {
   const hash = stateToHash();
   if (location.hash !== hash) { try { history.pushState(null, "", hash); } catch { /* sandboxed */ } }
@@ -327,6 +330,7 @@ function applyHashToState() {
   state.openDriveId = parsed.screen === "dr" ? parsed.id : null;
   state.openChargeId = parsed.screen === "ch" ? parsed.id : null;
   state.openPlaceId = parsed.screen === "pl" ? parsed.id : null;
+  state.openDriverName = parsed.screen === "dv" ? parsed.name : null;
   return true;
 }
 
@@ -724,6 +728,7 @@ function onRootClick(e) {
     renderDrivers();
   } else if (action === "back-drivers") {
     state.openDriverName = null;
+    pushHistory();
     renderDrivers();
   } else if (action === "open-drive") {
     // Opening a drive is a navigation into the Drives section — keep the left-nav
@@ -971,36 +976,47 @@ async function loadLiveVehicleData() {
   await renderOverview();
 }
 
-/** Month-end forecast line shared by budgetCard() and sideBudgetHtml(). */
+/** Month-end forecast line shared by the API screen and sideBudgetHtml().
+ * Dollar figures appear ONLY in the non-compact (API screen) variant; the
+ * compact sidebar variant speaks in % of the poll cap. */
 function budgetForecastNote(b, compact) {
   const f = b.forecast;
   if (!f || f.method === "insufficient_data") return "";
   const overBudget = f.projected_over_budget === true;
   const warn = overBudget || f.budget_exhausted_in_days != null;
+  const projPct = b.poll_budget_usd > 0 && f.projected_month_usd != null
+    ? (f.projected_month_usd / b.poll_budget_usd) * 100 : null;
   const text = f.budget_exhausted_in_days != null
     ? `At this rate, runs out in ~${fmt1(f.budget_exhausted_in_days)} day${f.budget_exhausted_in_days === 1 ? "" : "s"} — before month-end`
     : overBudget
-      ? `Projected ≈ $${fmt2(f.projected_month_usd)} by month-end — over the $${fmt0(b.poll_budget_usd)} cap`
-      : `On track — projected ≈ $${fmt2(f.projected_month_usd)} by month-end`;
+      ? (compact && projPct != null
+        ? `Projected ≈ ${fmt0(projPct)}% of the cap by month-end`
+        : `Projected ≈ $${fmt2(f.projected_month_usd)} by month-end — over the $${fmt2(b.poll_budget_usd)} cap`)
+      : (compact && projPct != null
+        ? `On track — ≈ ${fmt0(projPct)}% of the cap by month-end`
+        : `On track — projected ≈ $${fmt2(f.projected_month_usd)} by month-end`);
   return compact
     ? `<div style="font-size:10.5px;color:${warn ? "var(--warn)" : "var(--faint)"};margin-top:3px;">${esc(text)}</div>`
     : `<div class="tm-stat-note" style="${warn ? "color:var(--warn);" : ""}">${esc(text)}</div>`;
 }
 
-/** Compact Tesla API spend for the sidebar (calls + $ spend + a one-line forecast, above the theme toggle). */
+/** Compact Tesla API spend for the sidebar (calls + % of the poll cap + a
+ * one-line forecast, above the theme toggle). Percentage ONLY by design —
+ * actual dollar figures live on the API screen (click through for them). */
 function sideBudgetHtml(b) {
   if (!b || typeof b !== "object") return "";
   const cap = b.poll_budget_usd > 0 ? b.poll_budget_usd : null;
-  const pct = cap ? Math.min(100, (b.spent_usd / cap) * 100) : 0;
+  const pctTrue = cap ? (b.spent_usd / cap) * 100 : null;
+  const pctBar = pctTrue != null ? Math.min(100, pctTrue) : 0;
   const atRisk = b.poll_allowed === false || b.forecast?.projected_over_budget === true || b.forecast?.budget_exhausted_in_days != null;
   const color = atRisk ? "var(--warn)" : "var(--good)";
   const calls = [b.reads, b.billed_reads, b.count, b.calls].find((v) => typeof v === "number");
   return `
     <div class="tm-sidebudget-top">
       <span>Tesla API${calls != null ? ` · ${fmt0(calls)} calls` : ""}</span>
-      <span class="tm-mono">$${fmt2(b.spent_usd)}${cap ? ` <span style="color:var(--faint);">/ ${fmt0(cap)}</span>` : ""}</span>
+      <span class="tm-mono">${pctTrue != null ? `${fmt0(pctTrue)}<span style="color:var(--faint);">%</span>` : "—"}</span>
     </div>
-    ${cap ? `<div class="tm-sidebudget-bar"><div style="width:${pct.toFixed(1)}%;background:${color};"></div></div>` : ""}
+    ${cap ? `<div class="tm-sidebudget-bar"><div style="width:${pctBar.toFixed(1)}%;background:${color};"></div></div>` : ""}
     ${budgetForecastNote(b, true)}`;
 }
 function updateSideBudget(b) {
@@ -2757,14 +2773,30 @@ function nowPlayingCard(latest) {
   const title = latest?.media_title, artist = latest?.media_artist, album = latest?.media_album;
   const station = latest?.media_station, source = latest?.media_source, status = latest?.media_status;
   const volume = latest?.media_volume;
+  const playing = typeof status === "string" && /playing/i.test(status);
   if (!title && !station) {
+    // Blank metadata but the car says something IS playing (some apps — e.g.
+    // YouTube Music — don't report NowPlaying names until a track change):
+    // be honest about the playback instead of claiming silence.
+    if (playing && source) {
+      return `<div class="tm-card tm-card-pad-lg tm-flex-row" style="gap:16px;align-items:center;">
+        <div class="tm-media-cover tm-media-cover-lg">♪</div>
+        <div style="min-width:0;flex:1;">
+          <div class="tm-flex-row" style="gap:8px;">
+            <span class="tm-pill tm-pill-good">▶ Playing</span>
+            <span class="tm-pill tm-pill-chip">${esc(source)}</span>
+          </div>
+          <div style="font-size:13px;color:var(--sub);margin-top:8px;">Track name not reported by this app — names usually appear on the next track change.</div>
+        </div>
+        ${volume != null ? `<div style="text-align:right;flex:none;"><div class="tm-readout-label">Volume</div><div class="tm-readout-value">${fmt0(volume)}</div></div>` : ""}
+      </div>`;
+    }
     return `<div class="tm-card tm-card-pad-lg"><div class="tm-empty" style="padding:10px 0;">
       <div class="tm-empty-icon">♪</div>
       <div class="tm-empty-title">Nothing playing right now</div>
       <div>Shows up here the moment the car streams a Media* field and something's on.</div>
     </div></div>`;
   }
-  const playing = typeof status === "string" && /playing/i.test(status);
   // Tesla reports a fixed 18,000,000 ms (5h) sentinel for radio/stations with
   // no real track length — a progress bar for that is meaningless, so only
   // show one for an actual, bounded track duration.

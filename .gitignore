@@ -10,3 +10,5 @@ tsc*.log
 # Design source (large binary, kept locally only)
 TeslaMate UI redesign.zip
 HANDOFF.md
+# Local secrets — the repo is PUBLIC; this file must never be committed
+SECRETS.md
