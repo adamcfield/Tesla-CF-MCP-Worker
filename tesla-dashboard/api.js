@@ -150,6 +150,8 @@ export const data = {
   vampire: (vin, days) => getJson("/data/vampire", { vin, days }),
   states: (vin, hours) => getJson("/data/states", { vin, hours }),
   batteryTimeline: (vin, hours) => getJson("/data/battery-timeline", { vin, hours }),
+  /** Live status per mapped Tesla telemetry field (canonical key, latest value, last-seen). New endpoint — may 404. */
+  telemetryFields: (vin) => getJson("/data/telemetry-fields", { vin }),
   locations: () => getJson("/data/locations"),
   locationStats: (id) => getJson("/data/location-stats", { id }),
   /** Forward-geocode an address to candidate {label, lat, lon, source} hits (GovMap, falling back to Nominatim). */

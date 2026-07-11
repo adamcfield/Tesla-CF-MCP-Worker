@@ -9,6 +9,24 @@ feature or screen, the **patch** version for fixes/tweaks/copy changes, and the
 configured. See `CLAUDE.md` at the repo root for the policy on keeping this file
 and `APP_VERSION` (in `app.js`) in sync.
 
+## 1.9.0 — 2026-07-11
+
+New "Telemetry fields" screen (Data section in the sidebar): every attribute
+from Tesla's fleet_streaming_fields reference (239 fields, vendored as a CSV
+into the dashboard) in a scrollable spreadsheet-style table — field name,
+category, the latest value this car actually sent, when it was last seen,
+and the official description. Filter by category chips or free-text search.
+Dimmed rows are fields the worker deliberately doesn't record (powertrain
+diagnostics, Semi-truck-only, static config). Built to answer "what is
+actually coming in, and what could I do with it".
+
+- Backend: new `GET /data/telemetry-fields?vin=` route
+  (`getTelemetryFieldStatus` in `ingest.ts`, which owns the field mapping) —
+  joins `FIELD_MAP` against the latest-state doc and per-field last-seen
+  timestamps (one indexed GROUP BY over `telemetry_events`).
+- Also added the missing page titles for this screen and the 1.8.0 Battery
+  timeline screen (it shipped without a header title).
+
 ## 1.8.0 — 2026-07-11
 
 **#23**: new Battery timeline screen — a stock-chart-style SoC line over a

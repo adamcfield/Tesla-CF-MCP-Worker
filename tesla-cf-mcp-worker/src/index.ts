@@ -56,7 +56,7 @@ import { getBatteryForecast, predictRange } from "./forecast";
 import { findSimilarDrives } from "./twin";
 import { handleGeocode, handleGovTile, probeGovmap } from "./govmap";
 import { reverseGeocode } from "./geocode";
-import { handleIngest } from "./ingest";
+import { getTelemetryFieldStatus, handleIngest } from "./ingest";
 import { handleMcp, SERVER_VERSION } from "./mcp";
 import { pollOnce } from "./poll";
 import { loadCommandKey } from "./protocol";
@@ -282,6 +282,8 @@ async function handleData(url: URL, env: Env): Promise<Response> {
       return json(await getBatteryDegradation(env, vin));
     case "/data/battery-timeline":
       return json(await getBatteryTimeline(env, vin, numParam("hours", 24)));
+    case "/data/telemetry-fields":
+      return json(await getTelemetryFieldStatus(env, vin));
     case "/data/vampire":
       return json(await getVampireDrain(env, vin, numParam("days", 30)));
     case "/data/states":

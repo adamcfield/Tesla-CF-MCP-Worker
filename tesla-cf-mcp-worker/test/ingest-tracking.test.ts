@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { applyIngest, handleIngest } from "../src/ingest";
+import { applyIngest, getTelemetryFieldStatus, handleIngest } from "../src/ingest";
 import { getLatest, querySeries, resetSchemaCacheForTests } from "../src/store";
 import { getDrives, getStateTimeline, getChargeSessions, getBatteryTimeline } from "../src/tracking";
 import { FakeD1 } from "./helpers/d1";
@@ -221,3 +221,29 @@ function req(body: unknown): Request {
     body: JSON.stringify(body),
   });
 }
+
+describe("telemetry field status", () => {
+  it("reports value + last-seen for mapped fields, null for never-seen ones", async () => {
+    const env = makeEnv();
+    const base = 1_700_060_000;
+    await applyIngest(env, parsed(VIN, base, { Soc: 72, Gear: "P", VehicleSpeed: 0, SentryMode: true }));
+
+    const res = (await getTelemetryFieldStatus(env, VIN)) as any;
+    const byTesla = new Map(res.fields.map((f: any) => [f.tesla, f]));
+
+    const soc = byTesla.get("Soc") as any;
+    expect(soc.canonical).toBe("soc");
+    expect(soc.value).toBe(72);
+    expect(soc.last_seen).toBe(base); // position-column field -> latest positions row ts
+
+    const sentry = byTesla.get("SentryMode") as any;
+    expect(sentry.value).not.toBeNull(); // EAV field, normalized at ingest
+    expect(sentry.last_seen).toBe(base);
+
+    // Mapped but never streamed on this car -> null value, null last_seen.
+    const acIn = byTesla.get("ACChargingEnergyIn") as any;
+    expect(acIn).toBeDefined();
+    expect(acIn.value).toBeNull();
+    expect(acIn.last_seen).toBeNull();
+  });
+});

@@ -5,7 +5,7 @@ import { destroyMaps, renderPointMap, renderRouteMap, renderLifetimeMap, createR
 // Bump on every change to this dashboard (UI, features, or the /data/*
 // endpoints it depends on) and add a matching entry to CHANGELOG.md — see
 // the versioning policy in the repo's CLAUDE.md. Shown in the sidebar footer.
-const APP_VERSION = "1.8.0";
+const APP_VERSION = "1.9.0";
 
 const root = document.getElementById("app");
 let shellBound = false; // guards one-time attach of the root click handler + sync timer
@@ -192,6 +192,8 @@ const state = {
   vehicleData: null, // last on-demand get_vehicle_data snapshot
   driveFilter: 1, // 0=7d, 1=30d, 2=all
   batteryTimelineRange: 0, // index into BATTERY_TIMELINE_RANGES (Battery timeline screen)
+  tfCat: "__all", // Telemetry-fields screen: active category chip
+  tfQuery: "", // Telemetry-fields screen: search text
   driverFilter: "__all", // "__all" | "__none" (unassigned) | driver name
   mediaDriverFilter: null, // selected driver chip on the Media screen's per-driver breakdown
   openDriveId: null,
@@ -215,6 +217,7 @@ const NAV = [
   { label: "Media", items: [["md", "♪ Media"]] },
   { label: "Charging", items: [["ch", "Charges"], ["cs", "Charging stats"]] },
   { label: "Battery", items: [["bh", "Battery health"], ["pr", "Predictions"], ["vd", "Vampire drain"]] },
+  { label: "Data", items: [["tf", "Telemetry fields"]] },
 ];
 
 const TITLES = {
@@ -232,6 +235,8 @@ const TITLES = {
   bh: ["Battery health", ""],
   pr: ["Predictions", "battery forecast & range predictor"],
   vd: ["Vampire drain", "standby losses"],
+  bt: ["Battery timeline", "state of charge over time, with stages"],
+  tf: ["Telemetry fields", "every attribute Tesla can stream, and what this car is sending"],
   api: ["API usage", "Tesla Fleet API call log & cost — click the sidebar widget to get here"],
   cl: ["Changelog", "what's shipped, version by version — click the version number to get here"],
 };
@@ -561,6 +566,9 @@ function onRootClick(e) {
   } else if (action === "battery-timeline-range") {
     state.batteryTimelineRange = Number(t.dataset.range);
     renderBatteryTimeline();
+  } else if (action === "tf-cat") {
+    state.tfCat = t.dataset.cat;
+    renderTelemetryFields();
   } else if (action === "driver-filter") {
     state.driverFilter = t.dataset.driver;
     renderDrives();
@@ -818,6 +826,8 @@ function skeletonHtml(screen) {
       return `<div class="tm-grid-3col"><div class="tm-card tm-card-pad-lg" style="display:flex;align-items:center;justify-content:center;">${skel("height:132px;width:132px;border-radius:50%;")}</div>${metric.repeat(2)}</div>${chart}`;
     case "bt":
       return `<div class="tm-flex-row" style="gap:8px;">${skel("height:30px;width:86px;border-radius:999px;").repeat(3)}</div>${chart}`;
+    case "tf":
+      return `<div class="tm-flex-row" style="gap:8px;flex-wrap:wrap;">${skel("height:30px;width:86px;border-radius:999px;").repeat(5)}</div>${table(14)}`;
     case "cs":
       return `${metrics}<div class="tm-grid-2">${chart}${chart}</div>`;
     case "vd":
@@ -857,6 +867,7 @@ async function showScreen() {
       case "cs": await renderChargingStats(); break;
       case "bh": await renderBatteryHealth(); break;
       case "bt": await renderBatteryTimeline(); break;
+      case "tf": await renderTelemetryFields(); break;
       case "pr": await renderPredictions(); break;
       case "vd": await renderVampireDrain(); break;
       case "api": await renderApiUsage(); break;
@@ -2963,6 +2974,119 @@ async function renderBatteryTimeline() {
       ${batteryStageLegendHtml(tl.stage_hours)}
     </div>
   `);
+}
+
+// ---------------------------------------------------------------------------
+// Telemetry fields — every attribute from fleet_streaming_fields.csv, with
+// what this car is actually sending (vendored CSV + /data/telemetry-fields).
+// ---------------------------------------------------------------------------
+
+/** Minimal quoted-CSV parser (commas inside quotes, doubled-quote escapes). Returns array of rows. */
+function parseCsv(text) {
+  const out = [];
+  let row = [], cell = "", inQ = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (inQ) {
+      if (c === '"') { if (text[i + 1] === '"') { cell += '"'; i++; } else inQ = false; }
+      else cell += c;
+    } else if (c === '"') inQ = true;
+    else if (c === ",") { row.push(cell); cell = ""; }
+    else if (c === "\n" || c === "\r") {
+      if (c === "\r" && text[i + 1] === "\n") i++;
+      row.push(cell); cell = "";
+      if (row.length > 1 || row[0] !== "") out.push(row);
+      row = [];
+    } else cell += c;
+  }
+  if (cell !== "" || row.length) { row.push(cell); out.push(row); }
+  return out;
+}
+
+function fmtAgo(ts) {
+  if (ts == null) return "—";
+  const s = Math.max(0, Math.floor(Date.now() / 1000) - ts);
+  if (s < 60) return "just now";
+  if (s < 3600) return `${Math.floor(s / 60)}m ago`;
+  if (s < 86400) return `${Math.floor(s / 3600)}h ago`;
+  return fmtDay(ts);
+}
+
+function fmtTfValue(v) {
+  if (v == null) return "—";
+  if (typeof v === "boolean") return v ? "true" : "false";
+  if (typeof v === "number") return Number.isInteger(v) ? String(v) : String(Math.round(v * 100) / 100);
+  return String(v);
+}
+
+const TF_COLS = "190px 92px 150px 96px minmax(280px,1fr)";
+
+function tfRowsHtml(rows, status) {
+  const q = state.tfQuery.trim().toLowerCase();
+  const visible = rows.filter((r) =>
+    (state.tfCat === "__all" || r.category === state.tfCat) &&
+    (!q || r.field.toLowerCase().includes(q) || r.description.toLowerCase().includes(q)));
+  if (!visible.length) return `<div class="tm-empty" style="padding:20px 22px;">No fields match.</div>`;
+  return visible.map((r) => {
+    const st = status.get(r.field);
+    const mapped = !!st;
+    const seen = mapped && st.value != null;
+    return `
+      <div class="tm-table-row no-click" style="grid-template-columns:${TF_COLS};${mapped ? "" : "opacity:0.5;"}">
+        <div class="tm-mono tm-ellipsis" style="font-size:12px;" title="${esc(r.field)}${mapped ? ` → ${esc(st.canonical)}` : ""}">${esc(r.field)}</div>
+        <div><span class="tm-pill tm-pill-chip" style="font-size:10px;">${esc(r.category || "—")}</span></div>
+        <div class="tm-mono tm-ellipsis" style="${seen ? "" : "color:var(--faint);"}" title="${esc(fmtTfValue(st?.value))}">${seen ? esc(fmtTfValue(st.value)) : mapped ? "—" : "not tracked"}</div>
+        <div class="tm-mono" style="font-size:11.5px;color:var(--sub);">${mapped ? esc(fmtAgo(st.last_seen)) : "—"}</div>
+        <div style="font-size:12px;color:var(--sub);white-space:normal;">${esc(r.description)}${mapped ? "" : ` <span style="color:var(--faint);">(deliberately unmapped: diagnostics/Semi-only/static config)</span>`}</div>
+      </div>`;
+  }).join("");
+}
+
+async function renderTelemetryFields() {
+  const [csvText, statusRes] = await Promise.all([
+    cached("tf_csv", () => fetch("./fleet_streaming_fields.csv").then((r) => {
+      if (!r.ok) throw new Error("couldn't load fleet_streaming_fields.csv");
+      return r.text();
+    })),
+    safe(cached("tf_status", () => data.telemetryFields(vin())), null),
+  ]);
+  const parsed = parseCsv(csvText);
+  const rows = parsed.slice(1).map((r) => ({
+    field: r[0] || "", category: r[1] || "", type: r[2] || "",
+    vehicleDataEquivalent: r[3] || "", description: r[4] || "",
+  })).filter((r) => r.field);
+  const status = new Map((statusRes?.fields ?? []).map((f) => [f.tesla, f]));
+  const cats = [...new Set(rows.map((r) => r.category).filter(Boolean))].sort((a, b) => a.localeCompare(b));
+  if (state.tfCat !== "__all" && !cats.includes(state.tfCat)) state.tfCat = "__all";
+  const seenCount = rows.filter((r) => status.get(r.field)?.value != null).length;
+  const mappedCount = rows.filter((r) => status.has(r.field)).length;
+
+  setContent(`
+    <div class="tm-flex-row" style="gap:8px;flex-wrap:wrap;">
+      <button class="tm-chip-btn ${state.tfCat === "__all" ? "active" : ""}" data-action="tf-cat" data-cat="__all">All<span class="n">${rows.length}</span></button>
+      ${cats.map((c) => `<button class="tm-chip-btn ${state.tfCat === c ? "active" : ""}" data-action="tf-cat" data-cat="${esc(c)}">${esc(c)}<span class="n">${rows.filter((r) => r.category === c).length}</span></button>`).join("")}
+      <input class="tm-gate-input" id="tm-tf-search" type="search" placeholder="Search fields…" autocomplete="off" value="${esc(state.tfQuery)}" style="margin-left:auto;width:200px;padding:6px 12px;font-size:12.5px;">
+    </div>
+    <div style="font-size:12.5px;color:var(--sub);">${seenCount} of ${rows.length} fields received on this car · ${mappedCount} mapped by the worker${statusRes ? "" : ` · <span style="color:var(--warn);">live values unavailable — the deployed worker doesn't have /data/telemetry-fields yet (redeploy it)</span>`}</div>
+    <div class="tm-card tm-table-wrap">
+      <div style="min-width:900px;">
+        <div class="tm-table-head" style="grid-template-columns:${TF_COLS};">
+          <div>Field</div><div>Category</div><div>Latest value</div><div>Last seen</div><div>Description</div>
+        </div>
+        <div id="tm-tf-rows">${tfRowsHtml(rows, status)}</div>
+        <div class="tm-foot-note">Straight from Tesla's fleet_streaming_fields reference — dimmed rows are fields the worker deliberately doesn't record. Values refresh on reload (this reads already-stored data, free).</div>
+      </div>
+    </div>
+  `);
+
+  const search = document.getElementById("tm-tf-search");
+  if (search) {
+    search.addEventListener("input", () => {
+      state.tfQuery = search.value;
+      const body = document.getElementById("tm-tf-rows");
+      if (body) body.innerHTML = tfRowsHtml(rows, status);
+    });
+  }
 }
 
 // ---------------------------------------------------------------------------
