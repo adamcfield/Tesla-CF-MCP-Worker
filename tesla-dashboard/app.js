@@ -5,7 +5,7 @@ import { destroyMaps, renderPointMap, renderRouteMap, renderLifetimeMap, createR
 // Bump on every change to this dashboard (UI, features, or the /data/*
 // endpoints it depends on) and add a matching entry to CHANGELOG.md — see
 // the versioning policy in the repo's CLAUDE.md. Shown in the sidebar footer.
-const APP_VERSION = "1.10.0";
+const APP_VERSION = "1.10.1";
 
 const root = document.getElementById("app");
 let shellBound = false; // guards one-time attach of the root click handler + sync timer
@@ -571,6 +571,16 @@ function onRootClick(e) {
     renderTelemetryFields();
   } else if (action === "ov-goto-climate") {
     document.getElementById("tm-ov-climate")?.scrollIntoView({ behavior: "smooth", block: "start" });
+  } else if (action === "tyres-popup") {
+    cached("tires", () => data.tires(vin(), 30)).then(
+      (t) => openModal(tyresModalHtml(t)),
+      () => openModal(tyresModalHtml(null)),
+    );
+  } else if (action === "tyres-goto-stats") {
+    closeModal();
+    state.screen = "st";
+    pushHistory();
+    showScreen();
   } else if (action === "driver-other-toggle") {
     const other = document.getElementById("tm-driver-other");
     if (other) {
@@ -1221,7 +1231,10 @@ const WHEELS = [["fl", "FL"], ["fr", "FR"], ["rl", "RL"], ["rr", "RR"]];
  * deviates >0.3 bar from the 4-wheel median, or is trending down faster than
  * 0.15 bar/week (slow puncture signature).
  */
-function tpmsCard(t) {
+const BAR_PSI = 14.5038;
+
+/** Per-wheel warn flag shared by the Statistics card, the Overview readout, and the popup. */
+function tyreFlags(t) {
   const latest = t?.latest ?? null;
   const trend = t?.trend_bar_per_week ?? null;
   const vals = latest ? WHEELS.map(([w]) => latest[w]).filter((v) => typeof v === "number") : [];
@@ -1237,25 +1250,57 @@ function tpmsCard(t) {
     const tr = trend?.[w];
     return typeof tr === "number" && tr < -0.15;
   };
-  const anyWarn = WHEELS.some(([w]) => flag(w));
+  return { latest, trend, flag, anyWarn: WHEELS.some(([w]) => flag(w)) };
+}
+
+/** 2x2 wheel grid, PSI primary (what the car app shows) with bar underneath. */
+function tyreGridHtml(t, big = false) {
+  const { latest, flag } = tyreFlags(t);
+  return `<div class="tm-tpms-grid">
+    ${WHEELS.map(([w, label]) => `
+      <div class="tm-tpms-cell ${flag(w) ? "warn" : ""}">
+        <div class="tm-tpms-pos">${label}</div>
+        <div class="tm-tpms-val" ${big ? 'style="font-size:22px;"' : ""}>${typeof latest?.[w] === "number" ? fmt0(latest[w] * BAR_PSI) : "—"}</div>
+        <div style="font-size:10px;color:var(--faint);">${typeof latest?.[w] === "number" ? `${fmt1(latest[w])} bar` : ""}</div>
+      </div>`).join("")}
+  </div>`;
+}
+
+function tpmsCard(t) {
+  const { latest, anyWarn } = tyreFlags(t);
   const bal = t?.balance ?? null;
   return `
     <div class="tm-card tm-card-pad-metric">
       <div class="tm-stat-label" style="display:flex;align-items:baseline;">Tyre pressure
-        ${anyWarn ? `<span class="tm-pill tm-pill-warn" style="margin-left:auto;">check</span>` : `<span style="margin-left:auto;font-size:11px;color:var(--faint);">bar</span>`}
+        ${anyWarn ? `<span class="tm-pill tm-pill-warn" style="margin-left:auto;">check</span>` : `<span style="margin-left:auto;font-size:11px;color:var(--faint);">PSI</span>`}
       </div>
-      <div class="tm-tpms-grid">
-        ${WHEELS.map(([w, label]) => `
-          <div class="tm-tpms-cell ${flag(w) ? "warn" : ""}">
-            <div class="tm-tpms-pos">${label}</div>
-            <div class="tm-tpms-val">${typeof latest?.[w] === "number" ? fmt1(latest[w]) : "—"}</div>
-          </div>`).join("")}
-      </div>
+      ${tyreGridHtml(t)}
       <div class="tm-stat-note">${latest?.ts != null ? `as of ${fmtDateTime(latest.ts)}` : "no TPMS samples yet"}</div>
       ${bal ? `<div class="tm-stat-note" style="${bal.asymmetric ? "color:var(--warn);" : ""}">
         ${bal.asymmetric ? "Persistent side-to-side gap — " : "Well balanced — "}
-        FL–FR ${bal.fl_fr_bar >= 0 ? "+" : ""}${bal.fl_fr_bar} · RL–RR ${bal.rl_rr_bar >= 0 ? "+" : ""}${bal.rl_rr_bar} bar avg (${bal.paired_samples} samples)
+        FL–FR ${bal.fl_fr_bar >= 0 ? "+" : ""}${fmt1(bal.fl_fr_bar * BAR_PSI)} · RL–RR ${bal.rl_rr_bar >= 0 ? "+" : ""}${fmt1(bal.rl_rr_bar * BAR_PSI)} PSI avg (${bal.paired_samples} samples)
       </div>` : ""}
+    </div>`;
+}
+
+/** Popup opened from the Overview Tyres readout: the same wheel grid, bigger, with trend + history link. */
+function tyresModalHtml(t) {
+  const { latest, trend, flag } = tyreFlags(t);
+  const leaks = WHEELS
+    .filter(([w]) => typeof trend?.[w] === "number" && trend[w] < -0.15)
+    .map(([w, label]) => `${label} is losing ~${fmt1(Math.abs(trend[w]) * BAR_PSI)} PSI/week`);
+  const missing = WHEELS.filter(([w]) => typeof latest?.[w] !== "number").map(([, label]) => label);
+  return `
+    <div class="tm-modal-head">
+      <div><div class="tm-modal-title">Tyre pressure</div><div class="tm-modal-sub">${latest?.ts != null ? `as of ${fmtDateTime(latest.ts)}` : "no readings yet"}</div></div>
+      <button class="tm-icon-btn" data-action="modal-close" aria-label="Close">✕</button>
+    </div>
+    ${tyreGridHtml(t, true)}
+    ${WHEELS.some(([w]) => flag(w)) ? `<div class="tm-stat-note" style="color:var(--warn);margin-top:10px;">
+      ${[...leaks, ...(missing.length ? [`no reading from ${missing.join(", ")}`] : [])].join(" · ") || "One wheel is off from the others — check it against the door-jamb placard."}
+    </div>` : `<div class="tm-stat-note" style="color:var(--good);margin-top:10px;">All four look consistent.</div>`}
+    <div class="tm-flex-row" style="gap:12px;margin-top:16px;">
+      <button class="tm-chip-btn" data-action="tyres-goto-stats">Pressure history →</button>
     </div>`;
 }
 
@@ -1391,7 +1436,7 @@ async function renderOverview() {
           <div class="tm-grid-metrics" style="grid-template-columns:repeat(auto-fit,minmax(90px,1fr));gap:14px;">
             <div class="tm-readout-click" data-action="ov-goto-climate" title="See inside vs outside temperature"><div class="tm-readout-label">Inside</div><div class="tm-readout-value">${inside != null ? fmt1(inside) + " °C" : "—"}</div></div>
             <div class="tm-readout-click" data-action="ov-goto-climate" title="See inside vs outside temperature"><div class="tm-readout-label">Outside</div><div class="tm-readout-value">${outside != null ? fmt1(outside) + " °C" : "—"}</div></div>
-            <div class="tm-readout-click" data-action="nav" data-screen="st" title="Tyre pressures & trends on Statistics"><div class="tm-readout-label">Tyres</div><div class="tm-readout-value">${tyreStatusHtml(tires)}</div></div>
+            <div class="tm-readout-click" data-action="tyres-popup" title="Per-wheel pressures"><div class="tm-readout-label">Tyres</div><div class="tm-readout-value">${tyreStatusHtml(tires)}</div></div>
             <div class="tm-readout-click" data-action="nav" data-screen="tl" title="Full state timeline"><div class="tm-readout-label">Status</div><div class="tm-readout-value">${esc(currentStatus || "—")}</div></div>
           </div>
         ` : `
