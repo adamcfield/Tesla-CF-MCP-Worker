@@ -9,6 +9,23 @@ feature or screen, the **patch** version for fixes/tweaks/copy changes, and the
 configured. See `CLAUDE.md` at the repo root for the policy on keeping this file
 and `APP_VERSION` (in `app.js`) in sync.
 
+## 1.7.3 — 2026-07-11
+
+API usage screen: stop hiding why the call log is missing. Reported as "the
+page with all the calls doesn't work" while the month's budget was nearly
+exhausted — the screen was silently swallowing the `/data/budget-calls`
+failure and rendering an empty table, indistinguishable from "no spend".
+
+- A failed call-log fetch now renders an explicit card saying what went
+  wrong: a 404 explains that the **deployed worker predates this feature**
+  (and how to redeploy it — the usual cause, since the dashboard auto-ships
+  on merge but the worker doesn't); 401/403 points at the token; anything
+  else shows the actual error.
+- When the table's total covers less than the month's spend (per-call
+  accounting started mid-month with a worker deploy), a note now says so
+  instead of letting the two numbers silently disagree.
+- The month-total card still renders even if the summary endpoint fails.
+
 ## 1.7.2 — 2026-07-11
 
 **#22**: the "Name this place" field in the Add-a-place modal is now
