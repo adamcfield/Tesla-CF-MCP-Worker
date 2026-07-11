@@ -5,7 +5,7 @@ import { destroyMaps, renderPointMap, renderRouteMap, renderLifetimeMap, createR
 // Bump on every change to this dashboard (UI, features, or the /data/*
 // endpoints it depends on) and add a matching entry to CHANGELOG.md — see
 // the versioning policy in the repo's CLAUDE.md. Shown in the sidebar footer.
-const APP_VERSION = "1.12.0";
+const APP_VERSION = "1.13.0";
 
 const root = document.getElementById("app");
 let shellBound = false; // guards one-time attach of the root click handler + sync timer
@@ -198,6 +198,7 @@ const state = {
   driverFilter: "__all", // "__all" | "__none" (unassigned) | driver name
   mediaDriverFilter: null, // selected driver chip on the Media screen's per-driver breakdown
   openDriveId: null,
+  openDriverName: null, // Drivers screen: driver whose detail page is open (issue #39)
   openChargeId: null,
   openPlaceId: null,
   editingPlaceTags: false, // place-detail: driver-tag chip editor open/closed
@@ -544,6 +545,7 @@ function onRootClick(e) {
     state.openDriveId = null;
     state.openChargeId = null;
     state.openPlaceId = null;
+    state.openDriverName = null;
     pushHistory();
     renderShell();
     showScreen();
@@ -716,6 +718,13 @@ function onRootClick(e) {
       t.disabled = false;
       t.textContent = "Failed";
     });
+  } else if (action === "open-driver") {
+    state.openDriverName = t.dataset.name;
+    pushHistory();
+    renderDrivers();
+  } else if (action === "back-drivers") {
+    state.openDriverName = null;
+    renderDrivers();
   } else if (action === "open-drive") {
     // Opening a drive is a navigation into the Drives section — keep the left-nav
     // highlight + header in sync (the detail can be reached from Overview/Timeline too).
@@ -2313,7 +2322,80 @@ const FIDELITY_LABEL = {
   sparse: "sparse — harsh-event metrics not meaningful at this sampling",
 };
 
+/**
+ * Driver detail (issue #39): one driver's stats, their recent routes on a map,
+ * and their drives list — everything already fetched elsewhere, filtered to
+ * one person. Reached by clicking a driver card on the Drivers screen.
+ */
+async function renderDriverDetail() {
+  const name = state.openDriverName;
+  const [res, all] = await Promise.all([
+    safe(data.driverScores(vin()), null),
+    cached("all_drives", () => data.drives(vin(), 2000)),
+  ]);
+  const d = res?.drivers?.find((x) => x.driver === name) || null;
+  const theirs = all.filter((x) => x.driver === name);
+  const km = theirs.reduce((sum, x) => sum + (x.distance_km || 0), 0);
+  const stat = (label, v, unit, dp = 0) => `
+    <div class="tm-card tm-card-pad-metric">
+      <div class="tm-stat-label">${label}</div>
+      <div class="tm-stat-value">${v != null ? (dp ? fmt1(v) : fmt0(v)) : "—"} <span class="tm-stat-unit">${unit}</span></div>
+    </div>`;
+
+  setContent(`
+    <div class="tm-flex-row" style="gap:14px;flex-wrap:wrap;">
+      <button class="tm-back-btn" data-action="back-drivers">← Drivers</button>
+      <div style="font-size:15px;font-weight:600;">${esc(name)}</div>
+      ${d?.behavior_score != null ? `<span style="font-size:22px;font-weight:600;font-family:var(--mono);color:${scoreColor(d.behavior_score)};">${d.behavior_score}</span><span style="font-size:11px;color:var(--faint);">safety score</span>` : ""}
+      <div style="font-size:12.5px;color:var(--faint);">${theirs.length} drive${theirs.length === 1 ? "" : "s"} · ${fmt0(km)} km</div>
+    </div>
+    ${d ? `<div class="tm-grid-metrics">
+      ${stat("Avg speed", d.avg_speed_kmh, "km/h")}
+      ${stat("Top speed", d.max_speed_kmh, "km/h")}
+      ${stat("Speeding", d.over_limit_pct, "%")}
+      ${stat("Night driving", d.night_pct, "%")}
+      ${stat("Peak braking", d.max_decel_g, "g", 1)}
+      ${stat("Harsh brakes", d.harsh_brakes_per_100km, "/100km", 1)}
+    </div>` : ""}
+    <div class="tm-card" style="overflow:hidden;position:relative;height:340px;">
+      <div id="tm-driver-map" class="tm-map-canvas"></div>
+      ${theirs.length === 0 ? `<div class="tm-empty" style="height:100%;">No drives assigned to ${esc(name)} yet</div>` : ""}
+    </div>
+    ${theirs.length ? `
+    <div class="tm-card tm-table-wrap">
+      <div style="min-width:560px;">
+        <div class="tm-table-head" style="grid-template-columns:150px 1fr 90px 90px 70px;">
+          <div>When</div><div>Route</div><div class="tm-right">km</div><div class="tm-right">Time</div><div class="tm-right">Score</div>
+        </div>
+        ${theirs.slice(0, 50).map((x) => `
+          <div class="tm-table-row" data-action="open-drive" data-id="${x.id}" style="grid-template-columns:150px 1fr 90px 90px 70px;">
+            <div style="font-size:12.5px;color:var(--sub);">${esc(fmtDateTime(x.start_ts))}</div>
+            <div class="tm-ellipsis"><bdi>${esc(driveEndpoint(x, "start", []))}</bdi> → <bdi>${esc(driveEndpoint(x, "end", []))}</bdi></div>
+            <div class="tm-right tm-mono">${x.distance_km != null ? fmt1(x.distance_km) : "—"}</div>
+            <div class="tm-right tm-mono">${fmtDurationMin(x.duration_min)}</div>
+            <div class="tm-right tm-mono" style="color:${scoreColor(x.behavior_score)};">${x.behavior_score ?? "—"}</div>
+          </div>`).join("")}
+        ${theirs.length > 50 ? `<div class="tm-foot-note">Showing the 50 most recent of ${theirs.length} drives — the full list is on the Drives screen with the ${esc(name)} filter.</div>` : ""}
+      </div>
+    </div>` : ""}
+  `);
+
+  // Their recent routes, lifetime-map style (per-drive path fetches, capped).
+  const withGps = theirs.slice(0, 12);
+  if (withGps.length) {
+    const paths = await Promise.all(withGps.map(async (dr) => {
+      try {
+        const det = await data.drive(dr.id);
+        return (det.path || []).filter((pt) => pt.lat != null && pt.lon != null).map((pt) => [pt.lat, pt.lon]);
+      } catch { return []; }
+    }));
+    if (state.openDriverName !== name) return; // navigated away while fetching
+    requestAnimationFrame(() => renderLifetimeMap(document.getElementById("tm-driver-map"), paths.filter((pt) => pt.length > 1)));
+  }
+}
+
 async function renderDrivers() {
+  if (state.openDriverName != null) return renderDriverDetail();
   const res = await data.driverScores(vin());
   const drivers = res?.drivers || [];
   // Full household roster (Tesla-reported + tagged). 404s gracefully → []. Any
@@ -2345,7 +2427,7 @@ async function renderDrivers() {
     </div>
     ${drivers.length ? `<div class="tm-grid-3col">
       ${drivers.map((d) => `
-        <div class="tm-card tm-card-pad">
+        <div class="tm-card tm-card-pad tm-card-hover" data-action="open-driver" data-name="${esc(d.driver)}" title="Open ${esc(d.driver)}'s drives & routes">
           <div class="tm-flex-row" style="justify-content:space-between;align-items:flex-start;">
             <div>
               <div style="font-size:15px;font-weight:600;">${esc(d.driver)}</div>

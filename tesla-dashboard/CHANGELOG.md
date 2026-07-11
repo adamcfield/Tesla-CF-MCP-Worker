@@ -9,6 +9,14 @@ feature or screen, the **patch** version for fixes/tweaks/copy changes, and the
 configured. See `CLAUDE.md` at the repo root for the policy on keeping this file
 and `APP_VERSION` (in `app.js`) in sync.
 
+## 1.13.0 — 2026-07-11
+
+**#39**: clicking a driver card on the Drivers screen now opens that
+driver's detail page — their stats (avg/top speed, speeding %, night %,
+braking), a map of their recent routes, and their drives list (each row
+opens the full drive detail). Quick-assign and auto-assignment are
+unchanged; this is the read side.
+
 ## 1.12.0 — 2026-07-11
 
 Three fixes from the BugDrop backlog (issues #35, #36, #37).
