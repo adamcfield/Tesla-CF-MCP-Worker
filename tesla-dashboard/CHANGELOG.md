@@ -9,6 +9,14 @@ feature or screen, the **patch** version for fixes/tweaks/copy changes, and the
 configured. See `CLAUDE.md` at the repo root for the policy on keeping this file
 and `APP_VERSION` (in `app.js`) in sync.
 
+## 1.7.2 — 2026-07-11
+
+**#22**: the "Name this place" field in the Add-a-place modal is now
+pre-filled with the spot's address/label (from the current-location
+reverse-geocode, a frequent-stop, or a search result) instead of opening
+blank and forcing a manual name every time — the text is pre-selected so
+typing a custom name still just overwrites it in one keystroke.
+
 ## 1.7.1 — 2026-07-08
 
 **#21**: map cards now zoom with the mouse wheel (was disabled outright).
