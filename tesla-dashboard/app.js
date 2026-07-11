@@ -5,7 +5,7 @@ import { destroyMaps, renderPointMap, renderRouteMap, renderLifetimeMap, createR
 // Bump on every change to this dashboard (UI, features, or the /data/*
 // endpoints it depends on) and add a matching entry to CHANGELOG.md — see
 // the versioning policy in the repo's CLAUDE.md. Shown in the sidebar footer.
-const APP_VERSION = "1.11.0";
+const APP_VERSION = "1.12.0";
 
 const root = document.getElementById("app");
 let shellBound = false; // guards one-time attach of the root click handler + sync timer
@@ -1528,8 +1528,8 @@ async function renderOverview() {
       </div>
       ${(climate.insidePts.length > 1 || climate.outsidePts.length > 1) ? svgLineChart({
         series: [
-          { points: climate.outsidePts, color: "var(--faint)", dashed: true },
-          { points: climate.insidePts, color: "var(--accent)", width: 2.2 },
+          { points: climate.outsidePts, color: "var(--faint)", dashed: true, name: "Outside" },
+          { points: climate.insidePts, color: "var(--accent)", width: 2.2, name: "Inside" },
         ].filter((s) => s.points.length > 1),
         yTicks: autoTicks([...climate.insidePts, ...climate.outsidePts].map((p) => p[1]), 4),
         xTicks: buildDayTicks(climate.insidePts.length > 1 ? climate.insidePts : climate.outsidePts),
@@ -1663,13 +1663,29 @@ async function buildEventFeed(locations, driveLimit = 200) {
   for (const s of states) {
     if (s.start_ts == null) continue;
     if (s.state === "asleep" || s.state === "offline") {
-      events.push({ ts: s.start_ts, type: "sleep", title: s.state === "asleep" ? "Asleep" : "Offline", meta: esc(fmtDurationSec(s.duration_s)) });
+      events.push({ ts: s.start_ts, type: "sleep", title: s.state === "asleep" ? "Asleep" : "Offline", meta: esc(fmtDurationSec(s.duration_s)), dur_s: s.duration_s ?? 0 });
     } else if (s.state === "updating") {
-      events.push({ ts: s.start_ts, type: "update", title: "Software update", meta: esc(fmtDurationSec(s.duration_s)) });
+      events.push({ ts: s.start_ts, type: "update", title: "Software update", meta: esc(fmtDurationSec(s.duration_s)), dur_s: s.duration_s ?? 0 });
     }
   }
   events.sort((a, b) => b.ts - a.ts);
-  return events;
+  // #37: connectivity flaps split one outage into several vehicle_states rows,
+  // which rendered as "Offline" immediately followed by "Offline". Collapse
+  // ADJACENT same-title sleep/update events into one row spanning from the
+  // earliest start with the durations summed. A drive or charge in between
+  // breaks adjacency, so genuinely separate outages never get glued together.
+  const merged = [];
+  for (const e of events) {
+    const prev = merged[merged.length - 1];
+    if (prev && (e.type === "sleep" || e.type === "update") && prev.type === e.type && prev.title === e.title) {
+      prev.ts = e.ts; // desc order: e starts earlier — the run begins there
+      prev.dur_s = (prev.dur_s ?? 0) + (e.dur_s ?? 0);
+      prev.meta = esc(fmtDurationSec(prev.dur_s));
+      continue;
+    }
+    merged.push(e);
+  }
+  return merged;
 }
 
 // ---------------------------------------------------------------------------
