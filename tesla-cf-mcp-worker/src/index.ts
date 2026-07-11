@@ -81,6 +81,7 @@ import {
   getDrivers,
   getDrives,
   getEfficiencyByTemp,
+  backfillLocationMatches,
   getLocationHistory,
   getLocationStats,
   getMediaStats,
@@ -566,6 +567,9 @@ export default {
         return handleRegisterPartner(env, url.searchParams.get("domain") ?? undefined);
       }
       if (path === "/setup/partner-public-key") return handlePartnerPublicKey(env);
+      if (path === "/setup/backfill-locations" && request.method === "POST") {
+        return json(await backfillLocationMatches(env, url.searchParams.get("force") === "1"));
+      }
       if (path === "/setup/backfill-charges" && request.method === "POST") {
         const vin = url.searchParams.get("vin");
         if (!vin) return json({ error: "vin query param required" }, 400);

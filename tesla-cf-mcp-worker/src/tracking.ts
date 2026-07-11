@@ -798,6 +798,9 @@ export async function setLocation(
     )
       .bind(loc.id, loc.name, loc.lat, loc.lon, loc.radius_m ?? 150, loc.cost_per_kwh ?? null, driversJson, address)
       .run();
+    // The place may have moved/resized — re-match history so its visit stats
+    // and event history stay truthful (force recomputes existing matches too).
+    await backfillLocationMatches(env, true);
     return { id: loc.id };
   }
   const driversJson = serializeLocationDrivers(loc.drivers);
@@ -807,6 +810,9 @@ export async function setLocation(
   )
     .bind(loc.name, loc.lat, loc.lon, loc.radius_m ?? 150, loc.cost_per_kwh ?? null, Math.floor(Date.now() / 1000), driversJson, loc.address?.trim() || null)
     .run();
+  // A brand-new place claims its history immediately (visits/charges that
+  // happened here before it was saved).
+  await backfillLocationMatches(env, false);
   return { id: Number(res.meta.last_row_id ?? 0) };
 }
 
@@ -834,6 +840,60 @@ export async function getLocationStats(env: Env, id: number): Promise<unknown> {
     total_energy_added_kwh: round(charges?.kwh ?? 0, 2),
     total_cost: round(charges?.cost ?? 0, 2),
   };
+}
+
+/**
+ * (Re)matches historical drives and charge sessions to the saved places.
+ * Live matching only happens as sessions open/close, so anything recorded
+ * BEFORE a place was saved (or after it was moved/resized) sits unmatched
+ * and the place shows zero visits. Runs with the locations preloaded — one
+ * pass over ~all rows, only writing actual changes. `force` recomputes rows
+ * that already have a location id (needed after moving/deleting a place).
+ * Called from setLocation on every save, and exposed as
+ * POST /setup/backfill-locations for a manual full pass.
+ */
+export async function backfillLocationMatches(env: Env, force = false): Promise<Record<string, number>> {
+  await ensureSchema(env);
+  const locs = (await env.DB.prepare(`SELECT id, lat, lon, radius_m FROM locations`).all<{
+    id: number; lat: number; lon: number; radius_m: number;
+  }>()).results ?? [];
+  const match = (lat: number | null, lon: number | null): number | null => {
+    if (lat == null || lon == null) return null;
+    let best: { id: number; d: number } | null = null;
+    for (const l of locs) {
+      const d = haversineMeters(lat, lon, l.lat, l.lon);
+      if (d <= l.radius_m && (best === null || d < best.d)) best = { id: l.id, d };
+    }
+    return best?.id ?? null;
+  };
+
+  let drivesChanged = 0;
+  const drives = (await env.DB.prepare(
+    `SELECT id, start_lat, start_lon, end_lat, end_lon, start_location_id, end_location_id
+     FROM drives WHERE status = 'complete'`,
+  ).all<{ id: number; start_lat: number | null; start_lon: number | null; end_lat: number | null; end_lon: number | null; start_location_id: number | null; end_location_id: number | null }>()).results ?? [];
+  for (const d of drives) {
+    const start = force || d.start_location_id == null ? match(d.start_lat, d.start_lon) : d.start_location_id;
+    const end = force || d.end_location_id == null ? match(d.end_lat, d.end_lon) : d.end_location_id;
+    if (start !== (d.start_location_id ?? null) || end !== (d.end_location_id ?? null)) {
+      await env.DB.prepare(`UPDATE drives SET start_location_id = ?2, end_location_id = ?3 WHERE id = ?1`)
+        .bind(d.id, start, end).run();
+      drivesChanged++;
+    }
+  }
+
+  let chargesChanged = 0;
+  const charges = (await env.DB.prepare(
+    `SELECT id, lat, lon, location_id FROM charge_sessions WHERE status = 'complete'`,
+  ).all<{ id: number; lat: number | null; lon: number | null; location_id: number | null }>()).results ?? [];
+  for (const c of charges) {
+    const m = force || c.location_id == null ? match(c.lat, c.lon) : c.location_id;
+    if (m !== (c.location_id ?? null)) {
+      await env.DB.prepare(`UPDATE charge_sessions SET location_id = ?2 WHERE id = ?1`).bind(c.id, m).run();
+      chargesChanged++;
+    }
+  }
+  return { locations: locs.length, drives_examined: drives.length, drives_changed: drivesChanged, charges_examined: charges.length, charges_changed: chargesChanged };
 }
 
 /**
