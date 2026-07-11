@@ -80,10 +80,17 @@ const MAX_BILLED_GAP_S = 240;
 /** Fraction of the last paced interval that must elapse before any poller may bill again. */
 const BILLED_GAP_FRAC = 0.8;
 
+/** Skip billed REST reads while the telemetry stream stamped liveness within this window
+ *  (a hair over the slowest configured resend interval, 300s, so a healthy stream never flaps). */
+const STREAM_FRESH_S = 330;
+/** Even with a healthy stream, do one billed reconciliation read this often (odometer/full-snapshot drift). */
+const RECONCILE_BILLED_S = 3600;
+
 const POLL_STATE = (vin: string) => `poll_state:${vin}`;
 const POLL_OK = (vin: string) => `poll_ok_ts:${vin}`;
 const VCFG_TS = (vin: string) => `vcfg_ts:${vin}`;
 const BILLED_TS = (vin: string) => `billed_ts:${vin}`;
+const STREAM_OK = (vin: string) => `stream_ok_ts:${vin}`;
 
 interface PollState {
   last_active_ts?: number;
@@ -151,6 +158,25 @@ export async function pollOnce(env: Env, vin: string): Promise<PollResult> {
       vin, state, activity: "budget_exhausted", polled: false, active: false,
       next_interval_s: INTERVAL_SLEEP, budget_spent_usd: budget.spent_usd,
     };
+  }
+
+  // 2b. TELEMETRY-FIRST: when Fleet Telemetry is actively delivering (the
+  //     ingest route stamped liveness within the freshness window), a billed
+  //     REST read is redundant -- the stream records the same signals at finer
+  //     grain for ~1/300th the price, and its ingest path runs the exact same
+  //     drive/charge/state derivations. Keep one billed reconciliation read
+  //     per hour, and fall back to normal REST pacing automatically the
+  //     moment the stream goes quiet.
+  const streamOk = Number((await getAppState(env, STREAM_OK(vin)).catch(() => "0")) ?? "0");
+  if (now - streamOk < STREAM_FRESH_S) {
+    const lastBilledTs = Number(String((await getAppState(env, BILLED_TS(vin)).catch(() => "0")) ?? "0").split(" ")[0]) || 0;
+    if (now - lastBilledTs < RECONCILE_BILLED_S) {
+      await recordConnectivityState(env, vin, "online").catch(() => {});
+      return {
+        vin, state, activity: "stream_covered", polled: false, active: false,
+        next_interval_s: INTERVAL_SLEEP, budget_spent_usd: budget.spent_usd,
+      };
+    }
   }
 
   // 3. Suspension: idle long enough that we only probe occasionally.

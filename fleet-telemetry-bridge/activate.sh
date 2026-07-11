@@ -57,6 +57,31 @@ fields = {
  "OutsideTemp":              {"interval_seconds": 300},
  "TpmsPressureFl": {"interval_seconds": 300}, "TpmsPressureFr": {"interval_seconds": 300},
  "TpmsPressureRl": {"interval_seconds": 300}, "TpmsPressureRr": {"interval_seconds": 300},
+ # --- added 2026-07-11: media (the Media screen was empty because these were
+ # --- never streamed), plus the fields the hourly REST reconciliation used to
+ # --- be the only source of. All on-change-ish; signal cost is negligible
+ # --- ($1/150k signals) next to what telemetry-first saves in REST reads.
+ "MediaPlaybackStatus":      {"interval_seconds": 30},
+ "MediaPlaybackSource":      {"interval_seconds": 30},
+ "MediaNowPlayingTitle":     {"interval_seconds": 30},
+ "MediaNowPlayingArtist":    {"interval_seconds": 30},
+ "MediaNowPlayingAlbum":     {"interval_seconds": 60},
+ "MediaNowPlayingStation":   {"interval_seconds": 60},
+ "MediaAudioVolume":         {"interval_seconds": 60},
+ "Odometer":                 {"interval_seconds": 60},
+ "EstBatteryRange":          {"interval_seconds": 120},
+ "RatedRange":               {"interval_seconds": 120},
+ "EnergyRemaining":          {"interval_seconds": 120},
+ "ChargeLimitSoc":           {"interval_seconds": 300},
+ "ChargeAmps":               {"interval_seconds": 60},
+ "ACChargingEnergyIn":       {"interval_seconds": 60},
+ "DCChargingPower":          {"interval_seconds": 30},
+ "SentryMode":               {"interval_seconds": 300},
+ "Locked":                   {"interval_seconds": 300},
+ "ClimateKeeperMode":        {"interval_seconds": 300},
+ "HvacACEnabled":            {"interval_seconds": 120},
+ "HvacPower":                {"interval_seconds": 120},
+ "SoftwareUpdateDownloadPercentComplete": {"interval_seconds": 300},
 }
 args = {"vins":[os.environ["VIN"]], "hostname":os.environ["HOST"],
         "port":int(os.environ["PORT"]), "ca":os.environ["CA"], "fields":fields}

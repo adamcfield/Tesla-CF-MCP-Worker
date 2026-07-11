@@ -21,7 +21,7 @@
 
 import { recordSpend } from "./budget";
 import { evaluateOnIngest } from "./rules";
-import { getLatest, LatestState, mergeLatest, POSITION_COLUMNS, recordEvents, TelemetryEvent } from "./store";
+import { getAppState, getLatest, LatestState, mergeLatest, POSITION_COLUMNS, putAppState, recordEvents, TelemetryEvent } from "./store";
 import { applyDerivation } from "./tracking";
 import { Env } from "./types";
 
@@ -477,6 +477,21 @@ export async function handleIngest(request: Request, env: Env): Promise<Response
   if (signals > 0) await recordSpend(env, "signal", signals);
 
   for (const p of parsed) await applyIngest(env, p);
+
+  // Stream-liveness stamp (per vin, throttled to >=60s between writes):
+  // pollOnce reads this to skip billed REST reads while streaming is
+  // delivering (telemetry-first). Only the HTTP ingest route stamps it --
+  // the REST poll path enters via applyVehicleData and must not count as
+  // "streaming is alive".
+  const nowS = Math.floor(Date.now() / 1000);
+  for (const vinSeen of new Set(parsed.map((p) => p.vin))) {
+    try {
+      const prev = Number((await getAppState(env, `stream_ok_ts:${vinSeen}`)) ?? "0");
+      if (nowS - prev >= 60) await putAppState(env, `stream_ok_ts:${vinSeen}`, String(nowS));
+    } catch {
+      /* liveness stamp must never break ingest */
+    }
+  }
 
   return new Response(JSON.stringify({ accepted: parsed.length, rejected: items.length - parsed.length }), {
     headers: { "content-type": "application/json" },

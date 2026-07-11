@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { applyIngest, getTelemetryFieldStatus, handleIngest } from "../src/ingest";
-import { getLatest, querySeries, resetSchemaCacheForTests } from "../src/store";
+import { getAppState, getLatest, querySeries, resetSchemaCacheForTests } from "../src/store";
 import { getDrives, getStateTimeline, getChargeSessions, getBatteryTimeline } from "../src/tracking";
 import { FakeD1 } from "./helpers/d1";
 import { FakeKV } from "./helpers/kv";
@@ -96,6 +96,21 @@ describe("ingest value normalization", () => {
       { ts: 1000, data: { Soc: 50 } }, // no vin
     ]}), env);
     expect(await resp.json()).toEqual({ accepted: 1, rejected: 1 });
+  });
+});
+
+describe("stream-liveness stamp", () => {
+  it("handleIngest (the streaming route) stamps stream_ok_ts; the REST path does not", async () => {
+    const env = makeEnv();
+    await handleIngest(req({ vin: VIN, ts: 1000, data: { Soc: 55 } }), env);
+    const stamp = await getAppState(env, `stream_ok_ts:${VIN}`);
+    expect(Number(stamp)).toBeGreaterThan(0);
+
+    // REST path (applyIngest direct) must NOT refresh the stamp -- that would
+    // make the poller think streaming is alive and suppress its own reads.
+    const env2 = makeEnv();
+    await applyIngest(env2, parsed(VIN, 2000, { Soc: 56 }));
+    expect(await getAppState(env2, `stream_ok_ts:${VIN}`)).toBeNull();
   });
 });
 
