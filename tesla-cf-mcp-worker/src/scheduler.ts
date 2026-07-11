@@ -19,6 +19,23 @@ const MIN_INTERVAL_S = 10;
 const MAX_INTERVAL_S = 300;
 const DEFAULT_INTERVAL_S = 90;
 
+/**
+ * Next alarm delay from the intervals pollOnce returned this firing: the
+ * fastest across VINs (a driving car must not wait on a sleeping one), the
+ * DEFAULT when nothing reported (no VINs configured / every poll threw),
+ * clamped to [MIN, MAX]. Exported for tests.
+ *
+ * The fold starts from Infinity, NOT from DEFAULT_INTERVAL_S: seeding the
+ * min() with the default put a 90s CEILING on every re-arm, so when the
+ * budget pacer asked for 150s (charging, behind pace) or 300s (idle) the DO
+ * kept firing at 90s anyway — billing a charging car ~1.7x the intended
+ * rate for the whole session.
+ */
+export function nextAlarmDelayS(observed: number[]): number {
+  const fastest = observed.length ? Math.min(...observed) : DEFAULT_INTERVAL_S;
+  return Math.max(MIN_INTERVAL_S, Math.min(MAX_INTERVAL_S, fastest));
+}
+
 export class PollScheduler {
   private state: DurableObjectState;
   private env: Env;
@@ -43,13 +60,13 @@ export class PollScheduler {
   /** Fires on schedule: poll each configured VIN, then re-arm at the pace the
    *  poller asks for (fast while driving, slow while parked/asleep). */
   async alarm(): Promise<void> {
-    let nextS = DEFAULT_INTERVAL_S;
+    const observed: number[] = [];
     try {
       const vins = (this.env.POLL_VINS ?? "").split(/[,\s]+/).map((v) => v.trim()).filter(Boolean);
       for (const vin of vins) {
         try {
           const r = await pollOnce(this.env, vin);
-          if (typeof r.next_interval_s === "number") nextS = Math.min(nextS, r.next_interval_s);
+          if (typeof r.next_interval_s === "number") observed.push(r.next_interval_s);
         } catch (e) {
           console.error("DO poll failed:", e instanceof Error ? e.message : e);
         }
@@ -59,8 +76,7 @@ export class PollScheduler {
       // even if code above throws. A failed setAlarm is re-thrown so the runtime
       // retries alarm() (rather than silently leaving the DO with no next alarm);
       // the /scheduler/start + GH re-arm paths are the outer safety net.
-      const clamped = Math.max(MIN_INTERVAL_S, Math.min(MAX_INTERVAL_S, nextS));
-      await this.state.storage.setAlarm(Date.now() + clamped * 1000);
+      await this.state.storage.setAlarm(Date.now() + nextAlarmDelayS(observed) * 1000);
     }
   }
 }
