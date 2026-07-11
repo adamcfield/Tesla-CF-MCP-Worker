@@ -484,6 +484,7 @@ async function runCronTickInner(env: Env): Promise<Record<string, unknown>> {
   }
 
   await pollWatchdog(env, summary);
+  await budgetWatchdog(env, summary);
   // Generate AI coach notes for recently-closed drives that don't have one.
   try {
     const n = await backfillCoachNotes(env);
@@ -603,6 +604,42 @@ async function pollWatchdog(env: Env, summary: Record<string, unknown>): Promise
       ruleId: "poll_watchdog",
       kind: "watchdog",
       message: `Polling appears DEAD (no /poll/now in >2h) for: ${stale.join(", ")} — check the tesla-poll GitHub Action`,
+      delivered: false,
+    });
+  } catch {
+    /* watchdog must never break the tick */
+  }
+}
+
+/**
+ * Budget watchdog: an alert-log entry (dashboard-visible, same channel as the
+ * poll watchdog) when month-to-date spend crosses 95% of BUDGET_POLL_USD.
+ * Streaming signal spend can't be stopped worker-side, so this is the
+ * early-warning layer in front of the $9.70 hard ceiling and Tesla's own
+ * $10 suspend — it catches a runaway (bridge outage double-posting, a burst
+ * of billed reads) while there's still headroom. At most once per 24h;
+ * exported for tests.
+ */
+export async function budgetWatchdog(env: Env, summary: Record<string, unknown>): Promise<void> {
+  const COOLDOWN_S = 24 * 3600;
+  try {
+    const b = await getBudgetStatus(env);
+    const budgetMicro = Math.round(b.poll_budget_usd * 1_000_000);
+    if (budgetMicro <= 0 || b.spent_micro < 0.95 * budgetMicro) return;
+    summary.budget_watchdog = { spent_usd: b.spent_usd, cap_usd: b.poll_budget_usd };
+    const now = Math.floor(Date.now() / 1000);
+    const last = Number((await getAppState(env, "budget_alert_ts")) ?? "0");
+    if (now - last < COOLDOWN_S) return;
+    await putAppState(env, "budget_alert_ts", String(now));
+    const pct = Math.round((b.spent_micro / budgetMicro) * 100);
+    await logAlert(env, {
+      ruleId: "budget_watchdog",
+      kind: "budget",
+      message:
+        `Tesla API spend is at ${pct}% of the $${b.poll_budget_usd} monthly cap ` +
+        `($${b.spent_usd.toFixed(2)} MTD). Automated polling stops at the cap; streaming ` +
+        `continues up to the $${b.hard_ceiling_usd} ceiling and Tesla suspends (never ` +
+        `charges) past $10. Everything resets on the 1st.`,
       delivered: false,
     });
   } catch {
