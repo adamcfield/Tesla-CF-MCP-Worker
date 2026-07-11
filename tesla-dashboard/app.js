@@ -5,7 +5,7 @@ import { destroyMaps, renderPointMap, renderRouteMap, renderLifetimeMap, createR
 // Bump on every change to this dashboard (UI, features, or the /data/*
 // endpoints it depends on) and add a matching entry to CHANGELOG.md — see
 // the versioning policy in the repo's CLAUDE.md. Shown in the sidebar footer.
-const APP_VERSION = "1.10.1";
+const APP_VERSION = "1.11.0";
 
 const root = document.getElementById("app");
 let shellBound = false; // guards one-time attach of the root click handler + sync timer
@@ -194,6 +194,7 @@ const state = {
   batteryTimelineRange: 0, // index into BATTERY_TIMELINE_RANGES (Battery timeline screen)
   tfCat: "__all", // Telemetry-fields screen: active category chip
   tfQuery: "", // Telemetry-fields screen: search text
+  tfField: null, // field-history popup: { tesla, canonical, hours }
   driverFilter: "__all", // "__all" | "__none" (unassigned) | driver name
   mediaDriverFilter: null, // selected driver chip on the Media screen's per-driver breakdown
   openDriveId: null,
@@ -494,12 +495,12 @@ function tickSyncLabel() {
 // closest("[data-action]") stops there instead of bubbling to the backdrop).
 // ---------------------------------------------------------------------------
 
-function openModal(html) {
+function openModal(html, wide = false) {
   const root = document.getElementById("tm-modal-root");
   if (!root) return;
   root.innerHTML = `
     <div class="tm-modal-backdrop" data-action="modal-close">
-      <div class="tm-modal" data-action="modal-noop">${html}</div>
+      <div class="tm-modal ${wide ? "tm-modal-wide" : ""}" data-action="modal-noop">${html}</div>
     </div>`;
 }
 /** Returns true if a modal was open (and is now closed) — lets the Escape handler know whether to also handle map-fullscreen. */
@@ -507,6 +508,7 @@ function closeModal() {
   const root = document.getElementById("tm-modal-root");
   if (!root || !root.innerHTML) return false;
   root.innerHTML = "";
+  state.tfField = null; // stale field-history fetches check this before rendering
   return true;
 }
 
@@ -569,6 +571,14 @@ function onRootClick(e) {
   } else if (action === "tf-cat") {
     state.tfCat = t.dataset.cat;
     renderTelemetryFields();
+  } else if (action === "tf-field") {
+    state.tfField = { tesla: t.dataset.t, canonical: t.dataset.c, hours: 24 };
+    openTfFieldModal();
+  } else if (action === "tf-field-range") {
+    if (state.tfField) {
+      state.tfField.hours = Number(t.dataset.h);
+      openTfFieldModal();
+    }
   } else if (action === "ov-goto-climate") {
     document.getElementById("tm-ov-climate")?.scrollIntoView({ behavior: "smooth", block: "start" });
   } else if (action === "tyres-popup") {
@@ -3153,8 +3163,10 @@ function tfRowsHtml(rows, status) {
     const st = status.get(r.field);
     const mapped = !!st;
     const seen = mapped && st.value != null;
+    // Mapped rows click through to the field's full recorded history.
+    const click = mapped ? `data-action="tf-field" data-t="${esc(r.field)}" data-c="${esc(st.canonical)}" title="See this field over time"` : "";
     return `
-      <div class="tm-table-row no-click" style="grid-template-columns:${TF_COLS};${mapped ? "" : "opacity:0.5;"}">
+      <div class="tm-table-row ${mapped ? "" : "no-click"}" ${click} style="grid-template-columns:${TF_COLS};${mapped ? "" : "opacity:0.5;"}">
         <div class="tm-mono tm-ellipsis" style="font-size:12px;" title="${esc(r.field)}${mapped ? ` → ${esc(st.canonical)}` : ""}">${esc(r.field)}</div>
         <div><span class="tm-pill tm-pill-chip" style="font-size:10px;">${esc(r.category || "—")}</span></div>
         <div class="tm-mono tm-ellipsis" style="${seen ? "" : "color:var(--faint);"}" title="${esc(fmtTfValue(st?.value))}">${seen ? esc(fmtTfValue(st.value)) : mapped ? "—" : "not tracked"}</div>
@@ -3162,6 +3174,77 @@ function tfRowsHtml(rows, status) {
         <div style="font-size:12px;color:var(--sub);white-space:normal;">${esc(r.description)}${mapped ? "" : ` <span style="color:var(--faint);">(deliberately unmapped: diagnostics/Semi-only/static config)</span>`}</div>
       </div>`;
   }).join("");
+}
+
+const TF_HISTORY_RANGES = [["24 h", 24], ["7 d", 24 * 7], ["30 d", 24 * 30], ["90 d", 24 * 90]];
+
+/**
+ * Field-history popup: the full recorded time series for one telemetry field —
+ * a chart when the values are numeric, a change-log table otherwise. Reads
+ * /data/series (positions column or EAV store, whichever holds the field), so
+ * it covers everything captured since tracking began, not just live values.
+ */
+async function openTfFieldModal() {
+  const { tesla, canonical, hours } = state.tfField;
+  const label = TF_HISTORY_RANGES.find(([, h]) => h === hours)?.[0] ?? `${hours}h`;
+  const chips = `<div class="tm-flex-row" style="gap:8px;flex-wrap:wrap;margin-bottom:12px;">
+    ${TF_HISTORY_RANGES.map(([l, h]) => `<button class="tm-chip-btn ${h === hours ? "active" : ""}" data-action="tf-field-range" data-h="${h}">${l}</button>`).join("")}
+  </div>`;
+  const head = `<div class="tm-modal-head">
+    <div><div class="tm-modal-title tm-mono">${esc(tesla)}</div><div class="tm-modal-sub">recorded history · stored as <code>${esc(canonical)}</code></div></div>
+    <button class="tm-icon-btn" data-action="modal-close" aria-label="Close">✕</button>
+  </div>`;
+
+  openModal(`${head}${chips}<div class="tm-mini-empty">Loading ${esc(label)} of history…</div>`, true);
+
+  if (canonical === "location") {
+    return openModal(`${head}${chips}<div class="tm-mini-empty">Location history is best seen as routes — check the Drives screen or the Lifetime map.</div>`, true);
+  }
+
+  let pts;
+  try {
+    pts = await data.series(vin(), canonical, hours);
+  } catch (e) {
+    return openModal(`${head}${chips}<div class="tm-suggest-error">Couldn't load history: ${esc(e?.message || "unknown error")}</div>`, true);
+  }
+  // Guard against a stale response landing after the modal moved on.
+  if (!state.tfField || state.tfField.canonical !== canonical || state.tfField.hours !== hours) return;
+
+  const rows = (pts || []).filter((p) => p.value != null);
+  if (!rows.length) {
+    return openModal(`${head}${chips}<div class="tm-mini-empty">Nothing recorded in the last ${esc(label)} — try a wider range. Fields only record when the car sends them (many change rarely).</div>`, true);
+  }
+
+  const numeric = rows.filter((p) => typeof p.value === "number").length >= rows.length / 2;
+  let body;
+  if (numeric) {
+    const nPts = rows.filter((p) => typeof p.value === "number").map((p) => [p.ts, p.value]);
+    body = nPts.length > 1
+      ? svgLineChart({
+          series: [{ points: nPts, area: true }],
+          yTicks: autoTicks(nPts.map((p) => p[1]), 4),
+          xTicks: buildDayTicks(nPts),
+        }) + `<div class="tm-stat-note">${fmt0(nPts.length)} samples in the last ${esc(label)}${rows.length >= 5000 ? " (capped at 5,000 — narrow the range for full detail)" : ""}</div>`
+      : `<div class="tm-mini-empty">Only one sample in this range.</div>`;
+  } else {
+    // Change log for enums/strings: newest first, consecutive repeats collapsed.
+    const changes = [];
+    let prev;
+    for (const p of rows) {
+      if (p.value !== prev) { changes.push(p); prev = p.value; }
+    }
+    changes.reverse();
+    const MAX_ROWS = 300;
+    body = `<div style="max-height:50vh;overflow-y:auto;">
+      ${changes.slice(0, MAX_ROWS).map((p) => `
+        <div class="tm-table-row no-click" style="grid-template-columns:170px 1fr;padding:9px 4px;">
+          <div class="tm-mono" style="font-size:11.5px;color:var(--sub);">${esc(fmtDateTime(p.ts))}</div>
+          <div class="tm-mono" style="font-size:12.5px;">${esc(fmtTfValue(p.value))}</div>
+        </div>`).join("")}
+    </div>
+    <div class="tm-stat-note">${fmt0(changes.length)} change${changes.length === 1 ? "" : "s"} in the last ${esc(label)}${changes.length > MAX_ROWS ? ` (showing latest ${MAX_ROWS})` : ""} — repeats collapsed.</div>`;
+  }
+  openModal(`${head}${chips}${body}`, true);
 }
 
 async function renderTelemetryFields() {

@@ -9,6 +9,21 @@ feature or screen, the **patch** version for fixes/tweaks/copy changes, and the
 configured. See `CLAUDE.md` at the repo root for the policy on keeping this file
 and `APP_VERSION` (in `app.js`) in sync.
 
+## 1.11.0 — 2026-07-11
+
+Telemetry fields: every field is now explorable **over time**, not just its
+latest value — asked as "I want to see them over time, every data that was
+captured".
+
+- Click any tracked field row → a popup with that field's full recorded
+  history: a time-series chart for numeric fields, a change log (timestamp +
+  value, consecutive repeats collapsed) for enums/strings. Time scope
+  switchable between 24 h / 7 d / 30 d / 90 d.
+- Reads the existing `/data/series` endpoint, which serves both the
+  per-sample driving columns and the on-change event store — so it covers
+  everything captured since tracking began (raw history is kept ~400 days
+  before pruning).
+
 ## 1.10.1 — 2026-07-11
 
 Tyres, in the units you actually think in — and a popup instead of a jump.
