@@ -40,7 +40,6 @@ Budget display split: percentages in the chrome, dollars on the API screen.
   figures — month spend, cap, per-day/per-kind call costs.
 - Pairs with the worker-side poll-budget raise `$7 → $9.50`
   (`BUDGET_POLL_USD` in wrangler.toml; hard ceiling stays $9.70).
->>>>>>> main
 
 ## 1.12.0 — 2026-07-11
 
