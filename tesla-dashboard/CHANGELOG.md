@@ -9,6 +9,23 @@ feature or screen, the **patch** version for fixes/tweaks/copy changes, and the
 configured. See `CLAUDE.md` at the repo root for the policy on keeping this file
 and `APP_VERSION` (in `app.js`) in sync.
 
+## 1.12.0 — 2026-07-11
+
+Three fixes from the BugDrop backlog (issues #35, #36, #37).
+
+- **#35/chart tooltips**: every line chart (charge level, battery timeline,
+  cabin climate, telemetry field history, battery health…) now shows a
+  tooltip following the mouse — the nearest data point's time and value,
+  with one labeled line per series on multi-series charts.
+- **#36/sidebar headers**: the nav group headers (Driving, Media, Charging,
+  Battery, Data) are more noticeable — slightly larger, bolder, darker,
+  with a hairline separator above each group.
+- **#37/duplicate timeline rows**: consecutive same-state rows ("Offline"
+  right after "Offline" — connectivity flaps split one outage into several
+  records) are now combined into a single row spanning from the earliest
+  start, with the durations summed. A drive or charge in between still
+  separates them. Applies to the Timeline and Overview's recent activity.
+
 ## 1.11.0 — 2026-07-11
 
 Telemetry fields: every field is now explorable **over time**, not just its

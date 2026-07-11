@@ -18,6 +18,88 @@ function scale(points, { w, h, l = 46, r = 12, t = 12, b = 26, x0, x1, y0, y1 })
 
 const esc = (s) => String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;");
 
+// ---------------------------------------------------------------------------
+// Hover tooltips (#35): every svgLineChart registers its data + scale here;
+// one document-level listener maps the mouse to the nearest data point and
+// positions a single shared tooltip element. Registry is capped — charts from
+// screens navigated away from age out instead of accumulating.
+// ---------------------------------------------------------------------------
+
+let chartSeq = 0;
+const CHART_REGISTRY = new Map();
+const REGISTRY_CAP = 48;
+
+function registerChart(meta) {
+  const id = `tmch${++chartSeq}`;
+  CHART_REGISTRY.set(id, meta);
+  if (CHART_REGISTRY.size > REGISTRY_CAP) CHART_REGISTRY.delete(CHART_REGISTRY.keys().next().value);
+  return id;
+}
+
+let tipEl = null;
+function tip() {
+  if (!tipEl) {
+    tipEl = document.createElement("div");
+    tipEl.className = "tm-chart-tip";
+    tipEl.style.display = "none";
+    document.body.appendChild(tipEl);
+  }
+  return tipEl;
+}
+
+/** Nearest index by x in an x-ascending [[x,y],...] array. */
+function nearestIdx(pts, x) {
+  let lo = 0, hi = pts.length - 1;
+  while (hi - lo > 1) {
+    const mid = (lo + hi) >> 1;
+    if (pts[mid][0] < x) lo = mid; else hi = mid;
+  }
+  return x - pts[lo][0] <= pts[hi][0] - x ? lo : hi;
+}
+
+function fmtTipX(x) {
+  if (x > 1e9) { // epoch seconds → local day + time
+    return new Date(x * 1000).toLocaleString(undefined, { weekday: "short", hour: "2-digit", minute: "2-digit", hour12: false });
+  }
+  return String(Math.round(x * 100) / 100);
+}
+
+function fmtTipY(y) {
+  return typeof y === "number" ? String(Math.round(y * 100) / 100) : String(y);
+}
+
+document.addEventListener("mousemove", (ev) => {
+  const svg = ev.target?.closest?.("svg[data-tmchart]");
+  const t = tip();
+  const meta = svg ? CHART_REGISTRY.get(svg.dataset.tmchart) : null;
+  if (!meta) { t.style.display = "none"; return; }
+
+  // Map client-x into viewBox units (the SVG scales uniformly, width-driven).
+  const rect = svg.getBoundingClientRect();
+  const svgX = ((ev.clientX - rect.left) / rect.width) * meta.width;
+  const frac = (svgX - meta.left) / (meta.right - meta.left);
+  if (frac < -0.02 || frac > 1.02) { t.style.display = "none"; return; }
+  const dataX = meta.X0 + Math.max(0, Math.min(1, frac)) * (meta.X1 - meta.X0);
+
+  const lines = meta.series
+    .filter((sr) => sr.points.length)
+    .map((sr) => {
+      const p = sr.points[nearestIdx(sr.points, dataX)];
+      return { name: sr.name, color: sr.color || "var(--accent)", x: p[0], y: p[1] };
+    });
+  if (!lines.length) { t.style.display = "none"; return; }
+
+  t.innerHTML = `<div class="tm-chart-tip-x">${esc(fmtTipX(lines[0].x))}</div>` + lines
+    .map((l) => `<div class="tm-chart-tip-row"><span class="tm-chart-tip-dot" style="background:${l.color};"></span>${l.name ? esc(l.name) + ": " : ""}<strong>${esc(fmtTipY(l.y))}</strong></div>`)
+    .join("");
+  t.style.display = "block";
+  // Keep the tooltip inside the viewport: flip to the left of the cursor near the right edge.
+  const tw = t.offsetWidth || 120;
+  const x = ev.clientX + 14 + tw > window.innerWidth ? ev.clientX - tw - 12 : ev.clientX + 14;
+  t.style.left = `${x}px`;
+  t.style.top = `${Math.max(4, ev.clientY - t.offsetHeight - 10)}px`;
+});
+
 /**
  * Multi-series line/area chart. `series`: [{points:[[x,y],...], color, dashed, area}]
  * `yTicks`/`xTicks`: [{value, label}] in DATA units (mapped through the shared scale).
@@ -64,7 +146,11 @@ export function svgLineChart({ width = 760, height = 210, series, yTicks = [], x
     })
     .join("");
 
-  return `<svg viewBox="0 0 ${width} ${height}" class="tm-svg-block">${grid}${xLabels}${seriesMarkup}</svg>`;
+  const chartId = registerChart({
+    width, X0: sc.X0, X1: sc.X1, left: sc.left, right: sc.right,
+    series: series.map((s) => ({ name: s.name, color: s.color, points: s.points })),
+  });
+  return `<svg viewBox="0 0 ${width} ${height}" class="tm-svg-block" data-tmchart="${chartId}">${grid}${xLabels}${seriesMarkup}</svg>`;
 }
 
 /**
