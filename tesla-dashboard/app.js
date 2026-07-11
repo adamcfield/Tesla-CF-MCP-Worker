@@ -5,7 +5,7 @@ import { destroyMaps, renderPointMap, renderRouteMap, renderLifetimeMap, createR
 // Bump on every change to this dashboard (UI, features, or the /data/*
 // endpoints it depends on) and add a matching entry to CHANGELOG.md — see
 // the versioning policy in the repo's CLAUDE.md. Shown in the sidebar footer.
-const APP_VERSION = "1.12.0";
+const APP_VERSION = "1.12.1";
 
 const root = document.getElementById("app");
 let shellBound = false; // guards one-time attach of the root click handler + sync timer
@@ -962,36 +962,47 @@ async function loadLiveVehicleData() {
   await renderOverview();
 }
 
-/** Month-end forecast line shared by budgetCard() and sideBudgetHtml(). */
+/** Month-end forecast line shared by the API screen and sideBudgetHtml().
+ * Dollar figures appear ONLY in the non-compact (API screen) variant; the
+ * compact sidebar variant speaks in % of the poll cap. */
 function budgetForecastNote(b, compact) {
   const f = b.forecast;
   if (!f || f.method === "insufficient_data") return "";
   const overBudget = f.projected_over_budget === true;
   const warn = overBudget || f.budget_exhausted_in_days != null;
+  const projPct = b.poll_budget_usd > 0 && f.projected_month_usd != null
+    ? (f.projected_month_usd / b.poll_budget_usd) * 100 : null;
   const text = f.budget_exhausted_in_days != null
     ? `At this rate, runs out in ~${fmt1(f.budget_exhausted_in_days)} day${f.budget_exhausted_in_days === 1 ? "" : "s"} — before month-end`
     : overBudget
-      ? `Projected ≈ $${fmt2(f.projected_month_usd)} by month-end — over the $${fmt0(b.poll_budget_usd)} cap`
-      : `On track — projected ≈ $${fmt2(f.projected_month_usd)} by month-end`;
+      ? (compact && projPct != null
+        ? `Projected ≈ ${fmt0(projPct)}% of the cap by month-end`
+        : `Projected ≈ $${fmt2(f.projected_month_usd)} by month-end — over the $${fmt2(b.poll_budget_usd)} cap`)
+      : (compact && projPct != null
+        ? `On track — ≈ ${fmt0(projPct)}% of the cap by month-end`
+        : `On track — projected ≈ $${fmt2(f.projected_month_usd)} by month-end`);
   return compact
     ? `<div style="font-size:10.5px;color:${warn ? "var(--warn)" : "var(--faint)"};margin-top:3px;">${esc(text)}</div>`
     : `<div class="tm-stat-note" style="${warn ? "color:var(--warn);" : ""}">${esc(text)}</div>`;
 }
 
-/** Compact Tesla API spend for the sidebar (calls + $ spend + a one-line forecast, above the theme toggle). */
+/** Compact Tesla API spend for the sidebar (calls + % of the poll cap + a
+ * one-line forecast, above the theme toggle). Percentage ONLY by design —
+ * actual dollar figures live on the API screen (click through for them). */
 function sideBudgetHtml(b) {
   if (!b || typeof b !== "object") return "";
   const cap = b.poll_budget_usd > 0 ? b.poll_budget_usd : null;
-  const pct = cap ? Math.min(100, (b.spent_usd / cap) * 100) : 0;
+  const pctTrue = cap ? (b.spent_usd / cap) * 100 : null;
+  const pctBar = pctTrue != null ? Math.min(100, pctTrue) : 0;
   const atRisk = b.poll_allowed === false || b.forecast?.projected_over_budget === true || b.forecast?.budget_exhausted_in_days != null;
   const color = atRisk ? "var(--warn)" : "var(--good)";
   const calls = [b.reads, b.billed_reads, b.count, b.calls].find((v) => typeof v === "number");
   return `
     <div class="tm-sidebudget-top">
       <span>Tesla API${calls != null ? ` · ${fmt0(calls)} calls` : ""}</span>
-      <span class="tm-mono">$${fmt2(b.spent_usd)}${cap ? ` <span style="color:var(--faint);">/ ${fmt0(cap)}</span>` : ""}</span>
+      <span class="tm-mono">${pctTrue != null ? `${fmt0(pctTrue)}<span style="color:var(--faint);">%</span>` : "—"}</span>
     </div>
-    ${cap ? `<div class="tm-sidebudget-bar"><div style="width:${pct.toFixed(1)}%;background:${color};"></div></div>` : ""}
+    ${cap ? `<div class="tm-sidebudget-bar"><div style="width:${pctBar.toFixed(1)}%;background:${color};"></div></div>` : ""}
     ${budgetForecastNote(b, true)}`;
 }
 function updateSideBudget(b) {

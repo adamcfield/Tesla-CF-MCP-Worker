@@ -9,6 +9,18 @@ feature or screen, the **patch** version for fixes/tweaks/copy changes, and the
 configured. See `CLAUDE.md` at the repo root for the policy on keeping this file
 and `APP_VERSION` (in `app.js`) in sync.
 
+## 1.12.1 — 2026-07-11
+
+Budget display split: percentages in the chrome, dollars on the API screen.
+
+- **Sidebar API widget**: now shows **% of the poll cap used** (e.g. `77%`)
+  instead of dollar figures; the compact month-end forecast line speaks in
+  % of the cap too. Clicking through to the API screen is unchanged.
+- **API screen**: keeps (and remains the only place for) actual dollar
+  figures — month spend, cap, per-day/per-kind call costs.
+- Pairs with the worker-side poll-budget raise `$7 → $9.50`
+  (`BUDGET_POLL_USD` in wrangler.toml; hard ceiling stays $9.70).
+
 ## 1.12.0 — 2026-07-11
 
 Three fixes from the BugDrop backlog (issues #35, #36, #37).

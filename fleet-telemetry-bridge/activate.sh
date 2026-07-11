@@ -6,7 +6,7 @@
 #
 # What it does (all the credential-gated steps I can't do for you):
 #   1. Tells the Worker the ingest token so the forwarder's POSTs are accepted.
-#   2. Lowers the poll budget to $7 so streaming signals stay inside the $10 credit.
+#   2. (informational) The poll budget is a wrangler.toml var, not a secret.
 #   3. Registers the streaming config with Tesla (hostname + CA + field plan).
 #   4. Waits until the car reports the config as synced.
 #
@@ -37,8 +37,11 @@ echo "   ok (token ${#INGEST_TOKEN} chars, CA $(echo "$CA_PEM" | wc -l | tr -d '
 echo "== 1/4  Set Worker secret INGEST_TOKEN =="
 ( cd "$WORKER_DIR" && printf '%s' "$INGEST_TOKEN" | npx wrangler secret put INGEST_TOKEN )
 
-echo "== 2/4  Lower poll budget to \$7 (room for streaming signals) =="
-( cd "$WORKER_DIR" && printf '7' | npx wrangler secret put BUDGET_POLL_USD )
+echo "== 2/4  Poll budget note =="
+# BUDGET_POLL_USD is a [vars] entry in tesla-cf-mcp-worker/wrangler.toml — it can
+# NEVER be set with `wrangler secret put` (Cloudflare rejects the name collision,
+# error 10053). Edit the var + `wrangler deploy` to change the cap.
+echo "   BUDGET_POLL_USD is set in wrangler.toml (edit + deploy to change) — skipping."
 
 echo "== 3/4  Register streaming config with Tesla =="
 PAYLOAD=$(CA="$CA_PEM" VIN="$VIN" HOST="$HOST" PORT="$PORT" python3 - <<'PY'
