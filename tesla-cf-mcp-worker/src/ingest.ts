@@ -21,7 +21,7 @@
 
 import { recordSpend } from "./budget";
 import { evaluateOnIngest } from "./rules";
-import { LatestState, mergeLatest, POSITION_COLUMNS, recordEvents, TelemetryEvent } from "./store";
+import { getLatest, LatestState, mergeLatest, POSITION_COLUMNS, recordEvents, TelemetryEvent } from "./store";
 import { applyDerivation } from "./tracking";
 import { Env } from "./types";
 
@@ -530,4 +530,45 @@ export async function applyVehicleData(
     fields.Location = { latitude: drive.latitude, longitude: drive.longitude };
   }
   return applyIngest(env, { vin, ts, fields });
+}
+
+// ---------------------------------------------------------------------------
+// Telemetry field status — powers the dashboard's "Telemetry fields" screen
+// ---------------------------------------------------------------------------
+
+/**
+ * Per-field live status for every Tesla field name this worker maps: the
+ * canonical key it lands under, the latest merged value (null = never seen),
+ * and when it was last recorded. The dashboard joins this against the vendored
+ * fleet_streaming_fields.csv so the user can scroll every attribute Tesla can
+ * stream and see what's actually coming in. EAV last-seen comes from one
+ * indexed GROUP BY; position-column fields share the latest positions row's
+ * timestamp (they're sampled together into that row).
+ */
+export async function getTelemetryFieldStatus(env: Env, vin: string): Promise<unknown> {
+  const latest = ((await getLatest(env, vin)) ?? {}) as Record<string, unknown>;
+  const rs = await env.DB.prepare(
+    `SELECT field, MAX(ts) AS last_ts FROM telemetry_events WHERE vin = ?1 GROUP BY field`,
+  )
+    .bind(vin)
+    .all<{ field: string; last_ts: number }>();
+  const lastSeen = new Map((rs.results ?? []).map((r) => [r.field, r.last_ts]));
+  const pos = await env.DB.prepare(`SELECT MAX(ts) AS last_ts FROM positions WHERE vin = ?1`)
+    .bind(vin)
+    .first<{ last_ts: number | null }>();
+
+  const fields = Object.entries(FIELD_MAP).map(([tesla, canonical]) => {
+    // Location is unwrapped into lat/lon before it reaches the latest doc.
+    const value =
+      canonical === "location"
+        ? (latest.lat != null && latest.lon != null ? `${latest.lat}, ${latest.lon}` : null)
+        : latest[canonical] === undefined ? null : latest[canonical];
+    const seen =
+      lastSeen.get(canonical) ??
+      (POSITION_COLUMNS.has(canonical) || canonical === "location"
+        ? (value != null ? pos?.last_ts ?? null : null)
+        : null);
+    return { tesla, canonical, value, last_seen: seen ?? null };
+  });
+  return { vin, fields };
 }
