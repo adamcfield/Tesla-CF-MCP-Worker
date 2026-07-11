@@ -197,6 +197,60 @@ describe("cross-poller billed-read gap scales with the paced cadence", () => {
   });
 });
 
+describe("telemetry-first: streaming suppresses billed REST reads", () => {
+  let kv: FakeKV;
+  beforeEach(async () => {
+    kv = new FakeKV();
+    await kv.put("tesla:refresh_token", "R0");
+  });
+  afterEach(() => vi.restoreAllMocks());
+
+  it("skips the billed read while the stream stamp is fresh and a reconciliation read is recent", async () => {
+    const env = makeEnv(kv);
+    let vehicleDataCalls = 0;
+    vi.stubGlobal("fetch", vi.fn(async (url: string) => {
+      const u = String(url);
+      if (u.includes("/oauth2/v3/token")) {
+        return new Response(JSON.stringify({ access_token: "A", refresh_token: "R", expires_in: 3600, token_type: "Bearer" }), { status: 200 });
+      }
+      if (u.includes("/vehicle_data")) {
+        vehicleDataCalls++;
+        return new Response(JSON.stringify({ response: {} }), { status: 200 });
+      }
+      return new Response(JSON.stringify({ response: { vin: VIN, state: "online" } }), { status: 200 });
+    }));
+    const now = Math.floor(Date.now() / 1000);
+    await putAppState(env, `stream_ok_ts:${VIN}`, String(now - 30)); // stream alive
+    await putAppState(env, `billed_ts:${VIN}`, `${now - 600} 90`); // reconciled 10 min ago
+    const r = await pollOnce(env, VIN);
+    expect(r.activity).toBe("stream_covered");
+    expect(r.polled).toBe(false);
+    expect(r.active).toBe(false);
+    expect(vehicleDataCalls).toBe(0); // no billed read at all
+  });
+
+  it("still does an hourly reconciliation read despite a healthy stream", async () => {
+    const env = makeEnv(kv);
+    stubTesla({ state: "online", shift: "P", speed: 0 });
+    const now = Math.floor(Date.now() / 1000);
+    await putAppState(env, `stream_ok_ts:${VIN}`, String(now - 30)); // stream alive
+    await putAppState(env, `billed_ts:${VIN}`, `${now - 2 * 3600} 90`); // last billed read 2h ago
+    const r = await pollOnce(env, VIN);
+    expect(r.polled).toBe(true); // reconciliation happened
+  });
+
+  it("falls back to normal REST pacing the moment the stream goes quiet", async () => {
+    const env = makeEnv(kv);
+    stubTesla({ state: "online", shift: "D", speed: 45 });
+    const now = Math.floor(Date.now() / 1000);
+    await putAppState(env, `stream_ok_ts:${VIN}`, String(now - 400)); // stale (> 330s window)
+    const r = await pollOnce(env, VIN);
+    expect(r.activity).toBe("driving"); // normal billed burst resumed
+    expect(r.polled).toBe(true);
+    expect(r.next_interval_s).toBe(10);
+  });
+});
+
 describe("DO scheduler re-arm delay", () => {
   it("respects the paced interval instead of flooring it at 90s", () => {
     // Regression: the min() fold was seeded with the 90s default, so a 150s
