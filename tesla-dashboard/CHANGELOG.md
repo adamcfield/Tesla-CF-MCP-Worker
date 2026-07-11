@@ -9,6 +9,19 @@ feature or screen, the **patch** version for fixes/tweaks/copy changes, and the
 configured. See `CLAUDE.md` at the repo root for the policy on keeping this file
 and `APP_VERSION` (in `app.js`) in sync.
 
+## 1.10.1 — 2026-07-11
+
+Tyres, in the units you actually think in — and a popup instead of a jump.
+
+- Clicking the Overview Tyres readout now opens a popup with all four
+  wheels (PSI primary, bar underneath), per-wheel warnings, any
+  falling-pressure trend spelled out in PSI/week, and a button through to
+  the full pressure history on Statistics. Previously it navigated to
+  Statistics and left you at the top of the page.
+- The Statistics tyre card switched from bar to PSI (bar kept as the small
+  secondary line) — the Overview readout said "41 PSI" while Statistics
+  said "2.9", which read as "3 instead of 42".
+
 ## 1.10.0 — 2026-07-11
 
 New "Cabin climate" card on Overview — asked as "it's very hot outside, can
