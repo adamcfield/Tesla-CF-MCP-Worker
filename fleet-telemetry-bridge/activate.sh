@@ -46,14 +46,13 @@ echo "   BUDGET_POLL_USD is set in wrangler.toml (edit + deploy to change) — s
 echo "== 3/4  Register streaming config with Tesla =="
 PAYLOAD=$(CA="$CA_PEM" VIN="$VIN" HOST="$HOST" PORT="$PORT" python3 - <<'PY'
 import json, os
-# 2026-07-11: full-coverage plan — every streamable field from
-# tesla-dashboard/fleet_streaming_fields.csv (239 fields). Intervals are the
-# MINIMUM GAP between on-change transmissions, so rarely-changing fields cost
-# ~nothing regardless of interval; continuous signals get larger gaps
-# (Di* diagnostics 120s, pack stats 120s, static config 3600s) and
-# drive-dynamics/safety events small ones (5-15s). Wrong-vehicle-class fields
-# (Semitruck*/Tonneau*/Powershare*) are registered but never emit on this car.
-# The original 39 fields keep their previous intervals exactly.
+# 2026-07-11: full-coverage plan — every streamable field THIS VEHICLE accepts
+# (228 of the 239 in tesla-dashboard/fleet_streaming_fields.csv — Tesla 400s the
+# 11 Semitruck* fields on non-Semi vehicles, so they are omitted; the Cybertruck
+# fields are accepted but never emit). Intervals are the MINIMUM GAP between
+# on-change transmissions, so rarely-changing fields cost ~nothing regardless.
+# SelfDrivingMilesSinceReset is an accumulator — Tesla requires an explicit
+# minimum_delta >= 1 for it. Verified ACCEPTED + SYNCED on 2026-07-11.
 fields = {
  "ACChargingEnergyIn": {"interval_seconds": 60},
  "ACChargingPower": {"interval_seconds": 30},
@@ -244,18 +243,7 @@ fields = {
  "SeatHeaterRearRight": {"interval_seconds": 120},
  "SeatHeaterRight": {"interval_seconds": 120},
  "SeatVentEnabled": {"interval_seconds": 120},
- "SelfDrivingMilesSinceReset": {"interval_seconds": 300},
- "SemitruckPassengerSeatFoldPosition": {"interval_seconds": 3600},
- "SemitruckTpmsPressureRe1L0": {"interval_seconds": 3600},
- "SemitruckTpmsPressureRe1L1": {"interval_seconds": 3600},
- "SemitruckTpmsPressureRe1R0": {"interval_seconds": 3600},
- "SemitruckTpmsPressureRe1R1": {"interval_seconds": 3600},
- "SemitruckTpmsPressureRe2L0": {"interval_seconds": 3600},
- "SemitruckTpmsPressureRe2L1": {"interval_seconds": 3600},
- "SemitruckTpmsPressureRe2R0": {"interval_seconds": 3600},
- "SemitruckTpmsPressureRe2R1": {"interval_seconds": 3600},
- "SemitruckTractorParkBrakeStatus": {"interval_seconds": 3600},
- "SemitruckTrailerParkBrakeStatus": {"interval_seconds": 3600},
+ "SelfDrivingMilesSinceReset": {"interval_seconds": 300, "minimum_delta": 1},
  "SentryMode": {"interval_seconds": 300},
  "ServiceMode": {"interval_seconds": 15},
  "Setting24HourTime": {"interval_seconds": 3600},
