@@ -79,7 +79,7 @@ function baseMap(el, opts = {}) {
   const map = L.map(el, {
     zoomControl: false,
     attributionControl: true,
-    scrollWheelZoom: false,
+    scrollWheelZoom: true,
     ...opts,
   });
   const { streets, aerial, osm, dark } = govmapLayers();

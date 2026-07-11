@@ -9,6 +9,13 @@ feature or screen, the **patch** version for fixes/tweaks/copy changes, and the
 configured. See `CLAUDE.md` at the repo root for the policy on keeping this file
 and `APP_VERSION` (in `app.js`) in sync.
 
+## 1.7.1 — 2026-07-08
+
+**#21**: map cards now zoom with the mouse wheel (was disabled outright).
+Click-drag panning was already on by default in Leaflet — nothing to
+change there, just confirmed it wasn't being blocked by anything else on
+the map card.
+
 ## 1.7.0 — 2026-07-07
 
 New changelog viewer: clicking the version number in the sidebar now opens a
