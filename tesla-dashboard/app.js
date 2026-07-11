@@ -5,7 +5,7 @@ import { destroyMaps, renderPointMap, renderRouteMap, renderLifetimeMap, createR
 // Bump on every change to this dashboard (UI, features, or the /data/*
 // endpoints it depends on) and add a matching entry to CHANGELOG.md — see
 // the versioning policy in the repo's CLAUDE.md. Shown in the sidebar footer.
-const APP_VERSION = "1.9.0";
+const APP_VERSION = "1.9.1";
 
 const root = document.getElementById("app");
 let shellBound = false; // guards one-time attach of the root click handler + sync timer
@@ -569,6 +569,13 @@ function onRootClick(e) {
   } else if (action === "tf-cat") {
     state.tfCat = t.dataset.cat;
     renderTelemetryFields();
+  } else if (action === "driver-other-toggle") {
+    const other = document.getElementById("tm-driver-other");
+    if (other) {
+      const open = other.style.display !== "none";
+      other.style.display = open ? "none" : "inline-flex";
+      if (!open) document.getElementById("tm-driver-input")?.focus();
+    }
   } else if (action === "driver-filter") {
     state.driverFilter = t.dataset.driver;
     renderDrives();
@@ -1996,20 +2003,28 @@ async function renderDriveDetail() {
       ${synthetic ? syntheticBadgeHtml() : ""}
       <div class="tm-flex-row" style="margin-left:auto;gap:6px;">
         <a class="tm-chip-btn" style="padding:5px 12px;" href="${esc(exportUrl("/data/export/drive.gpx", { id: d.id }))}" target="_blank" rel="noopener" download>&#11015; GPX</a>
-        <span style="font-size:12px;color:var(--sub);">Driver:</span>
-        <input id="tm-driver-input" list="tm-driver-names-detail" class="tm-gate-input" style="width:140px;padding:5px 9px;font-family:var(--ui);" placeholder="${esc(d.suggested_driver ? `${d.suggested_driver}?` : "unassigned")}" value="${esc(d.driver || "")}" autocomplete="off">
-        <button class="tm-chip-btn" style="padding:5px 12px;" data-action="save-driver" data-id="${d.id}">Save</button>
       </div>
     </div>
     ${(() => {
-      const quickNames = [...new Set(roster.map(rosterName).filter(Boolean))].sort((a, b) => a.localeCompare(b)).filter((n) => n !== (d.driver || ""));
-      return quickNames.length ? `<div class="tm-flex-row" style="gap:8px;align-items:baseline;flex-wrap:wrap;">
-        <span style="font-size:12px;color:var(--sub);">${d.driver ? "Not right? Reassign to:" : "Or assign to:"}</span>
-        <div class="tm-quick-assign" style="margin-top:0;">${quickNames.map((n) => `<button type="button" class="tm-quick-chip" data-action="quick-assign" data-id="${d.id}" data-driver="${esc(n)}">${esc(n)}</button>`).join("")}</div>
-      </div>` : "";
+      // ONE driver control (was three: a header input+Save, a reassign-chip
+      // row, and a Household hint — issue #24). The roster chips ARE the
+      // API-derived household list; the current driver renders active; a
+      // suggested driver gets a "?" chip to confirm in one tap; "other…"
+      // reveals the free-text input for a name not on the roster.
+      const names = [...new Set([...roster.map(rosterName), d.driver].filter(Boolean))].sort((a, b) => a.localeCompare(b));
+      return `<div class="tm-flex-row" style="gap:8px;align-items:center;flex-wrap:wrap;">
+        <span style="font-size:12px;color:var(--sub);">Driver:</span>
+        <div class="tm-quick-assign" style="margin-top:0;">
+          ${names.map((n) => `<button type="button" class="tm-quick-chip ${n === d.driver ? "active" : ""}" data-action="quick-assign" data-id="${d.id}" data-driver="${esc(n)}" ${n === d.driver ? 'title="Currently assigned"' : ""}>${esc(n)}${!d.driver && n === d.suggested_driver ? "?" : ""}</button>`).join("")}
+        </div>
+        <button type="button" class="tm-link-btn" data-action="driver-other-toggle" style="font-size:12px;">other…</button>
+        <span id="tm-driver-other" style="display:none;gap:6px;align-items:center;">
+          <input id="tm-driver-input" list="tm-driver-names-detail" class="tm-gate-input" style="width:140px;padding:5px 9px;font-family:var(--ui);" placeholder="name…" value="${esc(d.driver || "")}" autocomplete="off">
+          <button class="tm-chip-btn" style="padding:5px 12px;" data-action="save-driver" data-id="${d.id}">Save</button>
+        </span>
+      </div>
+      <div style="font-size:12px;color:var(--faint);">${!d.driver && d.suggested_driver ? `Looks like <span class="tm-driver-suggested">${esc(d.suggested_driver)}</span> drove this — tap their name to confirm. ` : ""}${esc(DRIVER_MANUAL_NOTE)}</div>`;
     })()}
-    ${rosterHintHtml(roster)}
-    <div style="font-size:12px;color:var(--faint);">${esc(DRIVER_MANUAL_NOTE)}${!d.driver && d.suggested_driver ? ` Looks like <span class="tm-driver-suggested">${esc(d.suggested_driver)}</span> drove this — pick a name and Save to confirm.` : ""}</div>
 
     <div class="tm-grid-2-wide">
       <div class="tm-drive-livegrid">

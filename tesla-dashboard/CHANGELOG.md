@@ -9,6 +9,17 @@ feature or screen, the **patch** version for fixes/tweaks/copy changes, and the
 configured. See `CLAUDE.md` at the repo root for the policy on keeping this file
 and `APP_VERSION` (in `app.js`) in sync.
 
+## 1.9.1 — 2026-07-11
+
+**#24**: the drive-detail page showed the driver in three separate spots (a
+header input + Save, a "Not right? Reassign to:" chip row, and a Household
+hint row). Consolidated to ONE control: a single "Driver:" chip row built
+from the Tesla-account roster — the assigned driver is highlighted, a
+system-suggested driver shows with a "?" for one-tap confirmation, and an
+"other…" link reveals the free-text input for names not on the roster. The
+system still finds the driver on its own when it's confident (unchanged
+auto-assignment), so usually there's nothing to do here at all.
+
 ## 1.9.0 — 2026-07-11
 
 New "Telemetry fields" screen (Data section in the sidebar): every attribute
