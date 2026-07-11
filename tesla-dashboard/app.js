@@ -2774,10 +2774,11 @@ async function renderPlaceDetail() {
       <div class="tm-grid-half" style="align-content:start;">
         <div class="tm-card" style="padding:18px 20px;"><div class="tm-stat-label">Drives from here</div><div class="tm-stat-value">${fmt0(stats.drives_from)}</div></div>
         <div class="tm-card" style="padding:18px 20px;"><div class="tm-stat-label">Drives to here</div><div class="tm-stat-value">${fmt0(stats.drives_to)}</div></div>
+        ${stats.charge_sessions > 0 ? `
         <div class="tm-card" style="padding:18px 20px;"><div class="tm-stat-label">Charge sessions</div><div class="tm-stat-value">${fmt0(stats.charge_sessions)}</div></div>
         <div class="tm-card" style="padding:18px 20px;"><div class="tm-stat-label">Energy charged</div><div class="tm-stat-value">${fmt1(stats.total_energy_added_kwh)} <span class="tm-stat-unit">kWh</span></div></div>
         <div class="tm-card" style="padding:18px 20px;"><div class="tm-stat-label">Charging cost</div><div class="tm-stat-value">${money(stats.total_cost, cur)}</div></div>
-        ${l.cost_per_kwh != null ? `<div class="tm-card" style="padding:18px 20px;"><div class="tm-stat-label">Tariff</div><div class="tm-stat-value">${money(l.cost_per_kwh, cur)} <span class="tm-stat-unit">/kWh</span></div></div>` : ""}
+        ${l.cost_per_kwh != null ? `<div class="tm-card" style="padding:18px 20px;"><div class="tm-stat-label">Tariff</div><div class="tm-stat-value">${money(l.cost_per_kwh, cur)} <span class="tm-stat-unit">/kWh</span></div></div>` : ""}` : ""}
       </div>
     </div>
     ${placeHistoryHtml(history, l.name, cur)}
