@@ -5,7 +5,7 @@ import { destroyMaps, renderPointMap, renderRouteMap, renderLifetimeMap, createR
 // Bump on every change to this dashboard (UI, features, or the /data/*
 // endpoints it depends on) and add a matching entry to CHANGELOG.md — see
 // the versioning policy in the repo's CLAUDE.md. Shown in the sidebar footer.
-const APP_VERSION = "1.12.1";
+const APP_VERSION = "1.13.1";
 
 const root = document.getElementById("app");
 let shellBound = false; // guards one-time attach of the root click handler + sync timer
@@ -198,6 +198,7 @@ const state = {
   driverFilter: "__all", // "__all" | "__none" (unassigned) | driver name
   mediaDriverFilter: null, // selected driver chip on the Media screen's per-driver breakdown
   openDriveId: null,
+  openDriverName: null, // Drivers screen: driver whose detail page is open (issue #39)
   openChargeId: null,
   openPlaceId: null,
   editingPlaceTags: false, // place-detail: driver-tag chip editor open/closed
@@ -304,16 +305,19 @@ function hashToState(hash) {
   if (!raw) return null;
   const [screen, idStr] = raw.split("/");
   if (!TITLES[screen]) return null;
+  // "dv" carries a driver NAME (URI-encoded string); the others carry numeric ids.
+  if (screen === "dv") return { screen, id: null, name: idStr ? decodeURIComponent(idStr) : null };
   const id = idStr ? Number(idStr) : null;
-  return { screen, id: Number.isFinite(id) ? id : null };
+  return { screen, id: Number.isFinite(id) ? id : null, name: null };
 }
 function stateToHash() {
   if (state.screen === "dr" && state.openDriveId != null) return `#dr/${state.openDriveId}`;
   if (state.screen === "ch" && state.openChargeId != null) return `#ch/${state.openChargeId}`;
   if (state.screen === "pl" && state.openPlaceId != null) return `#pl/${state.openPlaceId}`;
+  if (state.screen === "dv" && state.openDriverName != null) return `#dv/${encodeURIComponent(state.openDriverName)}`;
   return `#${state.screen}`;
 }
-/** Call after any change to state.screen/openDriveId/openChargeId/openPlaceId. */
+/** Call after any change to state.screen/openDriveId/openChargeId/openPlaceId/openDriverName. */
 function pushHistory() {
   const hash = stateToHash();
   if (location.hash !== hash) { try { history.pushState(null, "", hash); } catch { /* sandboxed */ } }
@@ -326,6 +330,7 @@ function applyHashToState() {
   state.openDriveId = parsed.screen === "dr" ? parsed.id : null;
   state.openChargeId = parsed.screen === "ch" ? parsed.id : null;
   state.openPlaceId = parsed.screen === "pl" ? parsed.id : null;
+  state.openDriverName = parsed.screen === "dv" ? parsed.name : null;
   return true;
 }
 
@@ -544,6 +549,7 @@ function onRootClick(e) {
     state.openDriveId = null;
     state.openChargeId = null;
     state.openPlaceId = null;
+    state.openDriverName = null;
     pushHistory();
     renderShell();
     showScreen();
@@ -716,6 +722,14 @@ function onRootClick(e) {
       t.disabled = false;
       t.textContent = "Failed";
     });
+  } else if (action === "open-driver") {
+    state.openDriverName = t.dataset.name;
+    pushHistory();
+    renderDrivers();
+  } else if (action === "back-drivers") {
+    state.openDriverName = null;
+    pushHistory();
+    renderDrivers();
   } else if (action === "open-drive") {
     // Opening a drive is a navigation into the Drives section — keep the left-nav
     // highlight + header in sync (the detail can be reached from Overview/Timeline too).
@@ -2324,7 +2338,80 @@ const FIDELITY_LABEL = {
   sparse: "sparse — harsh-event metrics not meaningful at this sampling",
 };
 
+/**
+ * Driver detail (issue #39): one driver's stats, their recent routes on a map,
+ * and their drives list — everything already fetched elsewhere, filtered to
+ * one person. Reached by clicking a driver card on the Drivers screen.
+ */
+async function renderDriverDetail() {
+  const name = state.openDriverName;
+  const [res, all] = await Promise.all([
+    safe(data.driverScores(vin()), null),
+    cached("all_drives", () => data.drives(vin(), 2000)),
+  ]);
+  const d = res?.drivers?.find((x) => x.driver === name) || null;
+  const theirs = all.filter((x) => x.driver === name);
+  const km = theirs.reduce((sum, x) => sum + (x.distance_km || 0), 0);
+  const stat = (label, v, unit, dp = 0) => `
+    <div class="tm-card tm-card-pad-metric">
+      <div class="tm-stat-label">${label}</div>
+      <div class="tm-stat-value">${v != null ? (dp ? fmt1(v) : fmt0(v)) : "—"} <span class="tm-stat-unit">${unit}</span></div>
+    </div>`;
+
+  setContent(`
+    <div class="tm-flex-row" style="gap:14px;flex-wrap:wrap;">
+      <button class="tm-back-btn" data-action="back-drivers">← Drivers</button>
+      <div style="font-size:15px;font-weight:600;">${esc(name)}</div>
+      ${d?.behavior_score != null ? `<span style="font-size:22px;font-weight:600;font-family:var(--mono);color:${scoreColor(d.behavior_score)};">${d.behavior_score}</span><span style="font-size:11px;color:var(--faint);">safety score</span>` : ""}
+      <div style="font-size:12.5px;color:var(--faint);">${theirs.length} drive${theirs.length === 1 ? "" : "s"} · ${fmt0(km)} km</div>
+    </div>
+    ${d ? `<div class="tm-grid-metrics">
+      ${stat("Avg speed", d.avg_speed_kmh, "km/h")}
+      ${stat("Top speed", d.max_speed_kmh, "km/h")}
+      ${stat("Speeding", d.over_limit_pct, "%")}
+      ${stat("Night driving", d.night_pct, "%")}
+      ${stat("Peak braking", d.max_decel_g, "g", 1)}
+      ${stat("Harsh brakes", d.harsh_brakes_per_100km, "/100km", 1)}
+    </div>` : ""}
+    <div class="tm-card" style="overflow:hidden;position:relative;height:340px;">
+      <div id="tm-driver-map" class="tm-map-canvas"></div>
+      ${theirs.length === 0 ? `<div class="tm-empty" style="height:100%;">No drives assigned to ${esc(name)} yet</div>` : ""}
+    </div>
+    ${theirs.length ? `
+    <div class="tm-card tm-table-wrap">
+      <div style="min-width:560px;">
+        <div class="tm-table-head" style="grid-template-columns:150px 1fr 90px 90px 70px;">
+          <div>When</div><div>Route</div><div class="tm-right">km</div><div class="tm-right">Time</div><div class="tm-right">Score</div>
+        </div>
+        ${theirs.slice(0, 50).map((x) => `
+          <div class="tm-table-row" data-action="open-drive" data-id="${x.id}" style="grid-template-columns:150px 1fr 90px 90px 70px;">
+            <div style="font-size:12.5px;color:var(--sub);">${esc(fmtDateTime(x.start_ts))}</div>
+            <div class="tm-ellipsis"><bdi>${esc(driveEndpoint(x, "start", []))}</bdi> → <bdi>${esc(driveEndpoint(x, "end", []))}</bdi></div>
+            <div class="tm-right tm-mono">${x.distance_km != null ? fmt1(x.distance_km) : "—"}</div>
+            <div class="tm-right tm-mono">${fmtDurationMin(x.duration_min)}</div>
+            <div class="tm-right tm-mono" style="color:${scoreColor(x.behavior_score)};">${x.behavior_score ?? "—"}</div>
+          </div>`).join("")}
+        ${theirs.length > 50 ? `<div class="tm-foot-note">Showing the 50 most recent of ${theirs.length} drives — the full list is on the Drives screen with the ${esc(name)} filter.</div>` : ""}
+      </div>
+    </div>` : ""}
+  `);
+
+  // Their recent routes, lifetime-map style (per-drive path fetches, capped).
+  const withGps = theirs.slice(0, 12);
+  if (withGps.length) {
+    const paths = await Promise.all(withGps.map(async (dr) => {
+      try {
+        const det = await data.drive(dr.id);
+        return (det.path || []).filter((pt) => pt.lat != null && pt.lon != null).map((pt) => [pt.lat, pt.lon]);
+      } catch { return []; }
+    }));
+    if (state.openDriverName !== name) return; // navigated away while fetching
+    requestAnimationFrame(() => renderLifetimeMap(document.getElementById("tm-driver-map"), paths.filter((pt) => pt.length > 1)));
+  }
+}
+
 async function renderDrivers() {
+  if (state.openDriverName != null) return renderDriverDetail();
   const res = await data.driverScores(vin());
   const drivers = res?.drivers || [];
   // Full household roster (Tesla-reported + tagged). 404s gracefully → []. Any
@@ -2356,7 +2443,7 @@ async function renderDrivers() {
     </div>
     ${drivers.length ? `<div class="tm-grid-3col">
       ${drivers.map((d) => `
-        <div class="tm-card tm-card-pad">
+        <div class="tm-card tm-card-pad tm-card-hover" data-action="open-driver" data-name="${esc(d.driver)}" title="Open ${esc(d.driver)}'s drives & routes">
           <div class="tm-flex-row" style="justify-content:space-between;align-items:flex-start;">
             <div>
               <div style="font-size:15px;font-weight:600;">${esc(d.driver)}</div>
@@ -2686,14 +2773,30 @@ function nowPlayingCard(latest) {
   const title = latest?.media_title, artist = latest?.media_artist, album = latest?.media_album;
   const station = latest?.media_station, source = latest?.media_source, status = latest?.media_status;
   const volume = latest?.media_volume;
+  const playing = typeof status === "string" && /playing/i.test(status);
   if (!title && !station) {
+    // Blank metadata but the car says something IS playing (some apps — e.g.
+    // YouTube Music — don't report NowPlaying names until a track change):
+    // be honest about the playback instead of claiming silence.
+    if (playing && source) {
+      return `<div class="tm-card tm-card-pad-lg tm-flex-row" style="gap:16px;align-items:center;">
+        <div class="tm-media-cover tm-media-cover-lg">♪</div>
+        <div style="min-width:0;flex:1;">
+          <div class="tm-flex-row" style="gap:8px;">
+            <span class="tm-pill tm-pill-good">▶ Playing</span>
+            <span class="tm-pill tm-pill-chip">${esc(source)}</span>
+          </div>
+          <div style="font-size:13px;color:var(--sub);margin-top:8px;">Track name not reported by this app — names usually appear on the next track change.</div>
+        </div>
+        ${volume != null ? `<div style="text-align:right;flex:none;"><div class="tm-readout-label">Volume</div><div class="tm-readout-value">${fmt0(volume)}</div></div>` : ""}
+      </div>`;
+    }
     return `<div class="tm-card tm-card-pad-lg"><div class="tm-empty" style="padding:10px 0;">
       <div class="tm-empty-icon">♪</div>
       <div class="tm-empty-title">Nothing playing right now</div>
       <div>Shows up here the moment the car streams a Media* field and something's on.</div>
     </div></div>`;
   }
-  const playing = typeof status === "string" && /playing/i.test(status);
   // Tesla reports a fixed 18,000,000 ms (5h) sentinel for radio/stations with
   // no real track length — a progress bar for that is meaningless, so only
   // show one for an actual, bounded track duration.
