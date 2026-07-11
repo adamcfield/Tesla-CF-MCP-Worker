@@ -9,6 +9,29 @@ feature or screen, the **patch** version for fixes/tweaks/copy changes, and the
 configured. See `CLAUDE.md` at the repo root for the policy on keeping this file
 and `APP_VERSION` (in `app.js`) in sync.
 
+## 1.14.0 — 2026-07-12
+
+Places grew up: addresses you can correct, usage stats, and a full
+at-this-place history — asked as "I want to see addresses (that I can
+manipulate), and some stats… in the inner page, every visit, charge etc".
+
+- **Places list**: each place now shows its address (auto-filled by the
+  reverse geocoder for existing places, editable inline via ✎ — your text
+  wins over the geocoder's), plus visits, charge count · kWh, and last
+  visit. Coordinates moved to the detail page.
+- **Place detail**: new "History" section listing every arrival (with
+  where the drive came from, km, driver), departure (where it went), and
+  charge (+kWh, SoC span, cost) — newest first, each row opening the full
+  drive/charge detail.
+- Backend: `locations.address` column (kept on edits, cleared with empty
+  string, lazily re-geocoded when missing), stats folded into
+  `GET /data/locations`, new `GET /data/location-history?id=` +
+  `get_location_history` MCP tool (read scope).
+- Also in this release (worker-side): one-active-session-per-vin unique
+  indexes + open-race fix — the cause of a charge showing up twice on
+  2026-07-11 (REST poller and telemetry stream each opened a session for
+  the same charge, 1 second apart).
+
 ## 1.13.1 — 2026-07-11
 
 Media Now-Playing honesty + driver-page deep links.

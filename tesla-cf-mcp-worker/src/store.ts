@@ -147,7 +147,7 @@ export async function ensureSchema(env: Env): Promise<void> {
   // drivers: JSON array of driver names this location is tagged to (e.g. "Home"
   // tagged to both household drivers, "Work" tagged to just one) — null/empty
   // means untagged/shared, matching every pre-existing row.
-  await addMissingColumns(env, "locations", { drivers: "TEXT" });
+  await addMissingColumns(env, "locations", { drivers: "TEXT", address: "TEXT" });
 
   // charge_sessions predates the tracking build — widen it in place. D1 has no
   // "ADD COLUMN IF NOT EXISTS", so diff against the live table first.
@@ -220,6 +220,28 @@ export async function ensureSchema(env: Env): Promise<void> {
   await addMissingColumns(env, "positions", {
     lon_accel: "REAL", lat_accel: "REAL", brake_pedal: "REAL",
   });
+
+  // One ACTIVE session per vin — closes the check-then-insert race where the
+  // REST poller and the telemetry ingest path each open a session for the same
+  // physical drive/charge (observed live 2026-07-11: two charge_sessions
+  // created 1s apart for one charge). Any pre-existing duplicate actives are
+  // superseded first (keep the oldest id — that's the row the sample-update
+  // path was feeding) so index creation can never fail on a live database.
+  await env.DB.prepare(
+    `UPDATE drives SET status='superseded' WHERE status='active'
+     AND id NOT IN (SELECT MIN(id) FROM drives WHERE status='active' GROUP BY vin)`,
+  ).run();
+  await env.DB.prepare(
+    `UPDATE charge_sessions SET status='superseded', end_ts = COALESCE(end_ts, start_ts)
+     WHERE status='active'
+     AND id NOT IN (SELECT MIN(id) FROM charge_sessions WHERE status='active' GROUP BY vin)`,
+  ).run();
+  await env.DB.prepare(
+    `CREATE UNIQUE INDEX IF NOT EXISTS idx_drives_one_active ON drives (vin) WHERE status='active'`,
+  ).run();
+  await env.DB.prepare(
+    `CREATE UNIQUE INDEX IF NOT EXISTS idx_charges_one_active ON charge_sessions (vin) WHERE status='active'`,
+  ).run();
 
   // Posted-speed-limit cache (OSM maxspeed by ~110 m grid; -1 = negative cache).
   await env.DB.prepare(

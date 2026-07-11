@@ -5,7 +5,7 @@
  * this feature) means shared/no restriction — never null-vs-undefined
  * confusion leaking into the API surface, always a clean string[].
  */
-import { describe, it, expect, beforeEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { ensureSchema, resetSchemaCacheForTests } from "../src/store";
 import { setLocation, listLocations, getLocationStats } from "../src/tracking";
 import { FakeD1 } from "./helpers/d1";
@@ -31,7 +31,11 @@ describe("locations — driver tags", () => {
   beforeEach(async () => {
     env = makeEnv();
     await ensureSchema(env);
+    // listLocations lazily reverse-geocodes address-less places — keep tests
+    // hermetic (404 → negative-cached, address stays null).
+    vi.stubGlobal("fetch", vi.fn(async () => new Response("{}", { status: 404 })));
   });
+  afterEach(() => vi.unstubAllGlobals());
 
   it("creates a location with no driver tags (untagged/shared) by default", async () => {
     const { id } = await setLocation(env, { name: "Home", lat: 32.1, lon: 34.8 });

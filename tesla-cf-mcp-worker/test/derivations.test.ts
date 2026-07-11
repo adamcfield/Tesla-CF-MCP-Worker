@@ -130,10 +130,12 @@ describe("stale-session auto-close", () => {
       `INSERT INTO positions (vin, ts, drive_id, activity, speed, odometer, soc) VALUES (?1, ?2, ?3, 'driving', 60, 1005, 78)`,
     ).bind(VIN, old + 600, driveId).run();
 
-    // A FRESH open drive must not be touched.
+    // A FRESH open drive must not be touched. Different vin: two ACTIVE drives
+    // on one vin are now impossible by design (idx_drives_one_active — the
+    // very state this test used to seed was the concurrent-open race bug).
     const fresh = await env.DB.prepare(
-      `INSERT INTO drives (vin, start_ts, status) VALUES (?1, ?2, 'active')`,
-    ).bind(VIN, Math.floor(Date.now() / 1000) - 60).run();
+      `INSERT INTO drives (vin, start_ts, status) VALUES ('TESTVINFRESH00001', ?1, 'active')`,
+    ).bind(Math.floor(Date.now() / 1000) - 60).run();
 
     const out = await closeStaleSessions(env);
     expect(out.closed_drives).toBe(1);

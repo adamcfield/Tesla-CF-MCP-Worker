@@ -81,6 +81,7 @@ import {
   getDrivers,
   getDrives,
   getEfficiencyByTemp,
+  getLocationHistory,
   getLocationStats,
   getMediaStats,
   getMediaStatsByDriver,
@@ -256,6 +257,12 @@ async function handleData(url: URL, env: Env): Promise<Response> {
     const id = requireId("id");
     if (id === null) return json({ error: "id query param required" }, 400);
     return json(await getLocationStats(env, id));
+  }
+  if (p === "/data/location-history") {
+    const id = requireId("id");
+    if (id === null) return json({ error: "id query param required" }, 400);
+    const limit = Number(q.get("limit") ?? "200");
+    return json(await getLocationHistory(env, id, Number.isFinite(limit) ? Math.min(limit, 500) : 200));
   }
 
   // Everything else is per-vehicle.
@@ -460,11 +467,16 @@ export default {
         const drivers = driversParam != null
           ? driversParam.split(",").map((d) => d.trim()).filter(Boolean)
           : undefined;
+        // address: absent = keep as-is; present-but-empty = clear (it will be
+        // lazily re-geocoded); otherwise set the user's text verbatim.
+        const addressParam = url.searchParams.get("address");
+        const address = addressParam != null ? addressParam.trim().slice(0, 200) : undefined;
         return json(await setLocation(env, {
           id: Number.isFinite(id as number) ? id : undefined,
           name, lat, lon,
           radius_m: Number.isFinite(radius_m as number) ? radius_m : undefined,
           drivers,
+          address,
         }));
       }
 

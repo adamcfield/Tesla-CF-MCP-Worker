@@ -153,6 +153,7 @@ export const data = {
   /** Live status per mapped Tesla telemetry field (canonical key, latest value, last-seen). New endpoint — may 404. */
   telemetryFields: (vin) => getJson("/data/telemetry-fields", { vin }),
   locations: () => getJson("/data/locations"),
+  locationHistory: (id, limit = 200) => getJson("/data/location-history", { id, limit }),
   locationStats: (id) => getJson("/data/location-stats", { id }),
   /** Forward-geocode an address to candidate {label, lat, lon, source} hits (GovMap, falling back to Nominatim). */
   geocode: (q, lang) => getJson("/geocode", { q, lang }),
@@ -214,12 +215,13 @@ export const data = {
    * (optional) tags which household driver(s) it belongs to; omit entirely to
    * leave existing tags untouched on an edit, pass [] to explicitly clear them.
    */
-  saveLocation: ({ id, name, lat, lon, radius_m, drivers }) =>
+  saveLocation: ({ id, name, lat, lon, radius_m, drivers, address }) =>
     fetch(workerOrigin() + "/data/save-location?" + new URLSearchParams({
       name, lat: String(lat), lon: String(lon),
       ...(id != null ? { id: String(id) } : {}),
       ...(radius_m != null ? { radius_m: String(radius_m) } : {}),
       ...(drivers !== undefined ? { drivers: drivers.join(",") } : {}),
+      ...(address !== undefined ? { address } : {}),
       token: auth.token,
     }), { method: "POST" })
       .then(async (r) => {
