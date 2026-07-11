@@ -65,8 +65,20 @@ const VCFG_REFRESH_S = 30 * 86400;
  * each bill during the same 10s driving window and burn 2-3× the budget. A
  * poller landing inside this window does only the free connectivity check. 8s
  * still permits the intended ~10s driving cadence.
+ *
+ * 8s alone only deduped the driving burst: at the slower paced cadences the
+ * pollers interleave far apart (DO alarm at 90s, GH loop at 150s — every call
+ * lands >8s from the other's), so BOTH billed at full rate, ~2x the intended
+ * spend for every charging/idle-online hour. The gap therefore SCALES with
+ * the last billed read's own paced interval (stamped next to its timestamp),
+ * clamped to [MIN, MAX]: whichever poller fires first claims the slot, and
+ * every other poller stays free until ~that interval has elapsed.
  */
 const MIN_BILLED_GAP_S = 8;
+/** Hard cap on the scaled gap — never lock billed reads out longer than this. */
+const MAX_BILLED_GAP_S = 240;
+/** Fraction of the last paced interval that must elapse before any poller may bill again. */
+const BILLED_GAP_FRAC = 0.8;
 
 const POLL_STATE = (vin: string) => `poll_state:${vin}`;
 const POLL_OK = (vin: string) => `poll_ok_ts:${vin}`;
@@ -157,16 +169,23 @@ export async function pollOnce(env: Env, vin: string): Promise<PollResult> {
     }
   }
 
-  // 3b. Cross-poller dedup: if any poller did a billed read in the last few
-  //     seconds, skip the billed read here (free check already ran) so
-  //     overlapping pollers can't double-bill. Return active with a short
-  //     interval so the caller retries just after the window clears.
-  const lastBilled = Number((await getAppState(env, BILLED_TS(vin)).catch(() => "0")) ?? "0");
-  if (now - lastBilled < MIN_BILLED_GAP_S) {
+  // 3b. Cross-poller dedup: if any poller did a billed read more recently
+  //     than the gap scaled to that read's own paced interval, skip the
+  //     billed read here (free check already ran) so out-of-phase pollers
+  //     can't multiply the paced spend. Return active with the REMAINING gap
+  //     so the caller retries just as the window clears. The stamp is
+  //     "<ts> <intervalS>"; legacy ts-only stamps fall back to the 8s minimum.
+  const rawBilled = String((await getAppState(env, BILLED_TS(vin)).catch(() => "0")) ?? "0");
+  const [billedTsRaw, billedIvalRaw] = rawBilled.split(" ");
+  const lastBilled = Number(billedTsRaw) || 0;
+  const lastBilledIval = Number(billedIvalRaw) || 0;
+  const gapS = Math.min(MAX_BILLED_GAP_S, Math.max(MIN_BILLED_GAP_S, Math.round(lastBilledIval * BILLED_GAP_FRAC)));
+  if (now - lastBilled < gapS) {
     await recordConnectivityState(env, vin, "online").catch(() => {});
     return {
       vin, state, activity: "throttled", polled: false, active: true,
-      next_interval_s: MIN_BILLED_GAP_S, budget_spent_usd: budget.spent_usd,
+      next_interval_s: Math.max(MIN_BILLED_GAP_S, gapS - (now - lastBilled)),
+      budget_spent_usd: budget.spent_usd,
     };
   }
 
@@ -209,12 +228,16 @@ export async function pollOnce(env: Env, vin: string): Promise<PollResult> {
       await putAppState(env, POLL_STATE(vin), JSON.stringify({ last_active_ts: now, last_probe_ts: now } satisfies PollState));
     }
     const budgetTotal = pollBudgetMicro(env);
+    const nextIntervalS =
+      activity === "driving"
+        ? pacedDrivingIntervalS(budget.spent_micro, budgetTotal)
+        : pacedChargingIntervalS(budget.spent_micro, budgetTotal);
+    // Re-stamp the claim with the paced interval so the cross-poller gap in
+    // step 3b scales to the cadence this read was actually paced at.
+    await putAppState(env, BILLED_TS(vin), `${now} ${nextIntervalS}`).catch(() => {});
     return {
       vin, state, activity, polled: true, active: true, soc,
-      next_interval_s:
-        activity === "driving"
-          ? pacedDrivingIntervalS(budget.spent_micro, budgetTotal)
-          : pacedChargingIntervalS(budget.spent_micro, budgetTotal),
+      next_interval_s: nextIntervalS,
       budget_spent_usd: budget.spent_usd,
     };
   }
@@ -225,10 +248,12 @@ export async function pollOnce(env: Env, vin: string): Promise<PollResult> {
     POLL_STATE(vin),
     JSON.stringify({ last_active_ts: ps.last_active_ts ?? now, last_probe_ts: now } satisfies PollState),
   );
+  const idleIntervalS = suspended ? INTERVAL_SLEEP : INTERVAL_IDLE;
+  await putAppState(env, BILLED_TS(vin), `${now} ${idleIntervalS}`).catch(() => {});
   return {
     vin, state, activity: "idle", polled: true, soc,
     active: !suspended,
-    next_interval_s: suspended ? INTERVAL_SLEEP : INTERVAL_IDLE,
+    next_interval_s: idleIntervalS,
     budget_spent_usd: budget.spent_usd,
   };
 }

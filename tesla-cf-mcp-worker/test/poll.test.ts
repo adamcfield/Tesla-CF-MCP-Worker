@@ -1,7 +1,8 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { pacedChargingIntervalS, pacedDrivingIntervalS } from "../src/budget";
 import { pollOnce } from "../src/poll";
-import { putAppState, resetSchemaCacheForTests } from "../src/store";
+import { nextAlarmDelayS } from "../src/scheduler";
+import { getAppState, putAppState, resetSchemaCacheForTests } from "../src/store";
 import { FakeD1 } from "./helpers/d1";
 import { FakeKV } from "./helpers/kv";
 import type { Env } from "../src/types";
@@ -130,6 +131,86 @@ describe("pollOnce adaptive interval", () => {
     const later = await pollOnce(env, VIN);
     expect(later.activity).toBe("idle");
     expect(later.active).toBe(false); // suspended → loop stops, car allowed to sleep
+  });
+});
+
+describe("cross-poller billed-read gap scales with the paced cadence", () => {
+  let kv: FakeKV;
+  beforeEach(async () => {
+    kv = new FakeKV();
+    await kv.put("tesla:refresh_token", "R0");
+  });
+  afterEach(() => vi.restoreAllMocks());
+
+  it("a billed read stamps its paced interval next to the timestamp", async () => {
+    const env = makeEnv(kv);
+    stubTesla({ state: "online", charging_state: "Charging", shift: "P" });
+    const r = await pollOnce(env, VIN);
+    expect(r.polled).toBe(true);
+    expect(r.next_interval_s).toBe(60); // fresh budget → 60s charging cadence
+    const stamp = await getAppState(env, `billed_ts:${VIN}`);
+    expect(stamp).toMatch(/^\d+ 60$/);
+  });
+
+  it("throttles a second poller for ~80% of the stamped interval, not just 8s", async () => {
+    // Regression: DO alarm (90s) + GH loop (150s) interleaved >8s apart, so
+    // both billed at full rate — ~2x the paced spend for every charging hour.
+    const env = makeEnv(kv);
+    stubTesla({ state: "online", charging_state: "Charging", shift: "P" });
+    const now = Math.floor(Date.now() / 1000);
+    // Another poller billed 20s ago at the 60s charging cadence → gap 48s.
+    await putAppState(env, `billed_ts:${VIN}`, `${now - 20} 60`);
+    const r = await pollOnce(env, VIN);
+    expect(r.activity).toBe("throttled");
+    expect(r.polled).toBe(false);
+    // Remaining gap ≈ 48 - 20 = 28s (±1s clock jitter), not the 8s minimum.
+    expect(r.next_interval_s).toBeGreaterThanOrEqual(26);
+    expect(r.next_interval_s).toBeLessThanOrEqual(30);
+  });
+
+  it("bills again once the scaled gap has elapsed", async () => {
+    const env = makeEnv(kv);
+    stubTesla({ state: "online", charging_state: "Charging", shift: "P" });
+    const now = Math.floor(Date.now() / 1000);
+    await putAppState(env, `billed_ts:${VIN}`, `${now - 50} 60`); // 50s ≥ 48s gap
+    const r = await pollOnce(env, VIN);
+    expect(r.polled).toBe(true);
+    expect(r.activity).toBe("charging");
+  });
+
+  it("legacy ts-only stamps keep the 8s minimum (backward compatible)", async () => {
+    const env = makeEnv(kv);
+    stubTesla({ state: "online", charging_state: "Charging", shift: "P" });
+    const now = Math.floor(Date.now() / 1000);
+    await putAppState(env, `billed_ts:${VIN}`, String(now - 10)); // pre-upgrade format
+    const r = await pollOnce(env, VIN);
+    expect(r.polled).toBe(true); // 10s ≥ 8s minimum → not throttled
+  });
+
+  it("driving cadence keeps the 8s minimum (burst fidelity unchanged)", async () => {
+    const env = makeEnv(kv);
+    stubTesla({ state: "online", shift: "D", speed: 45 });
+    const now = Math.floor(Date.now() / 1000);
+    await putAppState(env, `billed_ts:${VIN}`, `${now - 9} 10`); // 0.8*10 = 8s gap
+    const r = await pollOnce(env, VIN);
+    expect(r.polled).toBe(true); // 9s ≥ 8s → the 10s driving burst still flows
+  });
+});
+
+describe("DO scheduler re-arm delay", () => {
+  it("respects the paced interval instead of flooring it at 90s", () => {
+    // Regression: the min() fold was seeded with the 90s default, so a 150s
+    // charging pace re-armed at 90s anyway — ~1.7x the intended billed rate.
+    expect(nextAlarmDelayS([150])).toBe(150);
+    expect(nextAlarmDelayS([300])).toBe(300);
+  });
+  it("takes the fastest across VINs and clamps to [10, 300]", () => {
+    expect(nextAlarmDelayS([10, 150])).toBe(10);
+    expect(nextAlarmDelayS([3])).toBe(10);
+    expect(nextAlarmDelayS([500])).toBe(300);
+  });
+  it("falls back to the 90s default when nothing reported", () => {
+    expect(nextAlarmDelayS([])).toBe(90);
   });
 });
 
