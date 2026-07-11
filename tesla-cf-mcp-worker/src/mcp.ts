@@ -846,6 +846,7 @@ const TOOLS: Tool[] = [
         radius_m: { type: "number", default: 150 },
         cost_per_kwh: { type: "number", description: "Price per kWh at this location (same currency as reports)" },
         drivers: { type: "array", items: { type: "string" }, description: "Driver name(s) this location applies to; omit to leave as-is on update" },
+        address: { type: "string", description: "Human-readable address; omit to keep, empty string to clear (it re-geocodes lazily)" },
       },
       required: ["name", "latitude", "longitude"],
     },
@@ -858,6 +859,7 @@ const TOOLS: Tool[] = [
         radius_m: a.radius_m,
         cost_per_kwh: a.cost_per_kwh,
         drivers: a.drivers,
+        address: a.address,
       }),
   },
   {
@@ -879,6 +881,18 @@ const TOOLS: Tool[] = [
       required: ["id"],
     },
     handler: (env, a) => tracking.getLocationStats(env, a.id),
+  },
+  {
+    name: "get_location_history",
+    description:
+      "Everything that happened AT a saved place, newest first: arrivals (drives ending there), " +
+      "departures (drives starting there) and charge sessions, each with its drive/charge id.",
+    inputSchema: {
+      type: "object",
+      properties: { id: { type: "number" }, limit: { type: "number", default: 200 } },
+      required: ["id"],
+    },
+    handler: (env, a) => tracking.getLocationHistory(env, a.id, a.limit ?? 200),
   },
 
   // ------------------------------------------------------------ automations
@@ -981,6 +995,7 @@ const READ_TOOLS = new Set([
   "list_locations",
   "get_api_call_log",
   "get_location_stats",
+  "get_location_history",
   "list_automations",
 ]);
 

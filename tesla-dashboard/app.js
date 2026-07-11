@@ -5,7 +5,7 @@ import { destroyMaps, renderPointMap, renderRouteMap, renderLifetimeMap, createR
 // Bump on every change to this dashboard (UI, features, or the /data/*
 // endpoints it depends on) and add a matching entry to CHANGELOG.md — see
 // the versioning policy in the repo's CLAUDE.md. Shown in the sidebar footer.
-const APP_VERSION = "1.13.1";
+const APP_VERSION = "1.14.0";
 
 const root = document.getElementById("app");
 let shellBound = false; // guards one-time attach of the root click handler + sync timer
@@ -619,6 +619,9 @@ function onRootClick(e) {
     state.editingPlaceTags = false;
     pushHistory();
     renderPlaceDetail();
+  } else if (action === "edit-place-address") {
+    const cell = t.closest(".tm-place-address");
+    if (cell && !cell.querySelector("input")) beginPlaceAddressEdit(cell, Number(t.dataset.id));
   } else if (action === "back-places") {
     state.openPlaceId = null;
     state.editingPlaceTags = false;
@@ -2631,27 +2634,64 @@ async function renderPlaces() {
     </div>
     ${locations.length ? `
     <div class="tm-card tm-table-wrap">
-      <div style="min-width:560px;">
-        <div class="tm-table-head" style="grid-template-columns:1fr 150px 96px;">
-          <div>Name</div><div class="tm-right">Coordinates</div><div class="tm-right">Radius</div>
+      <div style="min-width:820px;">
+        <div class="tm-table-head" style="grid-template-columns:1fr 1.4fr 64px 130px 130px 64px;">
+          <div>Name</div><div>Address</div><div class="tm-right">Visits</div><div class="tm-right">Charged</div><div class="tm-right">Last visit</div><div class="tm-right">Radius</div>
         </div>
         ${locations.map((l) => `
-          <div class="tm-table-row" data-action="open-place" data-id="${l.id}" style="grid-template-columns:1fr 150px 96px;">
+          <div class="tm-table-row" data-action="open-place" data-id="${l.id}" style="grid-template-columns:1fr 1.4fr 64px 130px 130px 64px;">
             <div style="min-width:0;">
               <div class="tm-ellipsis" style="font-size:13.5px;font-weight:500;">${esc(l.name)}</div>
               ${l.drivers?.length ? `<div style="margin-top:4px;">${l.drivers.map((d) => `<span class="tm-place-tag" style="margin-right:4px;">${esc(d)}</span>`).join("")}</div>` : ""}
             </div>
-            <div class="tm-right tm-mono" style="color:var(--sub);font-size:12px;">${fmt1(l.lat)}, ${fmt1(l.lon)}</div>
+            <div class="tm-place-address" style="min-width:0;display:flex;align-items:center;gap:6px;">
+              <span class="tm-ellipsis" style="font-size:12.5px;color:var(--sub);">${l.address ? esc(l.address) : `<span style="color:var(--faint);">no address yet</span>`}</span>
+              <button type="button" class="tm-link-btn" data-action="edit-place-address" data-id="${l.id}" title="Edit address">✎</button>
+            </div>
+            <div class="tm-right tm-mono">${fmt0(l.visits ?? 0)}</div>
+            <div class="tm-right tm-mono" style="color:var(--sub);font-size:12px;">${(l.charge_count ?? 0) > 0 ? `${fmt0(l.charge_count)}× · ${fmt1(l.charge_kwh)} kWh` : "—"}</div>
+            <div class="tm-right tm-mono" style="color:var(--sub);font-size:12px;">${l.last_visit_ts ? esc(fmtDateTime(l.last_visit_ts)) : "—"}</div>
             <div class="tm-right tm-mono" style="color:var(--sub);">${l.radius_m != null ? fmt0(l.radius_m) + " m" : "—"}</div>
           </div>`).join("")}
-        <div class="tm-foot-note">${locations.length} saved place${locations.length === 1 ? "" : "s"} · click one for its stats.</div>
+        <div class="tm-foot-note">${locations.length} saved place${locations.length === 1 ? "" : "s"} · click one for its full history. Addresses come from the geocoder — click ✎ to correct one.</div>
       </div>
     </div>` : emptyHtml("No saved places yet", suggestionCount ? "Add one of the frequent stops the car's already visited, or search an address." : "Add a place by address, or wait for a frequent-stop suggestion once a spot's been visited a few times.")}
   `);
 }
 
+/** Inline address editor on the Places list (mirrors beginDriverEdit). */
+function beginPlaceAddressEdit(cell, id) {
+  const loc = (state.cache.locations || []).find((l) => l.id === id);
+  if (!loc) return;
+  const current = loc.address || "";
+  cell.innerHTML = `<input class="tm-driver-edit" style="width:100%;" value="${esc(current)}" placeholder="address…" autocomplete="off">`;
+  const input = cell.querySelector("input");
+  input.focus();
+  input.select();
+  let done = false;
+  const finish = (save) => {
+    if (done) return;
+    done = true;
+    const v = input.value.trim();
+    if (!save || v === current) { renderPlaces(); return; }
+    cell.innerHTML = `<span style="color:var(--faint);">saving…</span>`;
+    // Empty = clear (the worker will lazily re-geocode a fresh suggestion).
+    data.saveLocation({ id: loc.id, name: loc.name, lat: loc.lat, lon: loc.lon, radius_m: loc.radius_m, address: v })
+      .then(() => { state.cache.locations = null; renderPlaces(); })
+      .catch(() => { cell.innerHTML = `<span style="color:var(--bad);">failed</span>`; });
+  };
+  input.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") finish(true);
+    else if (e.key === "Escape") finish(false);
+  });
+  input.addEventListener("blur", () => finish(true));
+}
+
 async function renderPlaceDetail() {
-  const stats = await safe(data.locationStats(state.openPlaceId), null);
+  const [stats, history] = await Promise.all([
+    safe(data.locationStats(state.openPlaceId), null),
+    safe(data.locationHistory(state.openPlaceId), null),
+  ]);
   if (!stats || stats.error || !stats.location) {
     return setContent(`
       <div class="tm-flex-row"><button class="tm-back-btn" data-action="back-places">← Places</button></div>
@@ -2670,6 +2710,7 @@ async function renderPlaceDetail() {
       <div style="font-size:15px;font-weight:600;">${esc(l.name)}</div>
       <div style="font-size:12.5px;color:var(--faint);">${fmt1(l.lat)}, ${fmt1(l.lon)} · ${l.radius_m != null ? fmt0(l.radius_m) + " m radius" : ""}</div>
     </div>
+    ${l.address ? `<div style="font-size:12.5px;color:var(--sub);margin-top:4px;">${esc(l.address)} <span style="color:var(--faint);">· edit on the Places list</span></div>` : ""}
     <div class="tm-driver-tags-scope tm-flex-row" style="align-items:center;flex-wrap:wrap;gap:8px;margin-top:6px;">
       ${state.editingPlaceTags ? `
         ${names.length ? driverChipsHtml(names, l.drivers) : `<span style="font-size:12px;color:var(--faint);">No household drivers on the roster yet.</span>`}
@@ -2693,11 +2734,63 @@ async function renderPlaceDetail() {
         ${l.cost_per_kwh != null ? `<div class="tm-card" style="padding:18px 20px;"><div class="tm-stat-label">Tariff</div><div class="tm-stat-value">${money(l.cost_per_kwh, cur)} <span class="tm-stat-unit">/kWh</span></div></div>` : ""}
       </div>
     </div>
+    ${placeHistoryHtml(history, l.name, cur)}
   `);
 
   if (l.lat != null && l.lon != null) {
     requestAnimationFrame(() => renderPointMap(document.getElementById("tm-place-map"), l.lat, l.lon, esc(l.name)));
   }
+}
+
+/**
+ * The full at-this-place record: every arrival, departure and charge (from
+ * /data/location-history), newest first — each row clicks through to its
+ * drive or charge detail.
+ */
+function placeHistoryHtml(history, placeName, cur) {
+  const events = history?.events || [];
+  if (!events.length) {
+    return `<div class="tm-card tm-card-pad" style="margin-top:14px;">
+      <div class="tm-card-head"><div class="tm-card-head-title">History</div></div>
+      ${miniEmptyHtml("Nothing recorded here yet — arrivals, departures and charges will collect as the car visits.")}
+    </div>`;
+  }
+  const KIND = {
+    arrival: { icon: "→", label: "Arrived" },
+    departure: { icon: "←", label: "Left" },
+    charge: { icon: "⚡", label: "Charged" },
+  };
+  const row = (e) => {
+    const k = KIND[e.kind] || { icon: "·", label: e.kind };
+    let detail = "";
+    let click = "";
+    if (e.kind === "charge") {
+      const soc = e.start_soc != null && e.end_soc != null ? ` · ${fmt0(e.start_soc)} → ${fmt0(e.end_soc)}%` : "";
+      detail = `+${fmt1(e.energy_added_kwh ?? 0)} kWh${soc}${e.cost ? ` · ${money(e.cost, cur)}` : ""}`;
+      click = `data-action="open-charge" data-id="${e.id}"`;
+    } else {
+      const other = e.other_address ? `${e.kind === "arrival" ? "from" : "to"} ${e.other_address}` : "";
+      const km = e.distance_km != null ? `${fmt1(e.distance_km)} km` : "";
+      detail = [other, km, e.driver ? String(e.driver) : ""].filter(Boolean).join(" · ");
+      click = `data-action="open-drive" data-id="${e.id}"`;
+    }
+    return `
+      <div class="tm-table-row" ${click} style="grid-template-columns:34px 150px 92px 1fr;">
+        <div style="text-align:center;">${k.icon}</div>
+        <div class="tm-mono" style="font-size:12px;color:var(--sub);">${esc(fmtDateTime(e.ts))}</div>
+        <div style="font-size:12.5px;">${k.label}</div>
+        <div class="tm-ellipsis" style="font-size:12.5px;color:var(--sub);"><bdi>${esc(detail)}</bdi></div>
+      </div>`;
+  };
+  return `
+    <div class="tm-card tm-table-wrap" style="margin-top:14px;">
+      <div style="min-width:560px;">
+        <div class="tm-card-head" style="padding:14px 16px 6px;"><div class="tm-card-head-title">History at ${esc(placeName)}</div>
+          <div class="tm-card-head-sub">every arrival, departure and charge · newest first</div></div>
+        ${events.map(row).join("")}
+        <div class="tm-foot-note">${events.length} event${events.length === 1 ? "" : "s"} · rows open the full drive or charge.</div>
+      </div>
+    </div>`;
 }
 
 // ---------------------------------------------------------------------------

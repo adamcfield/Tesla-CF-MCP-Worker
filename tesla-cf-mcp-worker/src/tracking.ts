@@ -213,20 +213,29 @@ async function openDrive_(env: Env, vin: string, ts: number, s: LatestState): Pr
   const lat = num(s.lat);
   const lon = num(s.lon);
   const locId = lat !== null && lon !== null ? await matchLocation(env, lat, lon) : null;
-  const res = await env.DB.prepare(
-    `INSERT INTO drives (
-       vin, start_ts, status, start_lat, start_lon, start_location_id,
-       start_odometer, start_soc, start_rated_range, start_ideal_range, start_outside_temp,
-       fp_temp_set, fp_seat_heater
-     ) VALUES (?1,?2,'active',?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)`,
-  )
-    .bind(
-      vin, ts, lat, lon, locId, num(s.odometer), num(s.soc), num(s.rated_range), num(s.ideal_range), num(s.outside_temp),
-      num(s.cabin_temp_set), num(s.seat_heater_l),
+  try {
+    const res = await env.DB.prepare(
+      `INSERT INTO drives (
+         vin, start_ts, status, start_lat, start_lon, start_location_id,
+         start_odometer, start_soc, start_rated_range, start_ideal_range, start_outside_temp,
+         fp_temp_set, fp_seat_heater
+       ) VALUES (?1,?2,'active',?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)`,
     )
-    .run();
-  const id = Number(res.meta.last_row_id ?? 0);
-  return { id, vin, start_ts: ts, start_odometer: num(s.odometer) };
+      .bind(
+        vin, ts, lat, lon, locId, num(s.odometer), num(s.soc), num(s.rated_range), num(s.ideal_range), num(s.outside_temp),
+        num(s.cabin_temp_set), num(s.seat_heater_l),
+      )
+      .run();
+    const id = Number(res.meta.last_row_id ?? 0);
+    return { id, vin, start_ts: ts, start_odometer: num(s.odometer) };
+  } catch (e) {
+    // idx_drives_one_active fired: a concurrent invocation (REST poll vs
+    // telemetry ingest) opened a drive between our check and this insert —
+    // reuse that row instead of duplicating the drive.
+    const existing = await getOpenDrive(env, vin);
+    if (existing) return existing;
+    throw e;
+  }
 }
 
 async function closeDrive(env: Env, drive: DriveRow, s: LatestState, ts: number): Promise<void> {
@@ -552,16 +561,25 @@ async function openChargeSession(
   const lon = num(s.lon);
   const locId = lat !== null && lon !== null ? await matchLocation(env, lat, lon) : null;
   const chargeType = String(s.charger_kind ?? "") === "DC" ? "DC" : "AC";
-  const res = await env.DB.prepare(
-    `INSERT INTO charge_sessions (
-       vin, start_ts, status, start_soc, lat, lon, price_cents_kwh, start_odometer,
-       start_rated_range, start_ideal_range, charge_type, location_id
-     ) VALUES (?1,?2,'active',?3,?4,?5,?6,?7,?8,?9,?10,?11)`,
-  )
-    .bind(vin, ts, num(s.soc), lat, lon, priceCentsKwh ?? null, num(s.odometer), num(s.rated_range), num(s.ideal_range), chargeType, locId)
-    .run();
-  const id = Number(res.meta.last_row_id ?? 0);
-  return { id, price_cents_kwh: priceCentsKwh ?? null, location_id: locId, max_charger_power: null, start_soc: num(s.soc) };
+  try {
+    const res = await env.DB.prepare(
+      `INSERT INTO charge_sessions (
+         vin, start_ts, status, start_soc, lat, lon, price_cents_kwh, start_odometer,
+         start_rated_range, start_ideal_range, charge_type, location_id
+       ) VALUES (?1,?2,'active',?3,?4,?5,?6,?7,?8,?9,?10,?11)`,
+    )
+      .bind(vin, ts, num(s.soc), lat, lon, priceCentsKwh ?? null, num(s.odometer), num(s.rated_range), num(s.ideal_range), chargeType, locId)
+      .run();
+    const id = Number(res.meta.last_row_id ?? 0);
+    return { id, price_cents_kwh: priceCentsKwh ?? null, location_id: locId, max_charger_power: null, start_soc: num(s.soc) };
+  } catch (e) {
+    // idx_charges_one_active fired: a concurrent invocation (REST poll vs
+    // telemetry ingest) opened a session between our check and this insert —
+    // reuse that row so one physical charge never becomes two sessions.
+    const existing = await getOpenChargeSession(env, vin);
+    if (existing) return existing;
+    throw e;
+  }
 }
 
 async function appendCurve(env: Env, sessionId: number, vin: string, s: LatestState, ts: number): Promise<void> {
@@ -707,36 +725,94 @@ async function locationCostPerKwh(
 
 export async function listLocations(env: Env): Promise<LocationRow[]> {
   await ensureSchema(env);
-  const rs = await env.DB.prepare(`SELECT * FROM locations ORDER BY name`).all<LocationRow & { drivers: unknown }>();
-  return (rs.results ?? []).map((r) => ({ ...r, drivers: parseLocationDrivers(r.drivers) }));
+  const rs = await env.DB.prepare(`SELECT * FROM locations ORDER BY name`).all<LocationRow & { drivers: unknown; address?: string | null }>();
+  const rows = (rs.results ?? []).map((r) => ({ ...r, drivers: parseLocationDrivers(r.drivers) }));
+
+  // Lazily reverse-geocode places saved before the address column existed (or
+  // whose lookup failed) — capped per call so one list request can't stall on
+  // N geocodes; the 30d geocode cache makes repeats instant. Persisted so it
+  // runs once per place, not once per page view.
+  let filled = 0;
+  for (const r of rows) {
+    if (r.address || filled >= 3) continue;
+    const addr = await reverseGeocode(env, r.lat, r.lon);
+    if (addr) {
+      await env.DB.prepare(`UPDATE locations SET address = ?2 WHERE id = ?1`).bind(r.id, addr).run();
+      (r as { address?: string | null }).address = addr;
+      filled++;
+    }
+  }
+
+  // Per-place usage stats in ONE pass per table (visits = drives ending here).
+  const [arr, dep, chg] = await Promise.all([
+    env.DB.prepare(
+      `SELECT end_location_id loc, COUNT(*) n, MAX(end_ts) last_ts FROM drives
+       WHERE status = 'complete' AND end_location_id IS NOT NULL GROUP BY end_location_id`,
+    ).all<{ loc: number; n: number; last_ts: number | null }>(),
+    env.DB.prepare(
+      `SELECT start_location_id loc, COUNT(*) n FROM drives
+       WHERE status = 'complete' AND start_location_id IS NOT NULL GROUP BY start_location_id`,
+    ).all<{ loc: number; n: number }>(),
+    env.DB.prepare(
+      `SELECT location_id loc, COUNT(*) n, COALESCE(SUM(energy_added_kwh),0) kwh,
+              COALESCE(SUM(cost),0) cost, MAX(start_ts) last_ts
+       FROM charge_sessions WHERE status = 'complete' AND location_id IS NOT NULL GROUP BY location_id`,
+    ).all<{ loc: number; n: number; kwh: number; cost: number; last_ts: number | null }>(),
+  ]);
+  const arrBy = new Map((arr.results ?? []).map((x) => [x.loc, x]));
+  const depBy = new Map((dep.results ?? []).map((x) => [x.loc, x]));
+  const chgBy = new Map((chg.results ?? []).map((x) => [x.loc, x]));
+  return rows.map((r) => {
+    const a = arrBy.get(r.id), d = depBy.get(r.id), c = chgBy.get(r.id);
+    return {
+      ...r,
+      visits: a?.n ?? 0,
+      departures: d?.n ?? 0,
+      charge_count: c?.n ?? 0,
+      charge_kwh: round(c?.kwh ?? 0, 1),
+      charge_cost: round(c?.cost ?? 0, 2),
+      last_visit_ts: Math.max(a?.last_ts ?? 0, c?.last_ts ?? 0) || null,
+    };
+  });
 }
 
 export async function setLocation(
   env: Env,
-  loc: { id?: number; name: string; lat: number; lon: number; radius_m?: number; cost_per_kwh?: number; drivers?: string[] | null },
+  loc: { id?: number; name: string; lat: number; lon: number; radius_m?: number; cost_per_kwh?: number; drivers?: string[] | null; address?: string | null },
 ): Promise<{ id: number }> {
   await ensureSchema(env);
   if (loc.id !== undefined) {
     // `drivers` omitted (undefined) on an update means "leave tags as they
     // are" — e.g. renaming a location shouldn't silently wipe its driver
     // tags. Only an explicit array (including []) overwrites them.
+    // `address` follows the same contract: undefined = keep, ""/null = clear
+    // (a cleared address gets lazily re-geocoded by listLocations).
     const driversJson = loc.drivers !== undefined
       ? serializeLocationDrivers(loc.drivers)
       : (await env.DB.prepare(`SELECT drivers FROM locations WHERE id = ?1`).bind(loc.id).first<{ drivers: string | null }>())?.drivers ?? null;
+    const address = loc.address !== undefined
+      ? (loc.address?.trim() || null)
+      : ((await env.DB.prepare(`SELECT address FROM locations WHERE id = ?1`).bind(loc.id).first<{ address: string | null }>())?.address ?? null);
     await env.DB.prepare(
-      `UPDATE locations SET name=?2, lat=?3, lon=?4, radius_m=?5, cost_per_kwh=?6, drivers=?7 WHERE id=?1`,
+      `UPDATE locations SET name=?2, lat=?3, lon=?4, radius_m=?5, cost_per_kwh=?6, drivers=?7, address=?8 WHERE id=?1`,
     )
-      .bind(loc.id, loc.name, loc.lat, loc.lon, loc.radius_m ?? 150, loc.cost_per_kwh ?? null, driversJson)
+      .bind(loc.id, loc.name, loc.lat, loc.lon, loc.radius_m ?? 150, loc.cost_per_kwh ?? null, driversJson, address)
       .run();
+    // The place may have moved/resized — re-match history so its visit stats
+    // and event history stay truthful (force recomputes existing matches too).
+    await backfillLocationMatches(env, true);
     return { id: loc.id };
   }
   const driversJson = serializeLocationDrivers(loc.drivers);
   const res = await env.DB.prepare(
-    `INSERT INTO locations (name, lat, lon, radius_m, cost_per_kwh, created_ts, drivers)
-     VALUES (?1,?2,?3,?4,?5,?6,?7)`,
+    `INSERT INTO locations (name, lat, lon, radius_m, cost_per_kwh, created_ts, drivers, address)
+     VALUES (?1,?2,?3,?4,?5,?6,?7,?8)`,
   )
-    .bind(loc.name, loc.lat, loc.lon, loc.radius_m ?? 150, loc.cost_per_kwh ?? null, Math.floor(Date.now() / 1000), driversJson)
+    .bind(loc.name, loc.lat, loc.lon, loc.radius_m ?? 150, loc.cost_per_kwh ?? null, Math.floor(Date.now() / 1000), driversJson, loc.address?.trim() || null)
     .run();
+  // A brand-new place claims its history immediately (visits/charges that
+  // happened here before it was saved).
+  await backfillLocationMatches(env, false);
   return { id: Number(res.meta.last_row_id ?? 0) };
 }
 
@@ -764,6 +840,95 @@ export async function getLocationStats(env: Env, id: number): Promise<unknown> {
     total_energy_added_kwh: round(charges?.kwh ?? 0, 2),
     total_cost: round(charges?.cost ?? 0, 2),
   };
+}
+
+/**
+ * (Re)matches historical drives and charge sessions to the saved places.
+ * Live matching only happens as sessions open/close, so anything recorded
+ * BEFORE a place was saved (or after it was moved/resized) sits unmatched
+ * and the place shows zero visits. Runs with the locations preloaded — one
+ * pass over ~all rows, only writing actual changes. `force` recomputes rows
+ * that already have a location id (needed after moving/deleting a place).
+ * Called from setLocation on every save, and exposed as
+ * POST /setup/backfill-locations for a manual full pass.
+ */
+export async function backfillLocationMatches(env: Env, force = false): Promise<Record<string, number>> {
+  await ensureSchema(env);
+  const locs = (await env.DB.prepare(`SELECT id, lat, lon, radius_m FROM locations`).all<{
+    id: number; lat: number; lon: number; radius_m: number;
+  }>()).results ?? [];
+  const match = (lat: number | null, lon: number | null): number | null => {
+    if (lat == null || lon == null) return null;
+    let best: { id: number; d: number } | null = null;
+    for (const l of locs) {
+      const d = haversineMeters(lat, lon, l.lat, l.lon);
+      if (d <= l.radius_m && (best === null || d < best.d)) best = { id: l.id, d };
+    }
+    return best?.id ?? null;
+  };
+
+  let drivesChanged = 0;
+  const drives = (await env.DB.prepare(
+    `SELECT id, start_lat, start_lon, end_lat, end_lon, start_location_id, end_location_id
+     FROM drives WHERE status = 'complete'`,
+  ).all<{ id: number; start_lat: number | null; start_lon: number | null; end_lat: number | null; end_lon: number | null; start_location_id: number | null; end_location_id: number | null }>()).results ?? [];
+  for (const d of drives) {
+    const start = force || d.start_location_id == null ? match(d.start_lat, d.start_lon) : d.start_location_id;
+    const end = force || d.end_location_id == null ? match(d.end_lat, d.end_lon) : d.end_location_id;
+    if (start !== (d.start_location_id ?? null) || end !== (d.end_location_id ?? null)) {
+      await env.DB.prepare(`UPDATE drives SET start_location_id = ?2, end_location_id = ?3 WHERE id = ?1`)
+        .bind(d.id, start, end).run();
+      drivesChanged++;
+    }
+  }
+
+  let chargesChanged = 0;
+  const charges = (await env.DB.prepare(
+    `SELECT id, lat, lon, location_id FROM charge_sessions WHERE status = 'complete'`,
+  ).all<{ id: number; lat: number | null; lon: number | null; location_id: number | null }>()).results ?? [];
+  for (const c of charges) {
+    const m = force || c.location_id == null ? match(c.lat, c.lon) : c.location_id;
+    if (m !== (c.location_id ?? null)) {
+      await env.DB.prepare(`UPDATE charge_sessions SET location_id = ?2 WHERE id = ?1`).bind(c.id, m).run();
+      chargesChanged++;
+    }
+  }
+  return { locations: locs.length, drives_examined: drives.length, drives_changed: drivesChanged, charges_examined: charges.length, charges_changed: chargesChanged };
+}
+
+/**
+ * Everything that ever happened AT a saved place, newest first: arrivals
+ * (drives ending here), departures (drives starting here) and charge sessions
+ * — each row carries the drive/charge id so the dashboard can click through.
+ */
+export async function getLocationHistory(env: Env, id: number, limit = 200): Promise<unknown> {
+  await ensureSchema(env);
+  const loc = await env.DB.prepare(`SELECT id, name FROM locations WHERE id = ?1`).bind(id).first();
+  if (!loc) return { error: "location not found" };
+  const [arrivals, departures, charges] = await Promise.all([
+    env.DB.prepare(
+      `SELECT id, end_ts ts, start_address other_address, distance_km, driver, duration_min
+       FROM drives WHERE end_location_id = ?1 AND status = 'complete' ORDER BY end_ts DESC LIMIT ?2`,
+    ).bind(id, limit).all<Record<string, unknown>>(),
+    env.DB.prepare(
+      `SELECT id, start_ts ts, end_address other_address, distance_km, driver, duration_min
+       FROM drives WHERE start_location_id = ?1 AND status = 'complete' ORDER BY start_ts DESC LIMIT ?2`,
+    ).bind(id, limit).all<Record<string, unknown>>(),
+    env.DB.prepare(
+      `SELECT id, start_ts ts, end_ts, energy_added_kwh, start_soc, end_soc, cost, charge_type, duration_min
+       FROM charge_sessions WHERE location_id = ?1 AND status = 'complete' ORDER BY start_ts DESC LIMIT ?2`,
+    ).bind(id, limit).all<Record<string, unknown>>(),
+  ]);
+  const events: Array<Record<string, unknown>> = [
+    ...(arrivals.results ?? []).map((r) => ({ ...r, kind: "arrival" })),
+    ...(departures.results ?? []).map((r) => ({ ...r, kind: "departure" })),
+    ...(charges.results ?? []).map((r) => ({ ...r, kind: "charge" })),
+  ];
+  const sorted = events
+    .filter((e) => typeof e.ts === "number")
+    .sort((a, b) => (b.ts as number) - (a.ts as number))
+    .slice(0, limit);
+  return { location: loc, events: sorted };
 }
 
 // ---------------------------------------------------------------------------
