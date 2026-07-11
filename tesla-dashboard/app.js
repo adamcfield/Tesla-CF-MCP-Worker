@@ -5,7 +5,7 @@ import { destroyMaps, renderPointMap, renderRouteMap, renderLifetimeMap, createR
 // Bump on every change to this dashboard (UI, features, or the /data/*
 // endpoints it depends on) and add a matching entry to CHANGELOG.md — see
 // the versioning policy in the repo's CLAUDE.md. Shown in the sidebar footer.
-const APP_VERSION = "1.7.2";
+const APP_VERSION = "1.7.3";
 
 const root = document.getElementById("app");
 let shellBound = false; // guards one-time attach of the root click handler + sync timer
@@ -998,18 +998,64 @@ async function refreshConnStatus() {
 // API usage — drill-down behind the sidebar spend widget
 // ---------------------------------------------------------------------------
 
+/**
+ * Why the call log failed, as an actionable card — NOT the generic empty state.
+ * A 404 here has one overwhelmingly likely cause: the deployed worker predates
+ * the /data/budget-calls route (the dashboard ships via Pages on every merge,
+ * the worker only ships when someone runs `npm run deploy`). Saying exactly
+ * that is the difference between "it doesn't work" and knowing what to run.
+ */
+function callLogErrorHtml(err) {
+  const status = err?.status;
+  if (status === 404) {
+    return `<div class="tm-card tm-card-pad">
+      <div class="tm-empty-title" style="color:var(--warn);">Call log not available on the deployed worker</div>
+      <div style="font-size:13px;color:var(--sub);margin-top:8px;line-height:1.55;">
+        This screen reads <code>/data/budget-calls</code>, but the worker that's live right now answers 404 for it —
+        the deployed worker is older than this feature, so it also isn't recording the per-call breakdown yet.
+        The month total above still works (it uses an older endpoint).
+      </div>
+      <div style="font-size:13px;color:var(--sub);margin-top:8px;line-height:1.55;">
+        Fix: redeploy the worker — <code>cd tesla-cf-mcp-worker &amp;&amp; npm run deploy</code>.
+        The per-call log starts recording from the moment the new worker is live (spend before that stays visible only in the month total).
+      </div>
+    </div>`;
+  }
+  if (status === 401 || status === 403) {
+    return `<div class="tm-card tm-card-pad">
+      <div class="tm-empty-title" style="color:var(--warn);">Call log request was rejected (${status})</div>
+      <div style="font-size:13px;color:var(--sub);margin-top:8px;">Your access token didn't authorize <code>/data/budget-calls</code> — try disconnecting and logging in again with a current token.</div>
+    </div>`;
+  }
+  return `<div class="tm-card tm-card-pad">
+    <div class="tm-empty-title" style="color:var(--warn);">Couldn't load the call log</div>
+    <div style="font-size:13px;color:var(--sub);margin-top:8px;">${esc(err?.message || "Unknown error")} — the request to <code>/data/budget-calls</code> failed. Check the worker is reachable, then reload.</div>
+  </div>`;
+}
+
 async function renderApiUsage() {
-  const [summary, log] = await Promise.all([
+  // The call-log failure is kept (not swallowed to null) so the screen can say
+  // WHY it's missing — a silent empty table here is exactly what made a real
+  // budget overrun undiagnosable from the dashboard.
+  const [summary, logRes] = await Promise.all([
     safe(cached("summary", () => data.summary(vin())), null),
-    safe(data.budgetCallLog(30), null),
+    data.budgetCallLog(30).then((v) => ({ log: v }), (e) => ({ error: e })),
   ]);
   const b = summary?.api_budget ?? null;
+  const log = logRes.log ?? null;
 
-  if (!b && !log?.entries?.length) {
-    return setContent(emptyHtml("No API spend recorded yet", "This fills in once the worker starts polling or streaming telemetry for your car."));
+  if (!b && !log) {
+    return setContent(`
+      ${emptyHtml("No API spend recorded yet", "This fills in once the worker starts polling or streaming telemetry for your car.")}
+      ${logRes.error ? callLogErrorHtml(logRes.error) : ""}`);
   }
 
   const f = b?.forecast ?? null;
+  // Per-call accounting can start mid-month (it began with a worker deploy) —
+  // when the table covers less spend than the month total, say so instead of
+  // letting the numbers silently disagree.
+  const earliestDay = log?.entries?.length ? log.entries[log.entries.length - 1].day : null;
+  const accountingGap = b && log && b.spent_usd > (log.total_cost_usd ?? 0) + 0.05;
   setContent(`
     <div class="tm-grid-metrics">
       <div class="tm-card tm-card-pad-metric">
@@ -1030,6 +1076,7 @@ async function renderApiUsage() {
         <div class="tm-stat-value">${log ? "$" + fmt2(log.total_cost_usd) : "—"}</div>
       </div>
     </div>
+    ${logRes.error ? callLogErrorHtml(logRes.error) : ""}
     ${log?.by_kind?.length ? `
     <div class="tm-grid-metrics">
       ${log.by_kind.map((k) => `
@@ -1039,21 +1086,23 @@ async function renderApiUsage() {
           <div class="tm-stat-note">${fmt0(k.count)} call${k.count === 1 ? "" : "s"}</div>
         </div>`).join("")}
     </div>` : ""}
+    ${log ? `
     <div class="tm-card tm-table-wrap">
       <div style="min-width:560px;">
         <div class="tm-table-head" style="grid-template-columns:120px 1fr 90px 90px;">
           <div>Day</div><div>Call kind</div><div class="tm-right">Count</div><div class="tm-right">Cost</div>
         </div>
-        ${log?.entries?.length ? log.entries.map((e) => `
+        ${log.entries?.length ? log.entries.map((e) => `
           <div class="tm-table-row no-click" style="grid-template-columns:120px 1fr 90px 90px;">
             <div style="font-size:12.5px;color:var(--sub);">${esc(e.day)}</div>
             <div>${esc(e.label)}</div>
             <div class="tm-right tm-mono" style="color:var(--sub);">${fmt0(e.count)}</div>
             <div class="tm-right tm-mono">$${fmt2(e.cost_usd)}</div>
           </div>`).join("") : `<div class="tm-empty" style="padding:20px 22px;">No call log entries in this window yet.</div>`}
+        ${accountingGap ? `<div class="tm-foot-note" style="color:var(--warn);">The rows above total $${fmt2(log.total_cost_usd)} but the month has spent $${fmt2(b.spent_usd)} — per-call accounting only began ${earliestDay ? `on ${esc(earliestDay)}` : "recently"} (with a worker deploy); spend before that is in the month total only.</div>` : ""}
         <div class="tm-foot-note">One row per day + call kind, not one row per call — reload this screen to see today's row grow. This is a cost summary, not a live call feed: the "synced Xs ago" you see elsewhere is the dashboard re-reading already-stored data (free), separate from the worker's own, much slower Tesla API poll cadence that this screen tracks.</div>
       </div>
-    </div>
+    </div>` : ""}
   `);
 }
 
