@@ -18,7 +18,10 @@ set -euo pipefail
 
 WORKER="https://tesla-cf-mcp-worker.adamcfield.workers.dev"
 VIN="LRW3E7ET1RC159967"
-HOST="82.70.222.107.nip.io"
+# Must be a domain that matches the Tesla partner account registration
+# (rightcraft.io) — Tesla rejects bare-IP/nip.io hostnames with
+# "hostname domain does not match with partner account".
+HOST="telemetry.rightcraft.io"
 PORT=443
 VM_IP="82.70.222.107"
 SSH_KEY="$HOME/.ssh/oracle_tesla"
@@ -109,7 +112,9 @@ for i in $(seq 1 20); do
     -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_telemetry_config","arguments":{"vin":"'"$VIN"'"}}}')
   SHORT=$(echo "$CFG" | python3 -c 'import sys,json;print(json.dumps(json.load(sys.stdin))[:180])' 2>/dev/null || echo "$CFG" | head -c 180)
   echo "   [$((i*15))s] $SHORT"
-  if echo "$CFG" | grep -qE '"synced" *: *true'; then
+  # \\? — the MCP response embeds the config JSON as an escaped string (\"synced\"),
+  # so the quote before ":" may be preceded by a backslash.
+  if echo "$CFG" | grep -qE '"synced\\?" *: *true'; then
     echo ""; echo ">>> SYNCED. The car is now streaming to your VM. Take a drive and watch:"
     echo "    curl -s '$WORKER/data/latest?vin=$VIN&token=<read-token>' | python3 -m json.tool"
     exit 0
