@@ -129,18 +129,13 @@ const FIELD_MAP: Record<string, string> = {
   // these yet — the point is to start the historical record now and decide
   // what to build on top of it later.
   //
-  // Deliberately EXCLUDED (not mapped at all):
-  //   - The ~28 per-corner powertrain diagnostic fields (DiAxleSpeed*,
-  //     DiHeatsinkT*, DiInverterT*, DiMotorCurrent*, DiStatorTemp*,
-  //     DiTorque*, DiVBat*) — service-shop-only signals with no
-  //     interpretable meaning for a driver dashboard.
-  //   - Semi-truck-only and Cybertruck-only fields (Semitruck*, Tonneau*,
-  //     Powershare* — Powershare is a Cybertruck feature) — wrong vehicle
-  //     class for this deployment.
-  //   - RouteLastUpdated — the CSV itself documents it as broken/unreliable.
-  //   - Static vehicle-configuration/display-preference fields (ExteriorColor,
-  //     WheelType, Trim, RoofColor, VehicleName, Setting*, etc.) — these
-  //     don't change over time, so there's nothing to "track" about them.
+  // 2026-07-11 policy update: NOTHING is excluded anymore — the owner asked
+  // for every streamable field, so the previously-excluded groups (per-corner
+  // Di* powertrain diagnostics, Semi/Cybertruck-only fields, RouteLastUpdated,
+  // static configuration/display preferences) are now mapped at the end of
+  // this object. Mapping them keeps their EAV keys stable snake_case instead
+  // of the `field.toLowerCase()` fallback; wrong-vehicle-class fields simply
+  // never emit, costing nothing.
 
   // --- Climate / comfort habits (also strengthens the driver-fingerprint
   // classifier in suggestDriverForDrive, the same idea as SeatHeaterLeft).
@@ -270,6 +265,86 @@ const FIELD_MAP: Record<string, string> = {
   SoftwareUpdateDownloadPercentComplete: "software_update_download_pct",
   SoftwareUpdateExpectedDurationMinutes: "software_update_duration_min",
   SoftwareUpdateScheduledStartTime: "software_update_scheduled_ts",
+
+  // --- Per-corner powertrain diagnostics (Di*) — previously excluded; now captured because the user wants the complete record. EAV-only like everything else here.
+  DCDCEnable: "dcdc_enable",
+  DiAxleSpeedF: "di_axle_speed_f",
+  DiAxleSpeedR: "di_axle_speed_r",
+  DiAxleSpeedREL: "di_axle_speed_rel",
+  DiAxleSpeedRER: "di_axle_speed_rer",
+  DiHeatsinkTF: "di_heatsink_tf",
+  DiHeatsinkTR: "di_heatsink_tr",
+  DiHeatsinkTREL: "di_heatsink_trel",
+  DiHeatsinkTRER: "di_heatsink_trer",
+  DiInverterTF: "di_inverter_tf",
+  DiInverterTR: "di_inverter_tr",
+  DiInverterTREL: "di_inverter_trel",
+  DiInverterTRER: "di_inverter_trer",
+  DiMotorCurrentF: "di_motor_current_f",
+  DiMotorCurrentR: "di_motor_current_r",
+  DiMotorCurrentREL: "di_motor_current_rel",
+  DiMotorCurrentRER: "di_motor_current_rer",
+  DiSlaveTorqueCmd: "di_slave_torque_cmd",
+  DiStateF: "di_state_f",
+  DiStateR: "di_state_r",
+  DiStateREL: "di_state_rel",
+  DiStateRER: "di_state_rer",
+  DiStatorTempF: "di_stator_temp_f",
+  DiStatorTempR: "di_stator_temp_r",
+  DiStatorTempREL: "di_stator_temp_rel",
+  DiStatorTempRER: "di_stator_temp_rer",
+  DiTorqueActualF: "di_torque_actual_f",
+  DiTorqueActualR: "di_torque_actual_r",
+  DiTorqueActualREL: "di_torque_actual_rel",
+  DiTorqueActualRER: "di_torque_actual_rer",
+  DiTorquemotor: "di_torquemotor",
+  DiVBatF: "di_v_bat_f",
+  DiVBatR: "di_v_bat_r",
+  DiVBatREL: "di_v_bat_rel",
+  DiVBatRER: "di_v_bat_rer",
+  // --- Semi-truck-only fields — will never emit on this vehicle; mapped so nothing streamed is ever stored under a fallback key.
+  LifetimeEnergyUsedDrive: "lifetime_energy_used_drive",
+  SemitruckPassengerSeatFoldPosition: "semitruck_passenger_seat_fold_position",
+  SemitruckTpmsPressureRe1L0: "semitruck_tpms_pressure_re_1_l_0",
+  SemitruckTpmsPressureRe1L1: "semitruck_tpms_pressure_re_1_l_1",
+  SemitruckTpmsPressureRe1R0: "semitruck_tpms_pressure_re_1_r_0",
+  SemitruckTpmsPressureRe1R1: "semitruck_tpms_pressure_re_1_r_1",
+  SemitruckTpmsPressureRe2L0: "semitruck_tpms_pressure_re_2_l_0",
+  SemitruckTpmsPressureRe2L1: "semitruck_tpms_pressure_re_2_l_1",
+  SemitruckTpmsPressureRe2R0: "semitruck_tpms_pressure_re_2_r_0",
+  SemitruckTpmsPressureRe2R1: "semitruck_tpms_pressure_re_2_r_1",
+  SemitruckTractorParkBrakeStatus: "semitruck_tractor_park_brake_status",
+  SemitruckTrailerParkBrakeStatus: "semitruck_trailer_park_brake_status",
+  // --- Cybertruck-only fields (tonneau + Powershare) — same rationale as the Semi fields.
+  PowershareHoursLeft: "powershare_hours_left",
+  PowershareInstantaneousPowerKW: "powershare_instantaneous_power_kw",
+  PowershareStatus: "powershare_status",
+  PowershareStopReason: "powershare_stop_reason",
+  PowershareType: "powershare_type",
+  TonneauOpenPercent: "tonneau_open_percent",
+  TonneauPosition: "tonneau_position",
+  TonneauTentMode: "tonneau_tent_mode",
+  // --- Display-unit preferences + static vehicle configuration — near-constant, but they complete the record and document the car's spec in-band.
+  CarType: "car_type",
+  ChargePort: "charge_port",
+  EfficiencyPackage: "efficiency_package",
+  EuropeVehicle: "europe_vehicle",
+  ExteriorColor: "exterior_color",
+  OffroadLightbarPresent: "offroad_lightbar_present",
+  RearSeatHeaters: "rear_seat_heaters",
+  RightHandDrive: "right_hand_drive",
+  RoofColor: "roof_color",
+  Setting24HourTime: "setting_24_hour_time",
+  SettingChargeUnit: "setting_charge_unit",
+  SettingDistanceUnit: "setting_distance_unit",
+  SettingTemperatureUnit: "setting_temperature_unit",
+  SettingTirePressureUnit: "setting_tire_pressure_unit",
+  SunroofInstalled: "sunroof_installed",
+  Trim: "trim",
+  VehicleName: "vehicle_name",
+  WheelType: "wheel_type",
+  // --- Remaining odds and ends.
+  RouteLastUpdated: "route_last_updated",
 };
 
 /** Canonical fields that live only on `current` for derivation — never stored to EAV. */
