@@ -5,7 +5,7 @@ import { destroyMaps, renderPointMap, renderRouteMap, renderLifetimeMap, createR
 // Bump on every change to this dashboard (UI, features, or the /data/*
 // endpoints it depends on) and add a matching entry to CHANGELOG.md — see
 // the versioning policy in the repo's CLAUDE.md. Shown in the sidebar footer.
-const APP_VERSION = "1.20.0";
+const APP_VERSION = "1.21.0";
 
 const root = document.getElementById("app");
 let shellBound = false; // guards one-time attach of the root click handler + sync timer
@@ -489,6 +489,7 @@ function renderShell() {
   // would stack duplicate handlers and timers.
   if (!shellBound) {
     root.addEventListener("click", onRootClick);
+    root.addEventListener("contextmenu", onRootContextMenu);
     setInterval(tickSyncLabel, 1000);
     document.addEventListener("keydown", (ev) => {
       if (ev.key !== "Escape") return;
@@ -550,6 +551,18 @@ function setSyncing(on) {
 
 function setNavOpen(open) {
   document.querySelector("[data-tm-root]")?.classList.toggle("tm-nav-open", open);
+}
+
+/** Chart explorer: right-click (or long-press on touch) zooms a driving segment OUT one step. */
+function onRootContextMenu(e) {
+  const t = e.target.closest('[data-action="explorer-seg"][data-stage="driving"]');
+  if (!t) return;
+  e.preventDefault();
+  const k = t.dataset.seg;
+  const cur = Number(t.dataset.level) || 1;
+  if (cur <= 1) return; // already at min detail -- nothing to do
+  state.explorerSegLevel[k] = cur - 1;
+  renderExplorer();
 }
 
 function onRootClick(e) {
@@ -622,16 +635,22 @@ function onRootClick(e) {
     state.explorerSegLevel = {};
     renderExplorer();
   } else if (action === "explorer-seg") {
-    // Zoom in one step, clamped at level 5 (never wraps back to 1 -- "Reset
-    // zoomed parts" below is the only way back out). The rect's own
-    // data-level (stamped by charts.js from whatever level it actually
+    // Driving gets full bidirectional control (left-click zooms in one step,
+    // clamped at 5 -- right-click zooms out, see onRootContextMenu below).
+    // Every other stage is a simple two-state toggle: click jumps straight
+    // to max detail (5), click again returns to the default (1). The rect's
+    // own data-level (stamped by charts.js from whatever level it actually
     // rendered at -- an explicit override or the stage default) is the
     // source of truth, so this never needs to duplicate the default-level
     // logic that lives in charts.js.
     const k = t.dataset.seg;
     const cur = Number(t.dataset.level) || 1;
-    if (cur >= 5) return; // already at max detail -- nothing to do
-    state.explorerSegLevel[k] = cur + 1;
+    if (t.dataset.stage === "driving") {
+      if (cur >= 5) return; // already at max detail -- nothing to do
+      state.explorerSegLevel[k] = cur + 1;
+    } else {
+      state.explorerSegLevel[k] = cur <= 1 ? 5 : 1;
+    }
     renderExplorer();
   } else if (action === "explorer-warp-reset") {
     state.explorerSegLevel = {};
@@ -3561,7 +3580,7 @@ async function renderExplorer() {
     <div class="tm-card tm-card-pad" style="margin-top:14px;">
       <div class="tm-card-head">
         <div class="tm-card-head-title">Signals over time</div>
-        <div class="tm-card-head-sub">${esc(windowLabel)} · smart axis: drives stretched, charging/sleep compressed — click a strip segment to zoom in a step, "↺ Reset zoomed parts" to zoom back out · drag to zoom the whole window · hover the strip for what the next click does</div>
+        <div class="tm-card-head-sub">${esc(windowLabel)} · smart axis: drives stretched, charging/sleep compressed — on a driving part, click to zoom in and right-click to zoom out; on everything else, click to jump to max detail and click again to go back · drag to zoom the whole window · hover the strip for details</div>
       </div>
       <div id="tm-explorer-chart" style="position:relative;">
         ${svgTimelineExplorer({

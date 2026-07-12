@@ -9,6 +9,34 @@ feature or screen, the **patch** version for fixes/tweaks/copy changes, and the
 configured. See `CLAUDE.md` at the repo root for the policy on keeping this file
 and `APP_VERSION` (in `app.js`) in sync.
 
+## 1.21.0 — 2026-07-12
+
+Chart explorer: driving gets true bidirectional zoom, everything else
+gets a simple toggle — "Level 5 is not max detail. I want zoom in and
+out for the driving part. The rest can have the press to zoom and to
+start upon another press as before."
+
+- **One shared 5-level ladder for every stage** (weights 1/4/16/64/256)
+  instead of a driving-only ladder capped at 16 — level 5 is now the
+  same true maximum for every stage, not an artificially low ceiling
+  for driving.
+- **Driving: left-click zooms in, right-click (long-press on touch)
+  zooms out** — both clamp at the ladder's ends instead of wrapping.
+  Driving defaults mid-ladder (level 3) so there's real room to go
+  either direction. The hover hint now shows both actions and their
+  effect, e.g. "Click: zoom in ~15 min → ~10 min (level 3/5 → 4/5) ·
+  Right-click: zoom out ~15 min → ~1 h (level 3/5 → 2/5)".
+- **Every other stage (charging, connected, resting, data gaps) is a
+  two-state toggle**: click jumps straight to max detail, click again
+  returns to the default — no intermediate steps, no right-click
+  needed. "↺ Reset zoomed parts" still clears every override at once.
+- Verified live: a driving segment zoomed 3→4→5 on left-clicks, then
+  5→4→3→2→1 on right-clicks (clamping at both ends); a connected
+  segment alternated cleanly 1→5→1→5 on repeated clicks. Right-click
+  on a non-driving segment correctly does nothing (no bidirectional
+  control there) and doesn't interfere with the browser's normal
+  context menu elsewhere on the page.
+
 ## 1.20.0 — 2026-07-12
 
 Chart explorer: replaced the 5-level click-to-cycle zoom with explicit
