@@ -76,13 +76,23 @@ export type Activity = "driving" | "charging" | "idle";
  * off. A car in gear D/R or actually moving physically cannot be charging, so it
  * must win — otherwise the drive is never detected and the charge session hangs
  * open through the whole trip.
+ *
+ * `moving` alone (no gear check) decides "driving": Gear/ShiftState and
+ * VehicleSpeed stream independently and at different intervals, so `s.gear`
+ * in the merged state can be a STALE "P" carried over from before the car set
+ * off, persisting through an entire drive if Gear itself doesn't get
+ * re-reported. That previously suppressed the moving check (`gear !== "P"`)
+ * and produced real multi-minute, real-speed drives (seen live: sustained
+ * 60-90 km/h for 4+ minutes) misclassified as "idle" for their whole
+ * duration. Speed is the one field that was reliably fresh throughout that
+ * drive, so it alone is trusted here.
  */
 export function deriveActivity(s: LatestState): Activity {
   const gear = normalizeGear(s.gear);
   const speed = num(s.speed);
   const moving = speed !== null && speed > 1;
   if (gear === "D" || gear === "R") return "driving";
-  if (moving && gear !== "P") return "driving";
+  if (moving) return "driving";
   const cs = String(s.charging_state ?? "");
   if (CHARGING.has(cs)) return "charging";
   return "idle";
