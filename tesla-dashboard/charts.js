@@ -393,16 +393,30 @@ export function svgTimelineExplorer({
       tile.nextHint = `Click: ~${fmtStepSize(curStep)} → ~${fmtStepSize(nextStep)} intervals (level ${curLevel}/5 → ${nextLevel}/5)`;
     }
   }
-  // Floor: any tile longer than a minute stays at least 16px wide (clickable,
-  // visible); take the excess proportionally from the bigger tiles.
+  // Floor: any tile longer than a minute stays at least MINPX wide (clickable,
+  // visible). Two hard invariants keep this from breaking on many-segment
+  // windows (a 30-day view holds hundreds of stage changes): the floor itself
+  // shrinks once tiles.length * MINPX wouldn't fit in the plot (otherwise the
+  // strip would overflow the viewBox and everything past the right edge would
+  // be clipped and un-hoverable), and donors are only ever drawn down TO the
+  // floor, never below it (the old proportional take could push a donor's
+  // width negative, making the piecewise X() non-monotonic — series lines
+  // folding back over themselves).
   const MINPX = 16;
-  const need = tiles.filter((x) => x.t1 - x.t0 > 60 && x.px < MINPX);
-  const deficit = need.reduce((s, x) => s + (MINPX - x.px), 0);
+  const floorPx = Math.min(MINPX, plotW / (tiles.length || 1));
+  const need = tiles.filter((x) => x.t1 - x.t0 > 60 && x.px < floorPx);
+  const deficit = need.reduce((s, x) => s + (floorPx - x.px), 0);
   if (deficit > 0) {
-    const donors = tiles.filter((x) => !need.includes(x));
-    const donorPx = donors.reduce((s, x) => s + x.px, 0) || 1;
-    for (const x of need) x.px = MINPX;
-    for (const x of donors) x.px -= (x.px / donorPx) * deficit;
+    const donors = tiles.filter((x) => !need.includes(x) && x.px > floorPx);
+    const avail = donors.reduce((s, x) => s + (x.px - floorPx), 0);
+    const frac = avail > 0 ? Math.min(1, deficit / avail) : 0;
+    for (const x of need) x.px = floorPx;
+    for (const x of donors) x.px -= (x.px - floorPx) * frac;
+    // When donors couldn't cover the whole deficit the total now sums under
+    // plotW; scale everything back up to fill the width (scaling up can never
+    // violate a floor).
+    const sum = tiles.reduce((s, x) => s + x.px, 0);
+    if (sum > 0 && sum < plotW - 0.5) for (const x of tiles) x.px *= plotW / sum;
   }
   let acc = plotL;
   const pieces = tiles.map((x) => {
@@ -461,7 +475,7 @@ export function svgTimelineExplorer({
     .map((tk) => `<text x="${tk.x}" y="${height - 5}" text-anchor="middle" style="font:10.5px var(--mono);fill:var(--faint);">${esc(fmtTick(tk.ts))}</text>`)
     .join("");
 
-  // ---- State strip (clickable: zoom in one step per click) ----------------
+  // ---- State strip (driving: click in / right-click out; rest: 5-level cycle)
   // Every piece is drawn, including data GAPS (stage null) -- the strip must
   // never have a blank/empty stretch, since that reads as "unknown" rather
   // than "the car reported nothing here". Gaps get a distinct hollow/dashed

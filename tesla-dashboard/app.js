@@ -5,7 +5,7 @@ import { destroyMaps, renderPointMap, renderRouteMap, renderLifetimeMap, createR
 // Bump on every change to this dashboard (UI, features, or the /data/*
 // endpoints it depends on) and add a matching entry to CHANGELOG.md — see
 // the versioning policy in the repo's CLAUDE.md. Shown in the sidebar footer.
-const APP_VERSION = "1.22.0";
+const APP_VERSION = "1.22.1";
 
 const root = document.getElementById("app");
 let shellBound = false; // guards one-time attach of the root click handler + sync timer
@@ -3632,9 +3632,11 @@ function bindExplorerZoom() {
     return Number(svg.dataset.x0) + frac * (Number(svg.dataset.x1) - Number(svg.dataset.x0));
   };
   let dragStartX = null;
+  let suppressClick = false;
   wrap.addEventListener("mousedown", (e) => {
     if (e.button !== 0) return;
     dragStartX = e.clientX;
+    suppressClick = false; // a stale flag (drag ended on mouseleave) must not eat this press's click
     e.preventDefault(); // no text selection while dragging
   });
   wrap.addEventListener("mousemove", (e) => {
@@ -3652,6 +3654,10 @@ function bindExplorerZoom() {
     dragStartX = null;
     sel.style.display = "none";
     if (Math.abs(e.clientX - startX) < 12) return; // a click, not a drag
+    // The browser still fires a click after this mouseup; without this it
+    // would bubble to onRootClick's explorer-seg branch and ALSO cycle the
+    // zoom level of whatever strip segment the drag happened to start on.
+    suppressClick = true;
     const t0 = toTs(Math.min(startX, e.clientX));
     const t1 = toTs(Math.max(startX, e.clientX));
     if (!(t1 > t0)) return;
@@ -3661,8 +3667,19 @@ function bindExplorerZoom() {
   };
   wrap.addEventListener("mouseup", finish);
   wrap.addEventListener("mouseleave", (e) => { if (dragStartX != null) finish(e); });
+  // Capture phase so this runs before the delegated bubble handler on root.
+  wrap.addEventListener("click", (e) => {
+    if (!suppressClick) return;
+    suppressClick = false;
+    e.stopPropagation();
+    e.preventDefault();
+  }, true);
   // Double-click: jump back to the live default without touching the duration.
-  wrap.addEventListener("dblclick", () => {
+  // NOT when it lands on a strip segment — the UI invites rapid clicks there
+  // to cycle detail levels, and yanking the view back to "now" mid-cycle
+  // silently discards a panned-back window position.
+  wrap.addEventListener("dblclick", (e) => {
+    if (e.target?.closest?.('[data-action="explorer-seg"]')) return;
     state.explorerEnd = null;
     renderExplorer();
   });

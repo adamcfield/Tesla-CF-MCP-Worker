@@ -9,6 +9,40 @@ feature or screen, the **patch** version for fixes/tweaks/copy changes, and the
 configured. See `CLAUDE.md` at the repo root for the policy on keeping this file
 and `APP_VERSION` (in `app.js`) in sync.
 
+## 1.22.1 — 2026-07-12
+
+Three Chart explorer fixes from a pre-release multi-agent audit of the
+whole branch, before any of it reached production.
+
+- **30-day view no longer breaks the smart axis.** The 16px minimum
+  tile width had no cap: a 30-day window holds hundreds of stage
+  segments, so the floors alone (~180 × 16px) overflowed the 760px-wide
+  chart — everything past roughly day 3 was silently clipped off the
+  right edge, unreachable by hover, click, or drag — and in mixed cases
+  the "take the excess from bigger tiles" step drove donor tiles to
+  *negative* widths, folding series lines back over themselves. The
+  floor now shrinks when there are more tiles than 16px-each can fit,
+  donors are never drawn below the floor, and the total is rescaled to
+  exactly fill the chart.
+- **Drag-to-zoom no longer also cycles a segment's detail level.** The
+  browser fires a click after every completed drag; it bubbled into the
+  strip-segment click handler, so zooming into a region that started on
+  a driving segment also bumped that segment's zoom level (and showed a
+  phantom "↺ Reset zoomed parts" chip) on top of the window change.
+- **Double-clicking a strip segment no longer yanks the view back to
+  live.** The chart-level double-click shortcut (back to now) now
+  ignores double-clicks on strip segments — the UI explicitly invites
+  rapid clicking there to cycle detail levels, and it was silently
+  discarding the panned-back window position mid-cycle.
+- Also in this release (worker-side, same deploy): false "Software
+  update" Timeline entries fixed — a single stale
+  install-percent sample no longer reads as "still updating"
+  indefinitely (treated stale after 90 min); and real drives are no
+  longer misclassified as idle/resting when the gear field streams
+  stale — speed alone now classifies driving (previously a stuck
+  pre-drive "P" suppressed it for the entire trip, verified live
+  against a 4-minute 60-90 km/h drive tagged "resting").
+
 ## 1.22.0 — 2026-07-12
 
 Chart explorer: dual tooltip, deeper driving zoom, 5-level cycle back
@@ -22,8 +56,10 @@ else now has only 2 levels? I want 5."
   tooltip AND the browser's own plain title tooltip stacked on top of
   each other. Removed the native titles — the custom tooltip already
   covers everything they said.
-- **Driving zoom goes much deeper**: level 5's weight jumped from 1024
-  to 65536, so a maxed driving segment now claims virtually all
+- **Driving zoom goes much deeper**: the ladder's top end steepened —
+  level 4's weight went 128 → 256 and level 5's 1024 → 65536 (full
+  ladder now [0.25, 2, 16, 256, 65536]), so a maxed driving segment
+  claims virtually all
   available chart width. A short/medium drive reaches sub-minute ticks
   easily (verified: a 2-minute drive shows ~15 sec intervals even at
   its *default*, unzoomed level). A very long drive (tens of minutes)
