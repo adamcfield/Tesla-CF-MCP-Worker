@@ -9,6 +9,15 @@ feature or screen, the **patch** version for fixes/tweaks/copy changes, and the
 configured. See `CLAUDE.md` at the repo root for the policy on keeping this file
 and `APP_VERSION` (in `app.js`) in sync.
 
+## 1.19.1 — 2026-07-12
+
+Chart explorer: removed the duplicate legend under the chart — "Why do we
+need those twice? have it in one place and de-clutter the chart." The
+signal and marker toggle chips above the chart already carry a colored
+dot + label each, so they already work as the legend; the second static
+legend row (repeating the same names/colors under the chart) was pure
+duplication and is gone.
+
 ## 1.19.0 — 2026-07-12
 
 Chart explorer: fixed a stale hover tooltip after clicking a strip segment,

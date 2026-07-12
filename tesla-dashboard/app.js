@@ -5,7 +5,7 @@ import { destroyMaps, renderPointMap, renderRouteMap, renderLifetimeMap, createR
 // Bump on every change to this dashboard (UI, features, or the /data/*
 // endpoints it depends on) and add a matching entry to CHANGELOG.md — see
 // the versioning policy in the repo's CLAUDE.md. Shown in the sidebar footer.
-const APP_VERSION = "1.19.0";
+const APP_VERSION = "1.19.1";
 
 const root = document.getElementById("app");
 let shellBound = false; // guards one-time attach of the root click handler + sync timer
@@ -3551,7 +3551,6 @@ async function renderExplorer() {
     .map(([f, label, unit, color, dashed]) => ({ key: f, name: label, unit, color, dashed: !!dashed, points: tl.series[f] }));
   const markerColor = Object.fromEntries(Object.entries(MARKER_META).map(([k, [, c]]) => [k, c]));
   const shownMarkers = (tl.markers || []).filter((m) => state.explorerMarkerKinds.includes(m.kind));
-  const presentKinds = [...new Set(shownMarkers.map((m) => m.kind))];
   const overflowNote = Object.entries(tl.marker_overflow || {}).map(([k, n]) => `${n} ${MARKER_META[k]?.[0] || k} markers beyond the cap not shown`).join(" · ");
 
   setContent(`
@@ -3574,16 +3573,6 @@ async function renderExplorer() {
       </div>
       <div style="margin-top:12px;padding-top:12px;border-top:1px solid var(--line2);">
         ${rangeChips}
-      </div>
-      <div class="tm-flex-row" style="gap:16px;flex-wrap:wrap;margin-top:10px;">
-        ${seriesDefs.map((s) => `
-          <span style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--sub);">
-            <span style="width:14px;height:2px;background:${s.color};flex:none;${s.dashed ? "background:repeating-linear-gradient(90deg," + s.color + " 0 4px,transparent 4px 7px);" : ""}"></span>${esc(s.name)}
-          </span>`).join("")}
-        ${presentKinds.map((k) => `
-          <span style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--sub);">
-            <span style="width:9px;height:9px;border-radius:50%;background:${markerColor[k] || "var(--warn)"};flex:none;"></span>${esc(MARKER_META[k]?.[0] || k)}
-          </span>`).join("")}
       </div>
       ${batteryStageLegendHtml(tl.stage_hours)}
       <div class="tm-foot-note">Resolution adapts to what the car was doing: driving keeps up to ~4× more points than idle/charging (this window: ${fmt0(tl.resolution?.kept ?? 0)} of ${fmt0(tl.resolution?.rows ?? 0)} samples kept${tl.resolution?.stride_driving > 1 ? `, driving thinned ×${tl.resolution.stride_driving}` : ", driving at full resolution"}).${overflowNote ? " " + esc(overflowNote) + "." : ""}</div>
