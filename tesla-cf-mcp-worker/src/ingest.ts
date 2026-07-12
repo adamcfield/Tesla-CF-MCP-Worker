@@ -485,6 +485,11 @@ export async function applyIngest(env: Env, parsed: ParsedIngest): Promise<Lates
     }
 
     patch[canonical] = value;
+    // Companion timestamp so timelineState can tell a genuinely fresh
+    // "installing" reading apart from mergeLatest's merge-forever carrying a
+    // stale one indefinitely (Tesla never sends a terminal packet for this
+    // field — see UPDATE_STALE_S in tracking.ts).
+    if (canonical === "software_update_pct") patch.software_update_pct_ts = parsed.ts;
     // EAV history holds only fields not captured as structured position columns.
     if (!POSITION_COLUMNS.has(canonical) && !META_FIELDS.has(canonical) && canonical !== "location") {
       events.push({ field: canonical, value, ts: parsed.ts });

@@ -89,12 +89,24 @@ export function deriveActivity(s: LatestState): Activity {
   return "idle";
 }
 
+// SoftwareUpdateInstallationPercentComplete is an on-change field: Tesla sends
+// it while an update is actively installing, then simply stops — there is no
+// reliable terminal 0/100 packet. mergeLatest's merge-forever semantics mean
+// a single "1%" sample would otherwise read as "still updating" indefinitely
+// (observed live 2026-07-12: one real sample at 22:26 the night before kept
+// fragmenting the whole next day's idle time into false "Software update"
+// timeline entries). Treat it as stale — and therefore not updating — once
+// it's older than a real OTA install ever takes.
+const UPDATE_STALE_S = 90 * 60;
+
 /** Maps activity (plus a possible software update) to a state-timeline label. */
-function timelineState(s: LatestState, activity: Activity): string {
+function timelineState(s: LatestState, activity: Activity, ts: number): string {
   if (activity === "driving") return "driving";
   if (activity === "charging") return "charging";
   const pct = num(s.software_update_pct);
-  if (pct !== null && pct > 0 && pct < 100) return "updating";
+  const seenTs = num(s.software_update_pct_ts);
+  const fresh = seenTs !== null && ts - seenTs < UPDATE_STALE_S;
+  if (pct !== null && pct > 0 && pct < 100 && fresh) return "updating";
   return "online";
 }
 
@@ -183,7 +195,7 @@ export async function applyDerivation(
   await insertPosition(env, vin, ts, sample);
 
   // 3. State timeline.
-  await updateStateTimeline(env, vin, timelineState(current, activity), ts, "ingest");
+  await updateStateTimeline(env, vin, timelineState(current, activity, ts), ts, "ingest");
 
   // 4. Charge sessions + curve.
   await trackCharge(env, vin, current, ts, activity === "charging", priceCentsKwh);
