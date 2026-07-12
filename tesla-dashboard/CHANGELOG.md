@@ -9,6 +9,24 @@ feature or screen, the **patch** version for fixes/tweaks/copy changes, and the
 configured. See `CLAUDE.md` at the repo root for the policy on keeping this file
 and `APP_VERSION` (in `app.js`) in sync.
 
+## 1.17.2 — 2026-07-12
+
+Fix (regression from 1.17.1): the tooltip fix caused a full-screen black
+box to open on hover instead of a small tooltip — "a black drawer opens
+from the left and covers the dashboard".
+
+- Root cause: `[data-tm-root]` alone (not just its dark-theme variant)
+  also carries the APP-SHELL layout rule (`display:flex; width:100%;
+  height:100vh; overflow:hidden`) — stamping that attribute onto the
+  tooltip to fix its colors (1.17.1) made it match this rule too,
+  expanding the tooltip to fill the viewport.
+- Fix: also add the `tm-root-plain` class already used by the login
+  gate for this exact situation (get the color variables, opt out of
+  the shell layout) — `[data-tm-root].tm-root-plain` overrides the
+  shell rule at higher specificity.
+- Verified live: tooltip is back to a normal shrink-to-fit box
+  (~201×118px, `overflow: visible`) with the correct opaque background.
+
 ## 1.17.1 — 2026-07-12
 
 Fix: chart tooltip had no background — chart lines showed straight

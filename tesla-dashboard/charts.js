@@ -48,7 +48,12 @@ function tip() {
     // same attribute on ITSELF to resolve those variables — otherwise
     // `background: var(--card)` falls back to transparent and chart lines
     // show straight through the tooltip text.
+    // .tm-root-plain is the SAME escape hatch the login gate uses (styles.css)
+    // to get the color variables WITHOUT the app-shell layout rule
+    // ([data-tm-root] alone also sets display:flex/width:100%/height:100vh/
+    // overflow:hidden) -- without it the tooltip becomes a full-viewport box.
     tipEl.setAttribute("data-tm-root", "1");
+    tipEl.classList.add("tm-root-plain");
     document.body.appendChild(tipEl);
   }
   // Keep in sync with the live theme (it can toggle after the tooltip was
