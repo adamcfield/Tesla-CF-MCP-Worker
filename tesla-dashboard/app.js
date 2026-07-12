@@ -1,11 +1,11 @@
 import { auth, data, mcp, verifyToken, exportUrl, ApiError } from "./api.js";
-import { svgLineChart, svgBarChart, svgDonut, svgSplitBar, svgDriveChart } from "./charts.js";
+import { svgLineChart, svgBarChart, svgDonut, svgSplitBar, svgDriveChart, svgTimelineExplorer, refreshChartTooltip } from "./charts.js";
 import { destroyMaps, renderPointMap, renderRouteMap, renderLifetimeMap, createReplayMarker, invalidateMaps } from "./map.js";
 
 // Bump on every change to this dashboard (UI, features, or the /data/*
 // endpoints it depends on) and add a matching entry to CHANGELOG.md — see
 // the versioning policy in the repo's CLAUDE.md. Shown in the sidebar footer.
-const APP_VERSION = "1.15.0";
+const APP_VERSION = "1.22.1";
 
 const root = document.getElementById("app");
 let shellBound = false; // guards one-time attach of the root click handler + sync timer
@@ -211,6 +211,11 @@ const state = {
   batteryTimelineRange: TIMELINE_RANGES_DEFAULT, // index into TIMELINE_RANGES (Battery timeline screen)
   ovChargeRange: TIMELINE_RANGES_DEFAULT, // index into TIMELINE_RANGES (Overview's Charge level card)
   ovClimateRange: TIMELINE_RANGES_DEFAULT, // index into TIMELINE_RANGES (Overview's Cabin climate card)
+  explorerHours: 24, // Chart explorer window DURATION in hours (chips set presets, drag-zoom sets exact values)
+  explorerEnd: null, // Chart explorer window END anchor (unix s) — null = live "now" (stock-chart pan/zoom)
+  explorerFields: ["speed", "soc", "inside_temp", "outside_temp"], // Chart explorer: overlaid signals
+  explorerMarkerKinds: ["harsh_brake", "harsh_accel", "music", "alert"], // Chart explorer: enabled event marker kinds
+  explorerSegLevel: {}, // Chart explorer smart axis: per-segment detail level override ({[start_ts]: 1-5}); cleared on window change. Unset segments use their stage default (driving=4, else=1).
   tfCat: "__all", // Telemetry-fields screen: active category chip
   tfQuery: "", // Telemetry-fields screen: search text
   tfField: null, // field-history popup: { tesla, canonical, hours }
@@ -238,7 +243,7 @@ const NAV = [
   { label: "Media", items: [["md", "♪ Media"]] },
   { label: "Charging", items: [["ch", "Charges"], ["cs", "Charging stats"]] },
   { label: "Battery", items: [["bh", "Battery health"], ["pr", "Predictions"], ["vd", "Vampire drain"]] },
-  { label: "Data", items: [["tf", "Telemetry fields"]] },
+  { label: "Data", items: [["tc", "Chart explorer"], ["tf", "Telemetry fields"]] },
 ];
 
 const TITLES = {
@@ -257,6 +262,7 @@ const TITLES = {
   pr: ["Predictions", "battery forecast & range predictor"],
   vd: ["Vampire drain", "standby losses"],
   bt: ["Battery timeline", "state of charge over time, with stages"],
+  tc: ["Chart explorer", "overlay any signals over time — with events & car state"],
   tf: ["Telemetry fields", "every attribute Tesla can stream, and what this car is sending"],
   api: ["API usage", "Tesla Fleet API call log & cost — click the sidebar widget to get here"],
   cl: ["Changelog", "what's shipped, version by version — click the version number to get here"],
@@ -483,6 +489,7 @@ function renderShell() {
   // would stack duplicate handlers and timers.
   if (!shellBound) {
     root.addEventListener("click", onRootClick);
+    root.addEventListener("contextmenu", onRootContextMenu);
     setInterval(tickSyncLabel, 1000);
     document.addEventListener("keydown", (ev) => {
       if (ev.key !== "Escape") return;
@@ -546,6 +553,18 @@ function setNavOpen(open) {
   document.querySelector("[data-tm-root]")?.classList.toggle("tm-nav-open", open);
 }
 
+/** Chart explorer: right-click (or long-press on touch) zooms a driving segment OUT one step. */
+function onRootContextMenu(e) {
+  const t = e.target.closest('[data-action="explorer-seg"][data-stage="driving"]');
+  if (!t) return;
+  e.preventDefault();
+  const k = t.dataset.seg;
+  const cur = Number(t.dataset.level) || 1;
+  if (cur <= 1) return; // already at min detail -- nothing to do
+  state.explorerSegLevel[k] = cur - 1;
+  renderExplorer();
+}
+
 function onRootClick(e) {
   const t = e.target.closest("[data-action]");
   if (!t) return;
@@ -599,6 +618,55 @@ function onRootClick(e) {
   } else if (action === "ov-climate-range") {
     state.ovClimateRange = Number(t.dataset.range);
     renderOverview();
+  } else if (action === "explorer-range") {
+    // Duration change keeps the window's right edge (stock-chart behavior).
+    state.explorerHours = Number(t.dataset.hours);
+    state.explorerSegLevel = {};
+    renderExplorer();
+  } else if (action === "explorer-pan") {
+    const dir = Number(t.dataset.dir); // -1 back, +1 forward
+    const now = Math.floor(Date.now() / 1000);
+    const end = (state.explorerEnd ?? now) + dir * state.explorerHours * 3600;
+    state.explorerEnd = end >= now ? null : end; // panning to/past the present re-anchors live
+    state.explorerSegLevel = {};
+    renderExplorer();
+  } else if (action === "explorer-live") {
+    state.explorerEnd = null;
+    state.explorerSegLevel = {};
+    renderExplorer();
+  } else if (action === "explorer-seg") {
+    // Driving gets full bidirectional control (left-click zooms in one step,
+    // clamped at 5 -- right-click zooms out, see onRootContextMenu below).
+    // Every other stage cycles through all 5 levels on click, wrapping 5
+    // back to 1. The rect's own data-level (stamped by charts.js from
+    // whatever level it actually rendered at -- an explicit override or the
+    // stage default) is the source of truth, so this never needs to
+    // duplicate the default-level logic that lives in charts.js.
+    const k = t.dataset.seg;
+    const cur = Number(t.dataset.level) || 1;
+    if (t.dataset.stage === "driving") {
+      if (cur >= 5) return; // already at max detail -- nothing to do
+      state.explorerSegLevel[k] = cur + 1;
+    } else {
+      state.explorerSegLevel[k] = cur >= 5 ? 1 : cur + 1;
+    }
+    renderExplorer();
+  } else if (action === "explorer-warp-reset") {
+    state.explorerSegLevel = {};
+    renderExplorer();
+  } else if (action === "explorer-field") {
+    const f = t.dataset.field;
+    const has = state.explorerFields.includes(f);
+    if (has && state.explorerFields.length > 1) state.explorerFields = state.explorerFields.filter((x) => x !== f);
+    else if (!has && state.explorerFields.length < 8) state.explorerFields = [...state.explorerFields, f];
+    renderExplorer();
+  } else if (action === "explorer-marker-kind") {
+    const k = t.dataset.kind;
+    const has = state.explorerMarkerKinds.includes(k);
+    state.explorerMarkerKinds = has
+      ? state.explorerMarkerKinds.filter((x) => x !== k)
+      : [...state.explorerMarkerKinds, k];
+    renderExplorer();
   } else if (action === "tf-cat") {
     state.tfCat = t.dataset.cat;
     renderTelemetryFields();
@@ -949,6 +1017,7 @@ async function showScreen() {
       case "cs": await renderChargingStats(); break;
       case "bh": await renderBatteryHealth(); break;
       case "bt": await renderBatteryTimeline(); break;
+      case "tc": await renderExplorer(); break;
       case "tf": await renderTelemetryFields(); break;
       case "pr": await renderPredictions(); break;
       case "vd": await renderVampireDrain(); break;
@@ -3417,6 +3486,203 @@ async function renderBatteryTimeline() {
       ${tl.points.length > 1 ? chargeLevelChartHtml(tl) : miniEmptyHtml("Not enough samples yet to plot a line")}
     </div>
   `);
+}
+
+// ---------------------------------------------------------------------------
+// Chart explorer — overlay any signals over time, with event markers and the
+// car-state layer. Data: /data/timeline-chart (activity-aware sampling:
+// driving windows keep ~4x the resolution of idle/charging/sleeping).
+// ---------------------------------------------------------------------------
+
+/** [key, label, unit, color, dashed?] — signals offered as overlay chips. */
+const EXPLORER_FIELDS = [
+  ["speed", "Speed", "km/h", "#4C7DFF"],
+  ["soc", "Battery", "%", "#2EA043"],
+  ["inside_temp", "Inside temp", "°C", "#E4572E"],
+  ["outside_temp", "Outside temp", "°C", "#8A8FA3", true],
+  ["power", "Motor power", "kW", "#B5179E"],
+  ["charger_power", "Charger power", "kW", "#0FA3B1"],
+  ["est_range", "Est. range", "km", "#FF9F1C"],
+  ["energy_remaining", "Energy left", "kWh", "#7B2D8B"],
+  ["lon_accel", "Accel/brake g", "m/s²", "#D62828"],
+  ["brake_pedal", "Brake pedal", "", "#9D4EDD"],
+  ["accel_pedal", "Accelerator", "%", "#52B788"],
+  ["media_volume", "Media volume", "", "#8A63D2"],
+];
+
+const MARKER_META = {
+  harsh_brake: ["Hard brake", "#D7263D"],
+  harsh_accel: ["Hard accel", "#F4A261"],
+  music: ["Track change", "#8A63D2"],
+  alert: ["Warning", "#E9C46A"],
+};
+
+/** Compact "Jul 12 14:05" for the explorer's window label. */
+function fmtWindowTs(ts) {
+  return new Date(ts * 1000).toLocaleString(undefined, { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit", hour12: false });
+}
+
+async function renderExplorer() {
+  const hours = state.explorerHours;
+  const end = state.explorerEnd;
+  const fields = state.explorerFields;
+  const key = `explorer:${hours}:${end ?? "live"}:${[...fields].sort().join(",")}`;
+  const tl = await safe(cached(key, () => data.timelineChart(vin(), hours, fields, end)), null);
+
+  const isPreset = (h) => Math.abs(h - hours) < 1e-9;
+  const win = tl?.window;
+  const windowLabel = win
+    ? `${fmtWindowTs(win.start_ts)} → ${win.live ? "now" : fmtWindowTs(win.end_ts)}`
+    : "";
+  const hasOverrides = Object.keys(state.explorerSegLevel).length > 0;
+  const rangeChips = `<div class="tm-flex-row" style="gap:8px;flex-wrap:wrap;align-items:center;">
+    ${TIMELINE_RANGES.map(([label, h]) => `
+      <button type="button" class="tm-chip-btn ${isPreset(h) ? "active" : ""}" data-action="explorer-range" data-hours="${h}">${esc(label)}</button>
+    `).join("")}
+    ${!TIMELINE_RANGES.some(([, h]) => isPreset(h)) ? `<span class="tm-chip-btn active" style="cursor:default;">${esc(fmtDurationMin(hours * 60))} zoom</span>` : ""}
+    ${hasOverrides ? `<button type="button" class="tm-chip-btn" data-action="explorer-warp-reset" title="Undo per-part expand/compress">↺ Reset zoomed parts</button>` : ""}
+    <span style="flex:1;"></span>
+    <button type="button" class="tm-chip-btn" data-action="explorer-pan" data-dir="-1" title="Pan one window back">←</button>
+    <span class="tm-mono" style="font-size:12px;color:var(--sub);white-space:nowrap;">${esc(windowLabel)}</span>
+    <button type="button" class="tm-chip-btn" data-action="explorer-pan" data-dir="1" title="Pan one window forward" ${!end ? "disabled style='opacity:0.4;'" : ""}>→</button>
+    ${end ? `<button type="button" class="tm-chip-btn" data-action="explorer-live" title="Back to now">⦿ Live</button>` : ""}
+  </div>`;
+  const fieldChips = `<div class="tm-flex-row" style="gap:8px;flex-wrap:wrap;margin-top:10px;">
+    ${EXPLORER_FIELDS.map(([f, label, , color]) => `
+      <button type="button" class="tm-chip-btn ${fields.includes(f) ? "active" : ""}" data-action="explorer-field" data-field="${f}" title="Toggle ${esc(label)}">
+        <span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:${color};margin-right:6px;vertical-align:baseline;"></span>${esc(label)}
+      </button>
+    `).join("")}
+  </div>`;
+  const markerKindChips = `<div class="tm-flex-row" style="gap:8px;flex-wrap:wrap;margin-top:8px;">
+    ${Object.entries(MARKER_META).map(([k, [label, color]]) => `
+      <button type="button" class="tm-chip-btn ${state.explorerMarkerKinds.includes(k) ? "active" : ""}" data-action="explorer-marker-kind" data-kind="${k}" title="Toggle ${esc(label)} markers">
+        <span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:${color};margin-right:6px;vertical-align:baseline;"></span>${esc(label)}
+      </button>
+    `).join("")}
+  </div>`;
+
+  if (!tl || !Object.values(tl.series || {}).some((pts) => pts.length > 1)) {
+    return setContent(`${fieldChips}${markerKindChips}${rangeChips}${emptyHtml("No samples in this window", "Pick a wider range, or different signals — data collects as the car drives, charges and streams.")}`);
+  }
+
+  const seriesDefs = EXPLORER_FIELDS
+    .filter(([f]) => fields.includes(f) && tl.series[f]?.length > 1)
+    .map(([f, label, unit, color, dashed]) => ({ key: f, name: label, unit, color, dashed: !!dashed, points: tl.series[f] }));
+  const markerColor = Object.fromEntries(Object.entries(MARKER_META).map(([k, [, c]]) => [k, c]));
+  const shownMarkers = (tl.markers || []).filter((m) => state.explorerMarkerKinds.includes(m.kind));
+  const overflowNote = Object.entries(tl.marker_overflow || {}).map(([k, n]) => `${n} ${MARKER_META[k]?.[0] || k} markers beyond the cap not shown`).join(" · ");
+
+  setContent(`
+    ${fieldChips}
+    ${markerKindChips}
+    <div class="tm-card tm-card-pad" style="margin-top:14px;">
+      <div class="tm-card-head">
+        <div class="tm-card-head-title">Signals over time</div>
+        <div class="tm-card-head-sub">${esc(windowLabel)} · smart axis: drives stretched, charging/sleep compressed — on a driving part, click to zoom in and right-click to zoom out; on everything else, click to cycle through 5 detail levels · drag to zoom the whole window · hover the strip for details</div>
+      </div>
+      <div id="tm-explorer-chart" style="position:relative;">
+        ${svgTimelineExplorer({
+          series: seriesDefs,
+          segments: tl.segments || [],
+          markers: shownMarkers,
+          stageColor: STAGE_COLOR, stageLabel: STAGE_LABEL, markerColor,
+          warp: { levels: state.explorerSegLevel },
+        })}
+        <div id="tm-explorer-sel" style="position:absolute;top:0;bottom:0;display:none;background:color-mix(in oklab, var(--accent) 14%, transparent);border-left:1px solid var(--accent);border-right:1px solid var(--accent);pointer-events:none;"></div>
+      </div>
+      <div style="margin-top:12px;padding-top:12px;border-top:1px solid var(--line2);">
+        ${rangeChips}
+      </div>
+      ${batteryStageLegendHtml(tl.stage_hours)}
+      <div class="tm-foot-note">Resolution adapts to what the car was doing: driving keeps up to ~4× more points than idle/charging (this window: ${fmt0(tl.resolution?.kept ?? 0)} of ${fmt0(tl.resolution?.rows ?? 0)} samples kept${tl.resolution?.stride_driving > 1 ? `, driving thinned ×${tl.resolution.stride_driving}` : ", driving at full resolution"}).${overflowNote ? " " + esc(overflowNote) + "." : ""}</div>
+    </div>
+  `);
+
+  bindExplorerZoom();
+  // The cursor doesn't move on a click-driven re-render (e.g. cycling a strip
+  // segment's zoom level), so re-evaluate the tooltip against the new DOM at
+  // its last known position instead of leaving stale pre-click content on screen.
+  refreshChartTooltip();
+}
+
+/**
+ * Stock-chart drag-to-zoom: drag a region on the explorer chart to make it the
+ * new window. Pixel→timestamp mapping comes from the data-x0/x1/left/right/w
+ * attributes svgTimelineExplorer stamps on its SVG.
+ */
+function bindExplorerZoom() {
+  const wrap = document.getElementById("tm-explorer-chart");
+  const svg = wrap?.querySelector("svg[data-tmchart]");
+  const sel = document.getElementById("tm-explorer-sel");
+  if (!wrap || !svg || !sel) return;
+  // Pixel → timestamp through the smart axis' piecewise mapping (falls back
+  // to linear when the chart was drawn without a warp).
+  let warpPieces = null;
+  try { warpPieces = JSON.parse(svg.dataset.warp || "null"); } catch { /* linear fallback */ }
+  const toTs = (clientX) => {
+    const rect = svg.getBoundingClientRect();
+    const svgX = ((clientX - rect.left) / rect.width) * Number(svg.dataset.w);
+    if (warpPieces?.length) {
+      const px = Math.max(Number(svg.dataset.left), Math.min(Number(svg.dataset.right), svgX));
+      const pc = warpPieces.find((p) => px >= p.x0 && px <= p.x1) || warpPieces[warpPieces.length - 1];
+      return pc.t0 + ((px - pc.x0) / ((pc.x1 - pc.x0) || 1)) * (pc.t1 - pc.t0);
+    }
+    const frac = Math.max(0, Math.min(1, (svgX - Number(svg.dataset.left)) / (Number(svg.dataset.right) - Number(svg.dataset.left))));
+    return Number(svg.dataset.x0) + frac * (Number(svg.dataset.x1) - Number(svg.dataset.x0));
+  };
+  let dragStartX = null;
+  let suppressClick = false;
+  wrap.addEventListener("mousedown", (e) => {
+    if (e.button !== 0) return;
+    dragStartX = e.clientX;
+    suppressClick = false; // a stale flag (drag ended on mouseleave) must not eat this press's click
+    e.preventDefault(); // no text selection while dragging
+  });
+  wrap.addEventListener("mousemove", (e) => {
+    if (dragStartX == null) return;
+    const rect = wrap.getBoundingClientRect();
+    const a = Math.min(dragStartX, e.clientX) - rect.left;
+    const b = Math.max(dragStartX, e.clientX) - rect.left;
+    sel.style.display = "block";
+    sel.style.left = `${a}px`;
+    sel.style.width = `${b - a}px`;
+  });
+  const finish = (e) => {
+    if (dragStartX == null) return;
+    const startX = dragStartX;
+    dragStartX = null;
+    sel.style.display = "none";
+    if (Math.abs(e.clientX - startX) < 12) return; // a click, not a drag
+    // The browser still fires a click after this mouseup; without this it
+    // would bubble to onRootClick's explorer-seg branch and ALSO cycle the
+    // zoom level of whatever strip segment the drag happened to start on.
+    suppressClick = true;
+    const t0 = toTs(Math.min(startX, e.clientX));
+    const t1 = toTs(Math.max(startX, e.clientX));
+    if (!(t1 > t0)) return;
+    state.explorerHours = Math.max(120, t1 - t0) / 3600; // never below a 2-min window
+    state.explorerEnd = Math.round(t1);
+    renderExplorer();
+  };
+  wrap.addEventListener("mouseup", finish);
+  wrap.addEventListener("mouseleave", (e) => { if (dragStartX != null) finish(e); });
+  // Capture phase so this runs before the delegated bubble handler on root.
+  wrap.addEventListener("click", (e) => {
+    if (!suppressClick) return;
+    suppressClick = false;
+    e.stopPropagation();
+    e.preventDefault();
+  }, true);
+  // Double-click: jump back to the live default without touching the duration.
+  // NOT when it lands on a strip segment — the UI invites rapid clicks there
+  // to cycle detail levels, and yanking the view back to "now" mid-cycle
+  // silently discards a panned-back window position.
+  wrap.addEventListener("dblclick", (e) => {
+    if (e.target?.closest?.('[data-action="explorer-seg"]')) return;
+    state.explorerEnd = null;
+    renderExplorer();
+  });
 }
 
 // ---------------------------------------------------------------------------

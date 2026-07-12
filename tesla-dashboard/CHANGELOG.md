@@ -9,6 +9,362 @@ feature or screen, the **patch** version for fixes/tweaks/copy changes, and the
 configured. See `CLAUDE.md` at the repo root for the policy on keeping this file
 and `APP_VERSION` (in `app.js`) in sync.
 
+## 1.22.1 — 2026-07-12
+
+Three Chart explorer fixes from a pre-release multi-agent audit of the
+whole branch, before any of it reached production.
+
+- **30-day view no longer breaks the smart axis.** The 16px minimum
+  tile width had no cap: a 30-day window holds hundreds of stage
+  segments, so the floors alone (~180 × 16px) overflowed the 760px-wide
+  chart — everything past roughly day 3 was silently clipped off the
+  right edge, unreachable by hover, click, or drag — and in mixed cases
+  the "take the excess from bigger tiles" step drove donor tiles to
+  *negative* widths, folding series lines back over themselves. The
+  floor now shrinks when there are more tiles than 16px-each can fit,
+  donors are never drawn below the floor, and the total is rescaled to
+  exactly fill the chart.
+- **Drag-to-zoom no longer also cycles a segment's detail level.** The
+  browser fires a click after every completed drag; it bubbled into the
+  strip-segment click handler, so zooming into a region that started on
+  a driving segment also bumped that segment's zoom level (and showed a
+  phantom "↺ Reset zoomed parts" chip) on top of the window change.
+- **Double-clicking a strip segment no longer yanks the view back to
+  live.** The chart-level double-click shortcut (back to now) now
+  ignores double-clicks on strip segments — the UI explicitly invites
+  rapid clicking there to cycle detail levels, and it was silently
+  discarding the panned-back window position mid-cycle.
+- Also in this release (worker-side, same deploy): false "Software
+  update" Timeline entries fixed — a single stale
+  install-percent sample no longer reads as "still updating"
+  indefinitely (treated stale after 90 min); and real drives are no
+  longer misclassified as idle/resting when the gear field streams
+  stale — speed alone now classifies driving (previously a stuck
+  pre-drive "P" suppressed it for the entire trip, verified live
+  against a 4-minute 60-90 km/h drive tagged "resting").
+
+## 1.22.0 — 2026-07-12
+
+Chart explorer: dual tooltip, deeper driving zoom, 5-level cycle back
+for everything else — "The tooltip is a mess. For driving I want
+deeper zoom in - to the minute or even sub minute level. Everything
+else now has only 2 levels? I want 5."
+
+- **Fixed the "messy" tooltip**: the strip segments and event markers
+  still carried native SVG `<title>` elements from before the custom
+  floating tooltip existed, so hovering showed BOTH the styled custom
+  tooltip AND the browser's own plain title tooltip stacked on top of
+  each other. Removed the native titles — the custom tooltip already
+  covers everything they said.
+- **Driving zoom goes much deeper**: the ladder's top end steepened —
+  level 4's weight went 128 → 256 and level 5's 1024 → 65536 (full
+  ladder now [0.25, 2, 16, 256, 65536]), so a maxed driving segment
+  claims virtually all
+  available chart width. A short/medium drive reaches sub-minute ticks
+  easily (verified: a 2-minute drive shows ~15 sec intervals even at
+  its *default*, unzoomed level). A very long drive (tens of minutes)
+  has a hard geometric floor around ~5 min — fitting that many
+  non-overlapping time labels into a ~700px-wide chart isn't possible
+  regardless of zoom weight — but it's now reliably at that floor
+  instead of falling short of it. Drag-to-zoom on the whole window is
+  the tool for inspecting a narrow slice of a long drive at true
+  fine-grained resolution.
+- **Reverted charging/connected/resting/gaps from the 2-state toggle
+  back to the full 5-level cycle** (1→2→3→4→5→1 on repeated clicks,
+  wrapping around) — "as before" meant the original cycling behavior,
+  not a binary toggle. Driving keeps its own left-click-in /
+  right-click-out control, unaffected by this.
+
+## 1.21.1 — 2026-07-12
+
+Chart explorer: widened the zoom ladder's dynamic range — "I want to
+zoom in to a sub minute (30 sec?) while driving option. Also zoom out
+should be longer for everything on left click."
+
+- Ladder changed from `[1, 4, 16, 64, 256]` to `[0.25, 2, 16, 128,
+  1024]` (level 3 stays weight 16, so driving's default look is
+  unchanged) — a 16x wider top-to-bottom range.
+- Verified live: a 1-minute driving segment now reaches **~15 sec**
+  intervals at max zoom (finer than the ~30 sec asked for); a 61-minute
+  drive improves from ~10 min to ~5 min at max (a longer drive can't
+  physically reach sub-minute ticks in a fixed-width chart — that would
+  need ~6800px of width for one segment — but it's noticeably sharper,
+  and the existing drag-to-zoom can narrow the absolute window for true
+  fine-grained inspection of a slice of a long drive).
+- A charging/connected/resting segment's default (zoomed-out) state now
+  shows ~1 day intervals instead of ~2 h — meaningfully coarser, as asked.
+
+## 1.21.0 — 2026-07-12
+
+Chart explorer: driving gets true bidirectional zoom, everything else
+gets a simple toggle — "Level 5 is not max detail. I want zoom in and
+out for the driving part. The rest can have the press to zoom and to
+start upon another press as before."
+
+- **One shared 5-level ladder for every stage** (weights 1/4/16/64/256)
+  instead of a driving-only ladder capped at 16 — level 5 is now the
+  same true maximum for every stage, not an artificially low ceiling
+  for driving.
+- **Driving: left-click zooms in, right-click (long-press on touch)
+  zooms out** — both clamp at the ladder's ends instead of wrapping.
+  Driving defaults mid-ladder (level 3) so there's real room to go
+  either direction. The hover hint now shows both actions and their
+  effect, e.g. "Click: zoom in ~15 min → ~10 min (level 3/5 → 4/5) ·
+  Right-click: zoom out ~15 min → ~1 h (level 3/5 → 2/5)".
+- **Every other stage (charging, connected, resting, data gaps) is a
+  two-state toggle**: click jumps straight to max detail, click again
+  returns to the default — no intermediate steps, no right-click
+  needed. "↺ Reset zoomed parts" still clears every override at once.
+- Verified live: a driving segment zoomed 3→4→5 on left-clicks, then
+  5→4→3→2→1 on right-clicks (clamping at both ends); a connected
+  segment alternated cleanly 1→5→1→5 on repeated clicks. Right-click
+  on a non-driving segment correctly does nothing (no bidirectional
+  control there) and doesn't interfere with the browser's normal
+  context menu elsewhere on the page.
+
+## 1.20.0 — 2026-07-12
+
+Chart explorer: replaced the 5-level click-to-cycle zoom with explicit
+zoom-in/reset, and made each car-state's zoom steps its own size —
+"maybe drop the preset altogether and have a zoom in, zoom out and
+reset to default" + "the intervals should be different for each state."
+
+- **Click now zooms in one step only, clamped at max — no more 5→1
+  wraparound.** The only way back out is the existing "↺ Reset zoomed
+  parts" chip (already the natural "I overdid it, start over" action).
+  A maxed-out segment's hover hint now reads "Already at max detail
+  (level 5/5) — use ↺ Reset to zoom back out" instead of promising a
+  click that would jump backwards.
+- **Per-stage zoom ladders instead of one universal doubling scale.**
+  Driving already carries plenty of native detail by default, so its
+  ladder climbs gently (weights 6→8→10→13→16, default at 8 — unchanged
+  from before). Every other stage (charging, connected, resting, data
+  gaps) typically spans hours with little worth seeing, so its ladder
+  jumps hard (weights 1→4→16→64→256) — one or two clicks turns a flat
+  multi-hour smear into something readable, instead of the same gentle
+  doubling driving gets.
+- Verified live: a driving segment now needs exactly 3 clicks to hit
+  max (2→3→4→5) and a charging segment 4 clicks (1→2→3→4→5); both
+  clamp on further clicks instead of wrapping, and Reset correctly
+  restores each to its (new) stage default.
+
+## 1.19.1 — 2026-07-12
+
+Chart explorer: removed the duplicate legend under the chart — "Why do we
+need those twice? have it in one place and de-clutter the chart." The
+signal and marker toggle chips above the chart already carry a colored
+dot + label each, so they already work as the legend; the second static
+legend row (repeating the same names/colors under the chart) was pure
+duplication and is gone.
+
+## 1.19.0 — 2026-07-12
+
+Chart explorer: fixed a stale hover tooltip after clicking a strip segment,
+moved the zoom-level indicator, and added marker on/off toggles — from
+follow-up feedback on 1.18.0: "The next interval upon click does not
+update after the click... The level indicator needs to be on the click
+line, not the data... I want to be able to turn on and off the markers
+(brake, acceleration, etc)."
+
+- **Fixed: the strip-hover tooltip no longer goes stale after a click.**
+  Clicking a segment re-renders the chart, but the cursor doesn't move —
+  so the browser never fires a fresh `mousemove` to refresh the tooltip,
+  and it kept showing the pre-click phase/level/hint text. The shared
+  tooltip now replays the last known cursor position against the new
+  chart right after every click-driven re-render, so the level and
+  "Click: ..." hint are correct immediately, with no mouse jiggle needed.
+- **Moved the zoom-level tag from the phase line onto the "Click: ..."
+  hint line** (e.g. "Click: ~30 min → ~15 min intervals (level 4/5 →
+  5/5)"), so it no longer also leaks into the main tooltip's car-state
+  row when hovering the data/plot area, where it read as out of place.
+- **Re-verified the state-strip-vs-hover mismatch** reported alongside
+  the above: confirmed (via direct DOM-level testing, isolating a single
+  click with no other pending state changes) that hovering the plot area
+  and hovering the strip at the same x always agree on the same segment —
+  no separate bug found beyond the stale-tooltip issue above.
+- **Marker kind toggle chips**: hard brake, hard accel, track change and
+  warning markers can now each be switched on/off independently, above
+  the signal chips — "I want to be able to turn on and off the markers."
+
+## 1.18.0 — 2026-07-12
+
+Chart explorer: 5-level per-part zoom + a hover hint that explains what
+the next click actually does — asked as "I see everything has 3 states
+of expansion, I want it 5 and everything but driving set to min, driving
+to 4 out of 5. Hovering the state bar should explain what is going to
+happen next click — expand from 1 min to 30 sec intervals (4->5) for
+example, or from 30 sec to 1 hour (5->1). The resolution is just for
+example, set it up according to the state and its duration."
+
+- **5 discrete detail levels** (was 3: normal/expanded/compressed) per
+  segment, cycling 1→2→3→4→5→1 on click. **Driving defaults to level
+  4/5; every other stage (charging, connected, resting) defaults to
+  level 1/5 (min)** — exactly as specified. "↺ Reset zoomed parts"
+  clears all overrides back to these defaults.
+- **Hovering the strip now explains the next click**: a second line
+  under the phase + duration reads e.g. "Click: ~30 min → ~15 min
+  intervals" — genuinely computed per segment from its own duration and
+  current pixel share (reusing the exact step-selection logic the axis
+  labels themselves use), not a fixed example value. A tiny 1-minute
+  driving burst in a 24h window predicts a totally different transition
+  than a 61-minute one, as it should.
+- Verified live: clicking one driving segment 6 times traced the exact
+  sequence 4→5→1→2→3→4; reset correctly restored every segment to its
+  stage default and hid the reset chip.
+
+## 1.17.4 — 2026-07-12
+
+Four state-strip fixes on the Chart explorer's smart axis, all from one
+report: "the state bar shows resting but there's speed recorded; some of
+the state bar is empty; hovering the state bar directly should show the
+duration of the phase; the change between car states should have the
+time on the axis when it's not too crowded."
+
+- **Fixed a real mismatch**: the tooltip's car-state row was computed by
+  an independent TIME-based segment search, which could disagree with
+  the segment actually drawn under the cursor in a densely-packed
+  region (e.g. showing "Resting" while the plot showed driving speed).
+  It now reads the SAME piece used to draw the strip and invert the
+  cursor position — state row and strip can no longer disagree.
+- **No more blank strip sections**: time ranges with no recorded data
+  (a connectivity gap) now render as a dashed "No data" outline instead
+  of being skipped — the strip is always a continuous width.
+- **Hover the strip directly** for a focused phase + duration readout
+  ("Driving · 61 min") instead of the full signal breakdown — verified
+  live to match exactly what hovering the plot above it reports.
+- **State-change tick labels**: the moment the car's state changes now
+  gets priority for an axis time label (reserved first, before the
+  regular evenly-spaced grid ticks fill remaining gaps) — 7 of 9 labels
+  in a tested 24h window landed exactly on a state change, making the
+  non-linear axis legible at a glance.
+
+## 1.17.3 — 2026-07-12
+
+Fix: the tooltip listed every harsh-brake/accel marker "nearby" in time,
+even ones the cursor wasn't anywhere near on screen — "shouldn't be in
+the tooltip unless directly hovering on them".
+
+- Root cause: marker inclusion was based on time-distance (within 1.5%
+  of the total window), which breaks under the smart (warped) axis — on
+  a stretched driving segment, 1.5% of a 24h window can span hundreds
+  of pixels, so several unrelated events all showed up on every hover.
+- Fix: markers now only appear when the cursor is within ~8px of where
+  the marker dot is actually DRAWN (same piecewise warp mapping the
+  chart itself uses), not a fraction of the time window.
+- Verified live: hovering exactly on a marker cluster shows its
+  events; moving 60px away (a different, correctly-updated data point)
+  now shows zero marker rows, where before it kept repeating the same
+  three regardless of cursor position.
+
+## 1.17.2 — 2026-07-12
+
+Fix (regression from 1.17.1): the tooltip fix caused a full-screen black
+box to open on hover instead of a small tooltip — "a black drawer opens
+from the left and covers the dashboard".
+
+- Root cause: `[data-tm-root]` alone (not just its dark-theme variant)
+  also carries the APP-SHELL layout rule (`display:flex; width:100%;
+  height:100vh; overflow:hidden`) — stamping that attribute onto the
+  tooltip to fix its colors (1.17.1) made it match this rule too,
+  expanding the tooltip to fill the viewport.
+- Fix: also add the `tm-root-plain` class already used by the login
+  gate for this exact situation (get the color variables, opt out of
+  the shell layout) — `[data-tm-root].tm-root-plain` overrides the
+  shell rule at higher specificity.
+- Verified live: tooltip is back to a normal shrink-to-fit box
+  (~201×118px, `overflow: visible`) with the correct opaque background.
+
+## 1.17.1 — 2026-07-12
+
+Fix: chart tooltip had no background — chart lines showed straight
+through the text, unreadable over a busy Chart-explorer overlay.
+
+- Root cause: every theme color (`--card`, `--text`, ...) is scoped to
+  `[data-tm-root]`; the tooltip is a permanent `document.body` child (so
+  it survives screen re-renders) living OUTSIDE that scope, so
+  `background: var(--card)` silently resolved to transparent.
+- Fix: the tooltip now carries `data-tm-root` + the live `data-theme`
+  on itself, re-synced on every hover, so it resolves the same
+  variables without needing to be nested inside the themed root (which
+  would risk it being wiped out by a full app-shell reset).
+- Verified live in both themes: computed background is now `rgb(255,255,255)`
+  (light) / `rgb(22,24,29)` (dark) — exact `--card` matches, was
+  `rgba(0,0,0,0)` before.
+
+## 1.17.0 — 2026-07-12
+
+Chart explorer: the **smart axis** — asked as "this is an example of a not
+'smart' chart… the driving is interesting and I would like to see more
+detail, the overnight charging is less. I want to be able to expand or
+contract any 'part' — not hide it. Have the drive with the most granular
+time breakdown and the charging section by the hour. The timeframe windows
+should be under the chart, like Google sheets stock chart has."
+
+- **Non-linear time axis**: the x-axis is now piecewise — a driving minute
+  gets ~16× the width of a charging/resting minute, so a 40-minute drive
+  is fully readable next to a 17-hour overnight charge that compresses to
+  a sliver (visible, never hidden — every part keeps a minimum width).
+  Dashed guides mark where the axis scale changes.
+- **Expand/contract any part**: click a segment on the state strip to
+  cycle it normal → expanded ×4 → compressed ×¼ → normal (zoomed parts get
+  an outline; a "↺ Reset zoomed parts" chip undoes everything).
+- **Per-part tick density**: each segment labels time at the density its
+  width affords — minute marks inside a stretched drive, hourly (or less)
+  in a compressed charge.
+- **Time controls moved below the chart**, Google-Finance style: duration
+  presets, zoom chip, pan ← →, window label and ⦿ Live all live under the
+  plot now.
+- Hover and drag-to-zoom both invert the warped axis exactly (verified: a
+  drag across a stretched drive lands on the same minutes the axis shows).
+
+## 1.16.1 — 2026-07-12
+
+Chart explorer: a real stock-chart **time window** — asked as "I want to
+be able to select the duration of the chart - like a stock chart there
+is a time window".
+
+- **Drag to zoom**: drag any region of the chart and it becomes the new
+  window (exact, not snapped to presets — a "42 min zoom" chip shows when
+  you're off-preset). Never narrower than 2 minutes.
+- **Pan**: ← → buttons step one window back/forward through history;
+  panning into the future re-anchors to live. Double-click the chart to
+  jump back to now. A `start → end` window label always shows what you're
+  looking at; the duration presets keep the window's right edge when
+  switched (stock-chart behavior).
+- Backend: `/data/timeline-chart` takes an optional `end` anchor (unix
+  seconds; default = now) — every series, stage segment and marker query
+  is bounded to `[end − hours, end]`, and the response reports the
+  resolved `window {start_ts, end_ts, live}`.
+
+## 1.16.0 — 2026-07-12
+
+New **Chart explorer** screen (Data section) — asked as "a timeline chart
+that has many many params overlayed one on top of the other… markers for
+important events like hard brake, music played, any warning… the car state
+as a second layer… smart resolution — when driving as small as possible,
+when charging or sleeping it doesn't matter… hovering shows anything
+displayed like the speed, temp and state of the car".
+
+- **Overlay any signals**: 12 toggleable signals (speed, battery %, inside/
+  outside temp, motor & charger power, est. range, energy left, IMU
+  accel/brake g, brake pedal, accelerator, media volume) drawn together,
+  each normalized to its own band so different units share one canvas.
+- **Event markers** on a band above the chart, with guide lines down the
+  plot: hard brakes / hard accelerations (from the real IMU stream,
+  debounced to one marker per maneuver at its peak, same ~0.3 g thresholds
+  as driver scoring), every track change (with artist), and every worker
+  warning/alert in the window.
+- **Car-state layer**: the driving/charging/connected/resting strip along
+  the bottom, same palette as the Battery timeline, with per-stage hours.
+- **Smart resolution**: the new `/data/timeline-chart` endpoint samples
+  activity-aware — driving windows keep up to ~4× more points (budget
+  2400) than idle/charging/sleeping (600), with segment boundaries always
+  kept, so a drive stays second-sharp while a night of sleeping costs a
+  handful of points. The footer says exactly what was kept.
+- **Hover = everything at that instant**: the tooltip now shows the car's
+  state, every displayed signal's real value with units, and any event
+  marker near the cursor. Time ranges: the shared 10 min → 30 days chips.
+
 ## 1.15.0 — 2026-07-12
 
 Overview's Charge level and Cabin climate cards, brought up to the Battery

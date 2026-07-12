@@ -42,8 +42,24 @@ function tip() {
     tipEl = document.createElement("div");
     tipEl.className = "tm-chart-tip";
     tipEl.style.display = "none";
+    // [data-tm-root] is where every theme color variable (--card, --text, ...)
+    // is scoped; this element lives outside that subtree (a permanent
+    // document.body child so it survives screen re-renders), so it needs the
+    // same attribute on ITSELF to resolve those variables — otherwise
+    // `background: var(--card)` falls back to transparent and chart lines
+    // show straight through the tooltip text.
+    // .tm-root-plain is the SAME escape hatch the login gate uses (styles.css)
+    // to get the color variables WITHOUT the app-shell layout rule
+    // ([data-tm-root] alone also sets display:flex/width:100%/height:100vh/
+    // overflow:hidden) -- without it the tooltip becomes a full-viewport box.
+    tipEl.setAttribute("data-tm-root", "1");
+    tipEl.classList.add("tm-root-plain");
     document.body.appendChild(tipEl);
   }
+  // Keep in sync with the live theme (it can toggle after the tooltip was
+  // first created, and the real root is the source of truth for it).
+  const liveTheme = document.querySelector("[data-tm-root]")?.getAttribute("data-theme");
+  if (liveTheme) tipEl.setAttribute("data-theme", liveTheme);
   return tipEl;
 }
 
@@ -68,37 +84,124 @@ function fmtTipY(y) {
   return typeof y === "number" ? String(Math.round(y * 100) / 100) : String(y);
 }
 
-document.addEventListener("mousemove", (ev) => {
-  const svg = ev.target?.closest?.("svg[data-tmchart]");
+// Click-driven re-renders (e.g. cycling a strip segment's zoom level) replace
+// the chart DOM without the mouse itself moving, so the real `mousemove`
+// event that would normally refresh the tooltip never fires -- it's left
+// showing whatever it had right before the click. `updateTooltip` is the
+// shared body both the live listener AND `refreshChartTooltip` (called after
+// a re-render, replaying the last known cursor position) drive, so the
+// tooltip always reflects what's actually under the cursor right now.
+let lastMouse = null;
+
+function updateTooltip(clientX, clientY) {
+  const el = document.elementFromPoint(clientX, clientY);
+  const svg = el?.closest?.("svg[data-tmchart]");
   const t = tip();
   const meta = svg ? CHART_REGISTRY.get(svg.dataset.tmchart) : null;
   if (!meta) { t.style.display = "none"; return; }
 
-  // Map client-x into viewBox units (the SVG scales uniformly, width-driven).
+  // Map client position into viewBox units (the SVG scales uniformly, width-driven).
   const rect = svg.getBoundingClientRect();
-  const svgX = ((ev.clientX - rect.left) / rect.width) * meta.width;
+  const svgX = ((clientX - rect.left) / rect.width) * meta.width;
   const frac = (svgX - meta.left) / (meta.right - meta.left);
   if (frac < -0.02 || frac > 1.02) { t.style.display = "none"; return; }
-  const dataX = meta.X0 + Math.max(0, Math.min(1, frac)) * (meta.X1 - meta.X0);
+
+  // `pc` (the matched warp piece) is the SAME piece used to draw the state
+  // strip at this x — reused below for the state row and the dedicated
+  // strip-hover tooltip so both always agree with what's visually under the
+  // cursor, instead of an independent time-based segment search that can
+  // disagree in a densely-packed region.
+  let dataX, pc = null;
+  if (meta.warpPieces?.length) {
+    const px = Math.max(meta.left, Math.min(meta.right, svgX));
+    pc = meta.warpPieces.find((p) => px >= p.x0 && px <= p.x1) || meta.warpPieces[meta.warpPieces.length - 1];
+    dataX = pc.t0 + ((px - pc.x0) / ((pc.x1 - pc.x0) || 1)) * (pc.t1 - pc.t0);
+  } else {
+    dataX = meta.X0 + Math.max(0, Math.min(1, frac)) * (meta.X1 - meta.X0);
+  }
+
+  // Hovering the state strip itself (Chart explorer): a focused phase +
+  // duration readout instead of the full signal breakdown -- "so it will be
+  // easy to understand the non-linear axis". Also explains what the NEXT
+  // click will do in concrete resolution terms (derived per-segment from its
+  // own duration/pixel share, not a fixed value) -- "hovering the state bar
+  // should explain what is going to happen next click".
+  if (meta.stripY != null && meta.height) {
+    const svgY = ((clientY - rect.top) / rect.height) * meta.height;
+    if (svgY >= meta.stripY - 2 && svgY <= meta.stripY + meta.stripH + 2 && pc) {
+      t.innerHTML = `<div class="tm-chart-tip-x">${esc(fmtTipX(dataX))}</div>`
+        + `<div class="tm-chart-tip-row"><span class="tm-chart-tip-dot" style="background:${meta.stageColor?.[pc.stage] || "var(--faint)"};"></span><strong>${esc(pc.label || pc.stage || "No data")}</strong></div>`
+        + (pc.nextHint ? `<div class="tm-chart-tip-row" style="color:var(--sub);font-size:10.5px;">${esc(pc.nextHint)}</div>` : "");
+      t.style.display = "block";
+      const tw = t.offsetWidth || 120;
+      const x = clientX + 14 + tw > window.innerWidth ? clientX - tw - 12 : clientX + 14;
+      t.style.left = `${x}px`;
+      t.style.top = `${Math.max(4, clientY - t.offsetHeight - 10)}px`;
+      return;
+    }
+  }
 
   const lines = meta.series
     .filter((sr) => sr.points.length)
     .map((sr) => {
       const p = sr.points[nearestIdx(sr.points, dataX)];
-      return { name: sr.name, color: sr.color || "var(--accent)", x: p[0], y: p[1] };
+      return { name: sr.name, unit: sr.unit, color: sr.color || "var(--accent)", x: p[0], y: p[1] };
     });
   if (!lines.length) { t.style.display = "none"; return; }
 
-  t.innerHTML = `<div class="tm-chart-tip-x">${esc(fmtTipX(lines[0].x))}</div>` + lines
-    .map((l) => `<div class="tm-chart-tip-row"><span class="tm-chart-tip-dot" style="background:${l.color};"></span>${l.name ? esc(l.name) + ": " : ""}<strong>${esc(fmtTipY(l.y))}</strong></div>`)
-    .join("");
+  // Car-state row (Chart explorer): the SAME piece (`pc`) drives this, so it
+  // can never disagree with the strip segment actually under the cursor.
+  let stateRow = "";
+  if (meta.segments?.length && pc) {
+    stateRow = `<div class="tm-chart-tip-row"><span class="tm-chart-tip-dot" style="background:${meta.stageColor?.[pc.stage] || "var(--faint)"};"></span><strong>${esc(pc.label || pc.stage || "No data")}</strong></div>`;
+  }
+
+  // Event markers directly under the cursor — PIXEL proximity to where each
+  // marker dot is actually drawn, not time proximity. Time-based "nearby"
+  // breaks under the smart (warped) axis: 1.5% of a 24h window is ~20
+  // minutes, which on a stretched driving segment can span hundreds of
+  // pixels — several unrelated events would all show up on every hover.
+  let markerRows = "";
+  if (meta.markers?.length) {
+    const markerPx = (ts) => {
+      if (!meta.warpPieces?.length) return meta.left + ((ts - meta.X0) / ((meta.X1 - meta.X0) || 1)) * (meta.right - meta.left);
+      const p = meta.warpPieces.find((mp) => ts >= mp.t0 && ts <= mp.t1) || meta.warpPieces[meta.warpPieces.length - 1];
+      return p.x0 + ((ts - p.t0) / ((p.t1 - p.t0) || 1)) * (p.x1 - p.x0);
+    };
+    const NEAR_PX = 8; // ~the drawn marker circle's radius + a little hover slop
+    markerRows = meta.markers
+      .filter((m) => Math.abs(markerPx(m.ts) - svgX) <= NEAR_PX)
+      .slice(0, 3)
+      .map((m) => `<div class="tm-chart-tip-row"><span class="tm-chart-tip-dot" style="background:${meta.markerColor?.[m.kind] || "var(--warn)"};"></span>${esc(m.label)}</div>`)
+      .join("");
+  }
+
+  t.innerHTML = `<div class="tm-chart-tip-x">${esc(fmtTipX(lines[0].x))}</div>` + stateRow + lines
+    .map((l) => `<div class="tm-chart-tip-row"><span class="tm-chart-tip-dot" style="background:${l.color};"></span>${l.name ? esc(l.name) + ": " : ""}<strong>${esc(fmtTipY(l.y))}${l.unit ? " " + esc(l.unit) : ""}</strong></div>`)
+    .join("") + markerRows;
   t.style.display = "block";
   // Keep the tooltip inside the viewport: flip to the left of the cursor near the right edge.
   const tw = t.offsetWidth || 120;
-  const x = ev.clientX + 14 + tw > window.innerWidth ? ev.clientX - tw - 12 : ev.clientX + 14;
+  const x = clientX + 14 + tw > window.innerWidth ? clientX - tw - 12 : clientX + 14;
   t.style.left = `${x}px`;
-  t.style.top = `${Math.max(4, ev.clientY - t.offsetHeight - 10)}px`;
+  t.style.top = `${Math.max(4, clientY - t.offsetHeight - 10)}px`;
+}
+
+document.addEventListener("mousemove", (ev) => {
+  lastMouse = { x: ev.clientX, y: ev.clientY };
+  updateTooltip(ev.clientX, ev.clientY);
 });
+
+/**
+ * Re-evaluates the tooltip at the last known cursor position. Needed after
+ * any click that re-renders the chart DOM in place (e.g. cycling a strip
+ * segment's zoom level) -- the cursor hasn't moved, so no new `mousemove`
+ * fires on its own, and without this the tooltip is left showing whatever
+ * it had right before the click.
+ */
+export function refreshChartTooltip() {
+  if (lastMouse) updateTooltip(lastMouse.x, lastMouse.y);
+}
 
 /**
  * Multi-series line/area chart. `series`: [{points:[[x,y],...], color, dashed, area}]
@@ -151,6 +254,292 @@ export function svgLineChart({ width = 760, height = 210, series, yTicks = [], x
     series: series.map((s) => ({ name: s.name, color: s.color, points: s.points })),
   });
   return `<svg viewBox="0 0 ${width} ${height}" class="tm-svg-block" data-tmchart="${chartId}">${grid}${xLabels}${seriesMarkup}</svg>`;
+}
+
+/**
+ * Chart-explorer overlay: N signals with WILDLY different scales (km/h, %, °C,
+ * kW…) drawn together by normalizing each to its own min-max band — the
+ * tooltip carries the real values + units, so the chart shows shape and the
+ * hover shows numbers. Adds an event-marker band on top (harsh brake/accel,
+ * track changes, warnings) and a car-state strip along the bottom
+ * (driving/charging/connected/resting), both of which also feed the tooltip.
+ *
+ * `series`: [{key, name, unit, color, dashed, points:[[ts,v],...]}]
+ * `segments`/`markers`: as returned by /data/timeline-chart.
+ * `stageColor`/`stageLabel`/`markerColor`: display maps owned by the caller.
+ */
+export function svgTimelineExplorer({
+  width = 760, height = 320,
+  series = [], segments = [], markers = [],
+  stageColor = {}, stageLabel = {}, markerColor = {},
+  xDomain,
+  // Smart (non-linear) axis: per-stage horizontal weight factors + per-segment
+  // user overrides ({[start_ts]: multiplier}). A driving minute gets ~16x the
+  // width of a charging/resting minute by default, so drives are readable and
+  // an overnight charge compresses to a sliver — visible, never hidden.
+  warp = null,
+}) {
+  const drawable = series.filter((s) => s.points.length > 1);
+  if (!drawable.length && !segments.length) return "";
+
+  const l = 14, r = 14;
+  const markerBandY = 14;      // marker dots
+  const t = 30;                // plot top (below the marker band)
+  const stripH = 12;           // state strip height
+  const xLabelH = 18;
+  const bottom = height - xLabelH - stripH - 6; // plot bottom
+  const stripY = bottom + 4;
+  const plotL = l, plotR = width - r, plotW = plotR - plotL;
+
+  // Shared x domain across everything visible.
+  const allX = [
+    ...drawable.flatMap((s) => [s.points[0][0], s.points[s.points.length - 1][0]]),
+    ...segments.flatMap((s) => [s.start_ts, s.end_ts]),
+    ...markers.map((m) => m.ts),
+  ];
+  const X0 = xDomain?.[0] ?? Math.min(...allX);
+  const X1 = xDomain?.[1] ?? Math.max(...allX);
+
+  // ---- Piecewise time->px mapping ("smart axis") --------------------------
+  // Tile [X0,X1] with the stage segments (gaps between/around them become
+  // weight-1 tiles), weight each tile by a 5-level zoom ladder SHARED by
+  // every stage (so "level 5" always means the same true maximum, not a
+  // stage-specific ceiling), hand each tile a proportional pixel share (with
+  // a floor so nothing vanishes), then map time linearly WITHIN each tile.
+  //
+  // Driving gets full bidirectional control, since it's the part worth
+  // fine-tuning: left-click zooms IN one step, right-click zooms OUT one
+  // step, both clamped at the ladder's ends. It defaults mid-ladder (level
+  // 3, weight unchanged from earlier versions) since it already carries
+  // plenty of native detail, leaving room to go either way -- level 5's
+  // weight is deliberately huge so a maxed driving segment claims virtually
+  // all available width, getting it as close as geometry allows to the
+  // finest tick spacing the chart's pixel width can label (a segment many
+  // minutes long still can't show sub-minute AXIS LABELS -- that's a hard
+  // "how many non-overlapping labels fit in ~700px" ceiling, not a zoom
+  // limit -- but a short driving segment reaches sub-minute easily, and
+  // drag-to-zoom on the whole window narrows to any slice for finer ticks).
+  // Every other stage (charging, connected, resting, data gaps) cycles
+  // through all 5 levels on click, wrapping 5 back to 1, same as before.
+  // "Reset zoomed parts" still clears every override at once regardless of
+  // stage.
+  const LEVEL_WEIGHTS = [0.25, 2, 16, 256, 65536];
+  const defaultLevel = (stage) => (stage === "driving" ? 3 : 1);
+  // Tick step sizes shared with the axis-label generator below AND with the
+  // "what will a click do" resolution hint -- one source of truth so the
+  // hint can never claim a granularity the axis wouldn't actually show.
+  const STEPS = [15, 30, 60, 120, 300, 600, 900, 1800, 3600, 7200, 10800, 21600, 43200, 86400];
+  const stepFor = (dur, pxW) => STEPS.find((s) => (dur / s) * 56 <= pxW) ?? STEPS[STEPS.length - 1];
+  const fmtStepSize = (s) => {
+    if (s < 60) return `${s} sec`;
+    if (s < 3600) return `${Math.round(s / 60)} min`;
+    if (s < 86400) return `${s % 3600 === 0 ? (s / 3600).toFixed(0) : (s / 3600).toFixed(1)} h`;
+    return `${Math.round(s / 86400)} d`;
+  };
+
+  const tiles = [];
+  let cursor = X0;
+  for (const seg of segments) {
+    const s0 = Math.max(X0, seg.start_ts), s1 = Math.min(X1, Math.max(seg.end_ts, seg.start_ts));
+    if (s1 <= cursor) continue;
+    if (s0 > cursor) tiles.push({ t0: cursor, t1: s0, stage: null, segStart: null });
+    tiles.push({ t0: Math.max(cursor, s0), t1: s1, stage: seg.stage, segStart: seg.start_ts });
+    cursor = s1;
+  }
+  if (cursor < X1) tiles.push({ t0: cursor, t1: X1, stage: null, segStart: null });
+  if (!tiles.length) tiles.push({ t0: X0, t1: X1, stage: null, segStart: null });
+
+  const levelOverrides = warp?.levels || {};
+  for (const tile of tiles) {
+    const dur = Math.max(1, tile.t1 - tile.t0);
+    const level = tile.stage == null ? 1
+      : (tile.segStart != null && levelOverrides[tile.segStart]) || defaultLevel(tile.stage);
+    tile.level = level;
+    tile.weight = dur * (warp ? LEVEL_WEIGHTS[level - 1] : 1);
+    tile.zoomed = tile.stage != null && level !== defaultLevel(tile.stage);
+  }
+  const totalW = tiles.reduce((s, x) => s + x.weight, 0) || 1;
+  for (const tile of tiles) tile.px = (tile.weight / totalW) * plotW;
+  // Predicted resolution for the strip-hover hint ("Click: zoom in ~1 min ->
+  // ~30 sec intervals") -- computed from each real segment's OWN duration
+  // and its (approximate, floor-less) pixel share at its current vs. target
+  // level, holding every other tile's weight constant. Approximate because
+  // the floor-redistribution below can shift shares slightly; close enough
+  // to describe what an action will roughly do.
+  const otherWeight = (tile) => totalW - tile.weight;
+  const pxAtLevel = (tile, dur, lvl) => {
+    const w = dur * LEVEL_WEIGHTS[lvl - 1];
+    return Math.max(1, (w / (otherWeight(tile) + w)) * plotW);
+  };
+  for (const tile of tiles) {
+    if (tile.stage == null) { tile.nextHint = null; continue; }
+    const dur = Math.max(1, tile.t1 - tile.t0);
+    const curLevel = tile.level;
+    const curStep = stepFor(dur, pxAtLevel(tile, dur, curLevel));
+
+    if (tile.stage === "driving") {
+      const canIn = curLevel < LEVEL_WEIGHTS.length;
+      const canOut = curLevel > 1;
+      const inHint = canIn
+        ? `Click: zoom in ~${fmtStepSize(curStep)} → ~${fmtStepSize(stepFor(dur, pxAtLevel(tile, dur, curLevel + 1)))} (level ${curLevel}/5 → ${curLevel + 1}/5)`
+        : `Click: already at max detail (level ${curLevel}/5)`;
+      const outHint = canOut
+        ? `Right-click: zoom out ~${fmtStepSize(curStep)} → ~${fmtStepSize(stepFor(dur, pxAtLevel(tile, dur, curLevel - 1)))} (level ${curLevel}/5 → ${curLevel - 1}/5)`
+        : `Right-click: already at min detail (level ${curLevel}/5)`;
+      tile.nextHint = `${inHint} · ${outHint}`;
+    } else {
+      const nextLevel = curLevel >= LEVEL_WEIGHTS.length ? 1 : curLevel + 1;
+      const nextStep = stepFor(dur, pxAtLevel(tile, dur, nextLevel));
+      tile.nextHint = `Click: ~${fmtStepSize(curStep)} → ~${fmtStepSize(nextStep)} intervals (level ${curLevel}/5 → ${nextLevel}/5)`;
+    }
+  }
+  // Floor: any tile longer than a minute stays at least MINPX wide (clickable,
+  // visible). Two hard invariants keep this from breaking on many-segment
+  // windows (a 30-day view holds hundreds of stage changes): the floor itself
+  // shrinks once tiles.length * MINPX wouldn't fit in the plot (otherwise the
+  // strip would overflow the viewBox and everything past the right edge would
+  // be clipped and un-hoverable), and donors are only ever drawn down TO the
+  // floor, never below it (the old proportional take could push a donor's
+  // width negative, making the piecewise X() non-monotonic — series lines
+  // folding back over themselves).
+  const MINPX = 16;
+  const floorPx = Math.min(MINPX, plotW / (tiles.length || 1));
+  const need = tiles.filter((x) => x.t1 - x.t0 > 60 && x.px < floorPx);
+  const deficit = need.reduce((s, x) => s + (floorPx - x.px), 0);
+  if (deficit > 0) {
+    const donors = tiles.filter((x) => !need.includes(x) && x.px > floorPx);
+    const avail = donors.reduce((s, x) => s + (x.px - floorPx), 0);
+    const frac = avail > 0 ? Math.min(1, deficit / avail) : 0;
+    for (const x of need) x.px = floorPx;
+    for (const x of donors) x.px -= (x.px - floorPx) * frac;
+    // When donors couldn't cover the whole deficit the total now sums under
+    // plotW; scale everything back up to fill the width (scaling up can never
+    // violate a floor).
+    const sum = tiles.reduce((s, x) => s + x.px, 0);
+    if (sum > 0 && sum < plotW - 0.5) for (const x of tiles) x.px *= plotW / sum;
+  }
+  let acc = plotL;
+  const pieces = tiles.map((x) => {
+    const p = { t0: x.t0, t1: x.t1, x0: acc, x1: acc + x.px, stage: x.stage, segStart: x.segStart, zoomed: x.zoomed, level: x.level, nextHint: x.nextHint };
+    acc = p.x1;
+    return p;
+  });
+  const X = (v) => {
+    if (v <= X0) return plotL;
+    if (v >= X1) return plotR;
+    const p = pieces.find((pc) => v >= pc.t0 && v <= pc.t1) || pieces[pieces.length - 1];
+    return +(p.x0 + ((v - p.t0) / ((p.t1 - p.t0) || 1)) * (p.x1 - p.x0)).toFixed(1);
+  };
+
+  // ---- Grid + per-piece time ticks ----------------------------------------
+  let grid = "";
+  for (const f of [0.25, 0.5, 0.75]) {
+    const y = +(t + f * (bottom - t)).toFixed(1);
+    grid += `<line x1="${plotL}" x2="${plotR}" y1="${y}" y2="${y}" style="stroke:var(--line2);stroke-width:1;opacity:0.6;"></line>`;
+  }
+  // Boundary guides where the axis scale changes (skip hairline tiles).
+  let boundaries = "";
+  for (const p of pieces.slice(1)) {
+    if (p.x1 - p.x0 < 8) continue;
+    boundaries += `<line x1="${p.x0.toFixed(1)}" x2="${p.x0.toFixed(1)}" y1="${t}" y2="${bottom}" style="stroke:var(--line2);stroke-width:1;stroke-dasharray:2 4;opacity:0.7;pointer-events:none;"></line>`;
+  }
+  // Ticks: each piece labels itself at the density its own width affords —
+  // a stretched drive gets minute marks, a squeezed overnight charge maybe one.
+  // (STEPS/stepFor are shared with the level-weight section above, so the
+  // axis and the "what will the next click do" hint can never disagree.)
+  const fmtTick = (ts) => new Date(ts * 1000).toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit", hour12: false });
+  const regularTicks = [];
+  for (const p of pieces) {
+    const pxW = p.x1 - p.x0;
+    if (pxW < 34) continue;
+    const dur = p.t1 - p.t0;
+    const step = stepFor(dur, pxW);
+    for (let ts = Math.ceil(p.t0 / step) * step; ts <= p.t1; ts += step) regularTicks.push({ ts, x: X(ts) });
+  }
+  // Boundary ticks: exactly where the car's state changes -- teaches the
+  // viewer how the smart axis compresses/stretches time at a glance. These
+  // get PRIORITY placement over the regular grid ticks (reserved first),
+  // and only appear where there's room (same 46px min-gap rule).
+  const boundaryTicks = pieces.slice(1).map((p) => ({ ts: p.t0, x: p.x0 }));
+  const MIN_TICK_GAP = 46;
+  const placedTicks = [];
+  const tryPlaceTick = (tk) => {
+    if (tk.x < plotL + 14 || tk.x > plotR - 14) return;
+    if (placedTicks.some((pl) => Math.abs(pl.x - tk.x) < MIN_TICK_GAP)) return;
+    placedTicks.push(tk);
+  };
+  boundaryTicks.slice().sort((a, b) => a.x - b.x).forEach(tryPlaceTick);
+  regularTicks.slice().sort((a, b) => a.x - b.x).forEach(tryPlaceTick);
+  const xLabels = placedTicks
+    .sort((a, b) => a.x - b.x)
+    .map((tk) => `<text x="${tk.x}" y="${height - 5}" text-anchor="middle" style="font:10.5px var(--mono);fill:var(--faint);">${esc(fmtTick(tk.ts))}</text>`)
+    .join("");
+
+  // ---- State strip (driving: click in / right-click out; rest: 5-level cycle)
+  // Every piece is drawn, including data GAPS (stage null) -- the strip must
+  // never have a blank/empty stretch, since that reads as "unknown" rather
+  // than "the car reported nothing here". Gaps get a distinct hollow/dashed
+  // treatment (not a solid stage color) and aren't click-to-zoom targets.
+  const fmtDur = (s) => s >= 5400 ? `${(s / 3600).toFixed(1)} h` : `${Math.round(s / 60)} min`;
+  // Plain phase + duration -- the zoom level lives on the "Click: ..." hint
+  // line instead (built above), not here: this label is also reused for the
+  // main tooltip's car-state row when hovering the DATA/plot area, where a
+  // zoom-level tag would read as out of place.
+  const stripLabel = (p) => {
+    if (p.stage == null) return `No data · ${fmtDur(p.t1 - p.t0)}`;
+    return `${stageLabel[p.stage] || p.stage} · ${fmtDur(p.t1 - p.t0)}`;
+  };
+  // No native <title> here -- the shared JS tooltip (charts.js's document
+  // mousemove listener) already covers strip hover with richer content, and
+  // the browser's own title tooltip rendering alongside it looked like two
+  // overlapping/duplicate tooltips ("the tooltip is a mess").
+  const strip = pieces
+    .map((p) => {
+      const w = Math.max(1.2, p.x1 - p.x0);
+      if (p.stage == null) {
+        return `<rect x="${p.x0.toFixed(1)}" y="${stripY}" width="${w.toFixed(1)}" height="${stripH}" rx="2" style="fill:none;stroke:var(--faint);stroke-width:1;stroke-dasharray:3 2;opacity:0.5;"></rect>`;
+      }
+      return `<rect x="${p.x0.toFixed(1)}" y="${stripY}" width="${w.toFixed(1)}" height="${stripH}" rx="2" data-action="explorer-seg" data-seg="${p.segStart}" data-level="${p.level}" data-stage="${esc(p.stage)}" style="fill:${stageColor[p.stage] || "var(--faint)"};cursor:pointer;${p.zoomed ? "stroke:var(--text);stroke-width:1;" : ""}"></rect>`;
+    })
+    .join("");
+
+  // ---- Series (each normalized to its own band) ----------------------------
+  const seriesMarkup = drawable
+    .map((s) => {
+      const ys = s.points.map((p) => p[1]);
+      let y0 = Math.min(...ys), y1 = Math.max(...ys);
+      if (y0 === y1) { y0 -= 1; y1 += 1; }
+      const pad = (y1 - y0) * 0.04;
+      y0 -= pad; y1 += pad;
+      const Y = (v) => +(t + (1 - (v - y0) / (y1 - y0)) * (bottom - t)).toFixed(1);
+      const pts = s.points.map((p) => `${X(p[0])},${Y(p[1])}`).join(" ");
+      return `<polyline points="${pts}" style="fill:none;stroke:${s.color || "var(--accent)"};stroke-width:${s.width || 1.8};stroke-linejoin:round;stroke-linecap:round;opacity:0.92;${s.dashed ? "stroke-dasharray:5 4;" : ""}"></polyline>`;
+    })
+    .join("");
+
+  // ---- Event markers --------------------------------------------------------
+  const markerMarkup = markers
+    .map((m) => {
+      const x = X(m.ts);
+      const col = markerColor[m.kind] || "var(--warn)";
+      return `<line x1="${x}" x2="${x}" y1="${markerBandY + 5}" y2="${bottom}" style="stroke:${col};stroke-width:1;stroke-dasharray:2 3;opacity:0.28;pointer-events:none;"></line>`
+        + `<circle cx="${x}" cy="${markerBandY}" r="4" style="fill:${col};stroke:var(--card);stroke-width:1.3;"></circle>`;
+    })
+    .join("");
+
+  // Each piece carries its own display label (built once here, shared verbatim
+  // by the tooltip handler when hovering the state strip directly) plus its
+  // stage, so the shared listener can do PIXEL-consistent state lookups --
+  // the exact same piece used to draw the strip and invert the cursor
+  // position, instead of an independent time-based segment search that can
+  // disagree with what's visually under the cursor in a densely-packed region.
+  const warpPieces = pieces.map((p) => ({ t0: p.t0, t1: p.t1, x0: p.x0, x1: p.x1, stage: p.stage, label: stripLabel(p), nextHint: p.nextHint }));
+  const chartId = registerChart({
+    width, height, X0, X1, left: plotL, right: plotR, warpPieces, stripY, stripH,
+    series: drawable.map((s) => ({ name: s.name, unit: s.unit, color: s.color, points: s.points })),
+    segments, stageColor, stageLabel, markers, markerColor,
+  });
+  return `<svg viewBox="0 0 ${width} ${height}" class="tm-svg-block" data-tmchart="${chartId}" data-x0="${X0}" data-x1="${X1}" data-left="${plotL}" data-right="${plotR}" data-w="${width}" data-warp="${JSON.stringify(warpPieces).replace(/"/g, "&quot;")}">${grid}${boundaries}${strip}${seriesMarkup}${markerMarkup}${xLabels}</svg>`;
 }
 
 /**

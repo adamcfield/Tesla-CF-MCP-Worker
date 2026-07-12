@@ -90,6 +90,7 @@ import {
   getSafetyFeatureStats,
   getStateTimeline,
   getSuggestedLocations,
+  getTimelineChart,
   getTirePressures,
   getTrackingSummary,
   getVampireDrain,
@@ -290,6 +291,15 @@ async function handleData(url: URL, env: Env): Promise<Response> {
       return json(await getBatteryDegradation(env, vin));
     case "/data/battery-timeline":
       return json(await getBatteryTimeline(env, vin, numParam("hours", 24)));
+    case "/data/timeline-chart": {
+      const fields = (q.get("fields") ?? "speed,soc,inside_temp,outside_temp")
+        .split(",").map((s) => s.trim()).filter(Boolean);
+      // Optional window anchor: unix seconds the window ENDS at (default now) —
+      // lets the Chart explorer pan back through history stock-chart style.
+      const endRaw = q.get("end");
+      const end = endRaw != null && endRaw !== "" && Number.isFinite(Number(endRaw)) ? Number(endRaw) : undefined;
+      return json(await getTimelineChart(env, vin, numParam("hours", 24), fields, end));
+    }
     case "/data/telemetry-fields":
       return json(await getTelemetryFieldStatus(env, vin));
     case "/data/vampire":
