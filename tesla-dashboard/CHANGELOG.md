@@ -9,6 +9,36 @@ feature or screen, the **patch** version for fixes/tweaks/copy changes, and the
 configured. See `CLAUDE.md` at the repo root for the policy on keeping this file
 and `APP_VERSION` (in `app.js`) in sync.
 
+## 1.22.0 — 2026-07-12
+
+Chart explorer: dual tooltip, deeper driving zoom, 5-level cycle back
+for everything else — "The tooltip is a mess. For driving I want
+deeper zoom in - to the minute or even sub minute level. Everything
+else now has only 2 levels? I want 5."
+
+- **Fixed the "messy" tooltip**: the strip segments and event markers
+  still carried native SVG `<title>` elements from before the custom
+  floating tooltip existed, so hovering showed BOTH the styled custom
+  tooltip AND the browser's own plain title tooltip stacked on top of
+  each other. Removed the native titles — the custom tooltip already
+  covers everything they said.
+- **Driving zoom goes much deeper**: level 5's weight jumped from 1024
+  to 65536, so a maxed driving segment now claims virtually all
+  available chart width. A short/medium drive reaches sub-minute ticks
+  easily (verified: a 2-minute drive shows ~15 sec intervals even at
+  its *default*, unzoomed level). A very long drive (tens of minutes)
+  has a hard geometric floor around ~5 min — fitting that many
+  non-overlapping time labels into a ~700px-wide chart isn't possible
+  regardless of zoom weight — but it's now reliably at that floor
+  instead of falling short of it. Drag-to-zoom on the whole window is
+  the tool for inspecting a narrow slice of a long drive at true
+  fine-grained resolution.
+- **Reverted charging/connected/resting/gaps from the 2-state toggle
+  back to the full 5-level cycle** (1→2→3→4→5→1 on repeated clicks,
+  wrapping around) — "as before" meant the original cycling behavior,
+  not a binary toggle. Driving keeps its own left-click-in /
+  right-click-out control, unaffected by this.
+
 ## 1.21.1 — 2026-07-12
 
 Chart explorer: widened the zoom ladder's dynamic range — "I want to

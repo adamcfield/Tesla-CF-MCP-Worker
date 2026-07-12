@@ -310,13 +310,20 @@ export function svgTimelineExplorer({
   // Driving gets full bidirectional control, since it's the part worth
   // fine-tuning: left-click zooms IN one step, right-click zooms OUT one
   // step, both clamped at the ladder's ends. It defaults mid-ladder (level
-  // 3) since it already carries plenty of native detail, leaving room to go
-  // either way. Every other stage (charging, connected, resting, data gaps
-  // -- typically hours long with one shape worth seeing at most) gets a
-  // simple two-state toggle instead: click jumps straight to max detail,
-  // click again returns to the default. "Reset zoomed parts" still clears
-  // every override at once regardless of stage.
-  const LEVEL_WEIGHTS = [0.25, 2, 16, 128, 1024];
+  // 3, weight unchanged from earlier versions) since it already carries
+  // plenty of native detail, leaving room to go either way -- level 5's
+  // weight is deliberately huge so a maxed driving segment claims virtually
+  // all available width, getting it as close as geometry allows to the
+  // finest tick spacing the chart's pixel width can label (a segment many
+  // minutes long still can't show sub-minute AXIS LABELS -- that's a hard
+  // "how many non-overlapping labels fit in ~700px" ceiling, not a zoom
+  // limit -- but a short driving segment reaches sub-minute easily, and
+  // drag-to-zoom on the whole window narrows to any slice for finer ticks).
+  // Every other stage (charging, connected, resting, data gaps) cycles
+  // through all 5 levels on click, wrapping 5 back to 1, same as before.
+  // "Reset zoomed parts" still clears every override at once regardless of
+  // stage.
+  const LEVEL_WEIGHTS = [0.25, 2, 16, 256, 65536];
   const defaultLevel = (stage) => (stage === "driving" ? 3 : 1);
   // Tick step sizes shared with the axis-label generator below AND with the
   // "what will a click do" resolution hint -- one source of truth so the
@@ -380,12 +387,10 @@ export function svgTimelineExplorer({
         ? `Right-click: zoom out ~${fmtStepSize(curStep)} → ~${fmtStepSize(stepFor(dur, pxAtLevel(tile, dur, curLevel - 1)))} (level ${curLevel}/5 → ${curLevel - 1}/5)`
         : `Right-click: already at min detail (level ${curLevel}/5)`;
       tile.nextHint = `${inHint} · ${outHint}`;
-    } else if (curLevel <= 1) {
-      const maxStep = stepFor(dur, pxAtLevel(tile, dur, LEVEL_WEIGHTS.length));
-      tile.nextHint = `Click: zoom to max detail — ~${fmtStepSize(curStep)} → ~${fmtStepSize(maxStep)} intervals`;
     } else {
-      const minStep = stepFor(dur, pxAtLevel(tile, dur, 1));
-      tile.nextHint = `Click: back to default — ~${fmtStepSize(curStep)} → ~${fmtStepSize(minStep)} intervals`;
+      const nextLevel = curLevel >= LEVEL_WEIGHTS.length ? 1 : curLevel + 1;
+      const nextStep = stepFor(dur, pxAtLevel(tile, dur, nextLevel));
+      tile.nextHint = `Click: ~${fmtStepSize(curStep)} → ~${fmtStepSize(nextStep)} intervals (level ${curLevel}/5 → ${nextLevel}/5)`;
     }
   }
   // Floor: any tile longer than a minute stays at least 16px wide (clickable,
@@ -470,14 +475,17 @@ export function svgTimelineExplorer({
     if (p.stage == null) return `No data · ${fmtDur(p.t1 - p.t0)}`;
     return `${stageLabel[p.stage] || p.stage} · ${fmtDur(p.t1 - p.t0)}`;
   };
+  // No native <title> here -- the shared JS tooltip (charts.js's document
+  // mousemove listener) already covers strip hover with richer content, and
+  // the browser's own title tooltip rendering alongside it looked like two
+  // overlapping/duplicate tooltips ("the tooltip is a mess").
   const strip = pieces
     .map((p) => {
       const w = Math.max(1.2, p.x1 - p.x0);
       if (p.stage == null) {
-        return `<rect x="${p.x0.toFixed(1)}" y="${stripY}" width="${w.toFixed(1)}" height="${stripH}" rx="2" style="fill:none;stroke:var(--faint);stroke-width:1;stroke-dasharray:3 2;opacity:0.5;"><title>${esc(stripLabel(p))}</title></rect>`;
+        return `<rect x="${p.x0.toFixed(1)}" y="${stripY}" width="${w.toFixed(1)}" height="${stripH}" rx="2" style="fill:none;stroke:var(--faint);stroke-width:1;stroke-dasharray:3 2;opacity:0.5;"></rect>`;
       }
-      const title = `${stripLabel(p)} — ${p.nextHint || "click to zoom in"}`;
-      return `<rect x="${p.x0.toFixed(1)}" y="${stripY}" width="${w.toFixed(1)}" height="${stripH}" rx="2" data-action="explorer-seg" data-seg="${p.segStart}" data-level="${p.level}" data-stage="${esc(p.stage)}" style="fill:${stageColor[p.stage] || "var(--faint)"};cursor:pointer;${p.zoomed ? "stroke:var(--text);stroke-width:1;" : ""}"><title>${esc(title)}</title></rect>`;
+      return `<rect x="${p.x0.toFixed(1)}" y="${stripY}" width="${w.toFixed(1)}" height="${stripH}" rx="2" data-action="explorer-seg" data-seg="${p.segStart}" data-level="${p.level}" data-stage="${esc(p.stage)}" style="fill:${stageColor[p.stage] || "var(--faint)"};cursor:pointer;${p.zoomed ? "stroke:var(--text);stroke-width:1;" : ""}"></rect>`;
     })
     .join("");
 
@@ -501,7 +509,7 @@ export function svgTimelineExplorer({
       const x = X(m.ts);
       const col = markerColor[m.kind] || "var(--warn)";
       return `<line x1="${x}" x2="${x}" y1="${markerBandY + 5}" y2="${bottom}" style="stroke:${col};stroke-width:1;stroke-dasharray:2 3;opacity:0.28;pointer-events:none;"></line>`
-        + `<circle cx="${x}" cy="${markerBandY}" r="4" style="fill:${col};stroke:var(--card);stroke-width:1.3;"><title>${esc(m.label)}</title></circle>`;
+        + `<circle cx="${x}" cy="${markerBandY}" r="4" style="fill:${col};stroke:var(--card);stroke-width:1.3;"></circle>`;
     })
     .join("");
 
