@@ -112,12 +112,16 @@ document.addEventListener("mousemove", (ev) => {
 
   // Hovering the state strip itself (Chart explorer): a focused phase +
   // duration readout instead of the full signal breakdown -- "so it will be
-  // easy to understand the non-linear axis".
+  // easy to understand the non-linear axis". Also explains what the NEXT
+  // click will do in concrete resolution terms (derived per-segment from its
+  // own duration/pixel share, not a fixed value) -- "hovering the state bar
+  // should explain what is going to happen next click".
   if (meta.stripY != null && meta.height) {
     const svgY = ((ev.clientY - rect.top) / rect.height) * meta.height;
     if (svgY >= meta.stripY - 2 && svgY <= meta.stripY + meta.stripH + 2 && pc) {
       t.innerHTML = `<div class="tm-chart-tip-x">${esc(fmtTipX(dataX))}</div>`
-        + `<div class="tm-chart-tip-row"><span class="tm-chart-tip-dot" style="background:${meta.stageColor?.[pc.stage] || "var(--faint)"};"></span><strong>${esc(pc.label || pc.stage || "No data")}</strong></div>`;
+        + `<div class="tm-chart-tip-row"><span class="tm-chart-tip-dot" style="background:${meta.stageColor?.[pc.stage] || "var(--faint)"};"></span><strong>${esc(pc.label || pc.stage || "No data")}</strong></div>`
+        + (pc.nextHint ? `<div class="tm-chart-tip-row" style="color:var(--sub);font-size:10.5px;">${esc(pc.nextHint)}</div>` : "");
       t.style.display = "block";
       const tw = t.offsetWidth || 120;
       const x = ev.clientX + 14 + tw > window.innerWidth ? ev.clientX - tw - 12 : ev.clientX + 14;
@@ -272,9 +276,28 @@ export function svgTimelineExplorer({
 
   // ---- Piecewise time->px mapping ("smart axis") --------------------------
   // Tile [X0,X1] with the stage segments (gaps between/around them become
-  // weight-1 tiles), weight each tile by stage factor x user override, hand
-  // each tile a proportional pixel share (with a floor so nothing vanishes),
-  // then map time linearly WITHIN each tile.
+  // weight-1 tiles), weight each tile by a 5-level zoom scale, hand each
+  // tile a proportional pixel share (with a floor so nothing vanishes), then
+  // map time linearly WITHIN each tile.
+  //
+  // 5 discrete levels (1 = min .. 5 = max), weight doubling per level, applied
+  // PER SEGMENT: driving defaults to level 4, every other stage (charging,
+  // connected, resting, and data gaps) defaults to level 1 (min) -- clicking
+  // a segment cycles its OWN level 1->2->3->4->5->1, overriding the default.
+  const LEVEL_WEIGHTS = [1, 2, 4, 8, 16];
+  const defaultLevel = (stage) => (stage === "driving" ? 4 : 1);
+  // Tick step sizes shared with the axis-label generator below AND with the
+  // "what will the next click do" resolution hint -- one source of truth so
+  // the hint can never claim a granularity the axis wouldn't actually show.
+  const STEPS = [15, 30, 60, 120, 300, 600, 900, 1800, 3600, 7200, 10800, 21600, 43200, 86400];
+  const stepFor = (dur, pxW) => STEPS.find((s) => (dur / s) * 56 <= pxW) ?? STEPS[STEPS.length - 1];
+  const fmtStepSize = (s) => {
+    if (s < 60) return `${s} sec`;
+    if (s < 3600) return `${Math.round(s / 60)} min`;
+    if (s < 86400) return `${s % 3600 === 0 ? (s / 3600).toFixed(0) : (s / 3600).toFixed(1)} h`;
+    return `${Math.round(s / 86400)} d`;
+  };
+
   const tiles = [];
   let cursor = X0;
   for (const seg of segments) {
@@ -287,17 +310,37 @@ export function svgTimelineExplorer({
   if (cursor < X1) tiles.push({ t0: cursor, t1: X1, stage: null, segStart: null });
   if (!tiles.length) tiles.push({ t0: X0, t1: X1, stage: null, segStart: null });
 
-  const factors = warp?.factors || {};
-  const overrides = warp?.overrides || {};
+  const levelOverrides = warp?.levels || {};
   for (const tile of tiles) {
     const dur = Math.max(1, tile.t1 - tile.t0);
-    const factor = warp ? (factors[tile.stage] ?? 1) : 1;
-    const mult = tile.segStart != null && overrides[tile.segStart] ? overrides[tile.segStart] : 1;
-    tile.weight = dur * factor * mult;
-    tile.zoomed = mult > 1 ? "expanded" : mult < 1 ? "compressed" : null;
+    const level = tile.stage == null ? 1
+      : (tile.segStart != null && levelOverrides[tile.segStart]) || defaultLevel(tile.stage);
+    tile.level = level;
+    tile.weight = dur * (warp ? LEVEL_WEIGHTS[level - 1] : 1);
+    tile.zoomed = tile.stage != null && level !== defaultLevel(tile.stage);
   }
   const totalW = tiles.reduce((s, x) => s + x.weight, 0) || 1;
   for (const tile of tiles) tile.px = (tile.weight / totalW) * plotW;
+  // Predicted resolution before/after the next click, for the strip-hover
+  // hint ("Click: ~1 min -> ~30 sec intervals") -- computed from each real
+  // segment's OWN duration and its (approximate, floor-less) pixel share at
+  // its current vs. next level, holding every other tile's weight constant.
+  // Approximate because the floor-redistribution below can shift shares
+  // slightly; close enough to describe what a click will roughly do.
+  const otherWeight = (tile) => totalW - tile.weight;
+  for (const tile of tiles) {
+    if (tile.stage == null) { tile.nextHint = null; continue; }
+    const dur = Math.max(1, tile.t1 - tile.t0);
+    const curLevel = tile.level;
+    const nextLevel = curLevel >= 5 ? 1 : curLevel + 1;
+    const pxAt = (lvl) => {
+      const w = dur * LEVEL_WEIGHTS[lvl - 1];
+      return Math.max(1, (w / (otherWeight(tile) + w)) * plotW);
+    };
+    const curStep = stepFor(dur, pxAt(curLevel));
+    const nextStep = stepFor(dur, pxAt(nextLevel));
+    tile.nextHint = `Click: ~${fmtStepSize(curStep)} → ~${fmtStepSize(nextStep)} intervals`;
+  }
   // Floor: any tile longer than a minute stays at least 16px wide (clickable,
   // visible); take the excess proportionally from the bigger tiles.
   const MINPX = 16;
@@ -311,7 +354,7 @@ export function svgTimelineExplorer({
   }
   let acc = plotL;
   const pieces = tiles.map((x) => {
-    const p = { t0: x.t0, t1: x.t1, x0: acc, x1: acc + x.px, stage: x.stage, segStart: x.segStart, zoomed: x.zoomed };
+    const p = { t0: x.t0, t1: x.t1, x0: acc, x1: acc + x.px, stage: x.stage, segStart: x.segStart, zoomed: x.zoomed, level: x.level, nextHint: x.nextHint };
     acc = p.x1;
     return p;
   });
@@ -336,14 +379,15 @@ export function svgTimelineExplorer({
   }
   // Ticks: each piece labels itself at the density its own width affords —
   // a stretched drive gets minute marks, a squeezed overnight charge maybe one.
-  const STEPS = [60, 120, 300, 600, 900, 1800, 3600, 7200, 10800, 21600, 43200, 86400];
+  // (STEPS/stepFor are shared with the level-weight section above, so the
+  // axis and the "what will the next click do" hint can never disagree.)
   const fmtTick = (ts) => new Date(ts * 1000).toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit", hour12: false });
   const regularTicks = [];
   for (const p of pieces) {
     const pxW = p.x1 - p.x0;
     if (pxW < 34) continue;
     const dur = p.t1 - p.t0;
-    const step = STEPS.find((s) => (dur / s) * 56 <= pxW) ?? STEPS[STEPS.length - 1];
+    const step = stepFor(dur, pxW);
     for (let ts = Math.ceil(p.t0 / step) * step; ts <= p.t1; ts += step) regularTicks.push({ ts, x: X(ts) });
   }
   // Boundary ticks: exactly where the car's state changes -- teaches the
@@ -373,7 +417,7 @@ export function svgTimelineExplorer({
   const fmtDur = (s) => s >= 5400 ? `${(s / 3600).toFixed(1)} h` : `${Math.round(s / 60)} min`;
   const stripLabel = (p) => {
     if (p.stage == null) return `No data · ${fmtDur(p.t1 - p.t0)}`;
-    const zoomNote = p.zoomed === "expanded" ? " (expanded)" : p.zoomed === "compressed" ? " (compressed)" : "";
+    const zoomNote = p.zoomed ? ` (level ${p.level}/5)` : "";
     return `${stageLabel[p.stage] || p.stage} · ${fmtDur(p.t1 - p.t0)}${zoomNote}`;
   };
   const strip = pieces
@@ -382,8 +426,8 @@ export function svgTimelineExplorer({
       if (p.stage == null) {
         return `<rect x="${p.x0.toFixed(1)}" y="${stripY}" width="${w.toFixed(1)}" height="${stripH}" rx="2" style="fill:none;stroke:var(--faint);stroke-width:1;stroke-dasharray:3 2;opacity:0.5;"><title>${esc(stripLabel(p))}</title></rect>`;
       }
-      const title = `${stripLabel(p)} — click to expand / compress this part`;
-      return `<rect x="${p.x0.toFixed(1)}" y="${stripY}" width="${w.toFixed(1)}" height="${stripH}" rx="2" data-action="explorer-seg" data-seg="${p.segStart}" style="fill:${stageColor[p.stage] || "var(--faint)"};cursor:pointer;${p.zoomed ? "stroke:var(--text);stroke-width:1;" : ""}"><title>${esc(title)}</title></rect>`;
+      const title = `${stripLabel(p)} — ${p.nextHint || "click to change detail"}`;
+      return `<rect x="${p.x0.toFixed(1)}" y="${stripY}" width="${w.toFixed(1)}" height="${stripH}" rx="2" data-action="explorer-seg" data-seg="${p.segStart}" data-level="${p.level}" style="fill:${stageColor[p.stage] || "var(--faint)"};cursor:pointer;${p.zoomed ? "stroke:var(--text);stroke-width:1;" : ""}"><title>${esc(title)}</title></rect>`;
     })
     .join("");
 
@@ -417,7 +461,7 @@ export function svgTimelineExplorer({
   // the exact same piece used to draw the strip and invert the cursor
   // position, instead of an independent time-based segment search that can
   // disagree with what's visually under the cursor in a densely-packed region.
-  const warpPieces = pieces.map((p) => ({ t0: p.t0, t1: p.t1, x0: p.x0, x1: p.x1, stage: p.stage, label: stripLabel(p) }));
+  const warpPieces = pieces.map((p) => ({ t0: p.t0, t1: p.t1, x0: p.x0, x1: p.x1, stage: p.stage, label: stripLabel(p), nextHint: p.nextHint }));
   const chartId = registerChart({
     width, height, X0, X1, left: plotL, right: plotR, warpPieces, stripY, stripH,
     series: drawable.map((s) => ({ name: s.name, unit: s.unit, color: s.color, points: s.points })),

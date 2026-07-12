@@ -9,6 +9,32 @@ feature or screen, the **patch** version for fixes/tweaks/copy changes, and the
 configured. See `CLAUDE.md` at the repo root for the policy on keeping this file
 and `APP_VERSION` (in `app.js`) in sync.
 
+## 1.18.0 — 2026-07-12
+
+Chart explorer: 5-level per-part zoom + a hover hint that explains what
+the next click actually does — asked as "I see everything has 3 states
+of expansion, I want it 5 and everything but driving set to min, driving
+to 4 out of 5. Hovering the state bar should explain what is going to
+happen next click — expand from 1 min to 30 sec intervals (4->5) for
+example, or from 30 sec to 1 hour (5->1). The resolution is just for
+example, set it up according to the state and its duration."
+
+- **5 discrete detail levels** (was 3: normal/expanded/compressed) per
+  segment, cycling 1→2→3→4→5→1 on click. **Driving defaults to level
+  4/5; every other stage (charging, connected, resting) defaults to
+  level 1/5 (min)** — exactly as specified. "↺ Reset zoomed parts"
+  clears all overrides back to these defaults.
+- **Hovering the strip now explains the next click**: a second line
+  under the phase + duration reads e.g. "Click: ~30 min → ~15 min
+  intervals" — genuinely computed per segment from its own duration and
+  current pixel share (reusing the exact step-selection logic the axis
+  labels themselves use), not a fixed example value. A tiny 1-minute
+  driving burst in a 24h window predicts a totally different transition
+  than a 61-minute one, as it should.
+- Verified live: clicking one driving segment 6 times traced the exact
+  sequence 4→5→1→2→3→4; reset correctly restored every segment to its
+  stage default and hid the reset chip.
+
 ## 1.17.4 — 2026-07-12
 
 Four state-strip fixes on the Chart explorer's smart axis, all from one

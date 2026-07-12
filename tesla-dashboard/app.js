@@ -5,7 +5,7 @@ import { destroyMaps, renderPointMap, renderRouteMap, renderLifetimeMap, createR
 // Bump on every change to this dashboard (UI, features, or the /data/*
 // endpoints it depends on) and add a matching entry to CHANGELOG.md — see
 // the versioning policy in the repo's CLAUDE.md. Shown in the sidebar footer.
-const APP_VERSION = "1.17.4";
+const APP_VERSION = "1.18.0";
 
 const root = document.getElementById("app");
 let shellBound = false; // guards one-time attach of the root click handler + sync timer
@@ -214,7 +214,7 @@ const state = {
   explorerHours: 24, // Chart explorer window DURATION in hours (chips set presets, drag-zoom sets exact values)
   explorerEnd: null, // Chart explorer window END anchor (unix s) — null = live "now" (stock-chart pan/zoom)
   explorerFields: ["speed", "soc", "inside_temp", "outside_temp"], // Chart explorer: overlaid signals
-  explorerSegZoom: {}, // Chart explorer smart axis: per-segment width override ({[start_ts]: 4|0.25}); cleared on window change
+  explorerSegLevel: {}, // Chart explorer smart axis: per-segment detail level override ({[start_ts]: 1-5}); cleared on window change. Unset segments use their stage default (driving=4, else=1).
   tfCat: "__all", // Telemetry-fields screen: active category chip
   tfQuery: "", // Telemetry-fields screen: search text
   tfField: null, // field-history popup: { tesla, canonical, hours }
@@ -607,29 +607,31 @@ function onRootClick(e) {
   } else if (action === "explorer-range") {
     // Duration change keeps the window's right edge (stock-chart behavior).
     state.explorerHours = Number(t.dataset.hours);
-    state.explorerSegZoom = {};
+    state.explorerSegLevel = {};
     renderExplorer();
   } else if (action === "explorer-pan") {
     const dir = Number(t.dataset.dir); // -1 back, +1 forward
     const now = Math.floor(Date.now() / 1000);
     const end = (state.explorerEnd ?? now) + dir * state.explorerHours * 3600;
     state.explorerEnd = end >= now ? null : end; // panning to/past the present re-anchors live
-    state.explorerSegZoom = {};
+    state.explorerSegLevel = {};
     renderExplorer();
   } else if (action === "explorer-live") {
     state.explorerEnd = null;
-    state.explorerSegZoom = {};
+    state.explorerSegLevel = {};
     renderExplorer();
   } else if (action === "explorer-seg") {
-    // Cycle this part of the timeline: normal → expanded ×4 → compressed ×¼ → normal.
+    // Cycle this part's detail level 1 (min) .. 5 (max), wrapping 5 -> 1.
+    // The rect's own data-level (stamped by charts.js from whatever level it
+    // actually rendered at -- an explicit override or the stage default) is
+    // the source of truth, so this never needs to duplicate the default-level
+    // logic that lives in charts.js.
     const k = t.dataset.seg;
-    const cur = state.explorerSegZoom[k];
-    if (cur === undefined) state.explorerSegZoom[k] = 4;
-    else if (cur === 4) state.explorerSegZoom[k] = 0.25;
-    else delete state.explorerSegZoom[k];
+    const cur = Number(t.dataset.level) || 1;
+    state.explorerSegLevel[k] = cur >= 5 ? 1 : cur + 1;
     renderExplorer();
   } else if (action === "explorer-warp-reset") {
-    state.explorerSegZoom = {};
+    state.explorerSegLevel = {};
     renderExplorer();
   } else if (action === "explorer-field") {
     const f = t.dataset.field;
@@ -3504,7 +3506,7 @@ async function renderExplorer() {
   const windowLabel = win
     ? `${fmtWindowTs(win.start_ts)} → ${win.live ? "now" : fmtWindowTs(win.end_ts)}`
     : "";
-  const hasOverrides = Object.keys(state.explorerSegZoom).length > 0;
+  const hasOverrides = Object.keys(state.explorerSegLevel).length > 0;
   const rangeChips = `<div class="tm-flex-row" style="gap:8px;flex-wrap:wrap;align-items:center;">
     ${TIMELINE_RANGES.map(([label, h]) => `
       <button type="button" class="tm-chip-btn ${isPreset(h) ? "active" : ""}" data-action="explorer-range" data-hours="${h}">${esc(label)}</button>
@@ -3541,7 +3543,7 @@ async function renderExplorer() {
     <div class="tm-card tm-card-pad" style="margin-top:14px;">
       <div class="tm-card-head">
         <div class="tm-card-head-title">Signals over time</div>
-        <div class="tm-card-head-sub">${esc(windowLabel)} · smart axis: drives stretched, charging/sleep compressed — click a strip segment to expand/compress that part · drag to zoom · hover for values, events & state</div>
+        <div class="tm-card-head-sub">${esc(windowLabel)} · smart axis: drives stretched, charging/sleep compressed — click a strip segment to cycle its detail level (1 min .. 5 max) · drag to zoom · hover the strip for what the next click does</div>
       </div>
       <div id="tm-explorer-chart" style="position:relative;">
         ${svgTimelineExplorer({
@@ -3549,7 +3551,7 @@ async function renderExplorer() {
           segments: tl.segments || [],
           markers: tl.markers || [],
           stageColor: STAGE_COLOR, stageLabel: STAGE_LABEL, markerColor,
-          warp: { factors: { driving: 16, connected: 2, charging: 1, resting: 1 }, overrides: state.explorerSegZoom },
+          warp: { levels: state.explorerSegLevel },
         })}
         <div id="tm-explorer-sel" style="position:absolute;top:0;bottom:0;display:none;background:color-mix(in oklab, var(--accent) 14%, transparent);border-left:1px solid var(--accent);border-right:1px solid var(--accent);pointer-events:none;"></div>
       </div>
