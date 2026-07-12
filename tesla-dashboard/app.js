@@ -5,7 +5,7 @@ import { destroyMaps, renderPointMap, renderRouteMap, renderLifetimeMap, createR
 // Bump on every change to this dashboard (UI, features, or the /data/*
 // endpoints it depends on) and add a matching entry to CHANGELOG.md — see
 // the versioning policy in the repo's CLAUDE.md. Shown in the sidebar footer.
-const APP_VERSION = "1.22.1";
+const APP_VERSION = "1.23.0";
 
 const root = document.getElementById("app");
 let shellBound = false; // guards one-time attach of the root click handler + sync timer
@@ -1508,31 +1508,17 @@ async function renderOverview() {
 
   const hasLive = soc != null || range != null;
 
-  // Charge level: SoC + driving/charging/connected/resting stage, range-picked
-  // via chips (issue: "hasn't changed ever" — it was pinned to a flat 7-day
-  // view; now it shares the Battery timeline screen's own derivation, so a
-  // 10-minute-old charge is visible immediately instead of buried in a week).
+  // Charge level + Cabin climate: both now share the Chart explorer's own
+  // /data/timeline-chart + svgTimelineExplorer (smart non-linear axis, one
+  // shared tooltip system) instead of each having its own bespoke chart —
+  // filtered to just the one/two signals each card actually shows, and
+  // rendered non-interactive (no click-to-zoom; that belongs to the full
+  // Chart explorer screen, not a compact Overview summary card).
   const chargeHours = TIMELINE_RANGES[state.ovChargeRange][1];
-  const chargeTl = await safe(cached(`ov_batterytl:${chargeHours}`, () => data.batteryTimeline(vin(), chargeHours)), null);
+  const chargeTl = await safe(cached(`ov_tl_soc:${chargeHours}`, () => data.timelineChart(vin(), chargeHours, ["soc"])), null);
 
-  // Cabin climate: inside vs outside, same range chips, PLUS the same stage
-  // strip so "what was the car doing" is visible under the temperature line
-  // (e.g. AC struggling while driving vs. cabin drifting while just parked).
-  // Keying the batteryTimeline cache by hours means this reuses the Charge
-  // level fetch above for free whenever both cards share a range.
   const climateHours = TIMELINE_RANGES[state.ovClimateRange][1];
-  const [climate, climateTl] = await Promise.all([
-    cached(`ov_climate:${climateHours}`, async () => {
-      const grab = async (field) => {
-        try {
-          const pts = await data.series(vin(), field, climateHours);
-          return pts.filter((p) => typeof p.value === "number").map((p) => [p.ts, p.value]);
-        } catch { return []; }
-      };
-      return { insidePts: await grab("inside_temp"), outsidePts: await grab("outside_temp") };
-    }),
-    safe(cached(`ov_batterytl:${climateHours}`, () => data.batteryTimeline(vin(), climateHours)), null),
-  ]);
+  const climateTl = await safe(cached(`ov_tl_climate:${climateHours}`, () => data.timelineChart(vin(), climateHours, ["inside_temp", "outside_temp"])), null);
 
   const recentFeed = await cached("ov_recent", async () => {
     try {
@@ -1641,7 +1627,14 @@ async function renderOverview() {
             <button type="button" class="tm-chip-btn ${state.ovChargeRange === i ? "active" : ""}" data-action="ov-charge-range" data-range="${i}">${esc(label)}</button>
           `).join("")}
         </div>
-        ${chargeTl?.points?.length > 1 ? chargeLevelChartHtml(chargeTl) : miniEmptyHtml("No SoC history in this window")}
+        ${chargeTl?.series?.soc?.length > 1 ? svgTimelineExplorer({
+          height: 210,
+          series: [{ key: "soc", name: "Battery", unit: "%", color: "var(--accent)", yDomain: [0, 100], points: chargeTl.series.soc }],
+          segments: chargeTl.segments || [],
+          stageColor: STAGE_COLOR, stageLabel: STAGE_LABEL,
+          warp: { levels: {} },
+          interactive: false,
+        }) + batteryStageLegendHtml(chargeTl.stage_hours) : miniEmptyHtml("No SoC history in this window")}
       </div>
       <div class="tm-card tm-card-pad">
         <div style="font-size:14px;font-weight:600;margin-bottom:14px;">Recent activity</div>
@@ -1671,20 +1664,22 @@ async function renderOverview() {
           <button type="button" class="tm-chip-btn ${state.ovClimateRange === i ? "active" : ""}" data-action="ov-climate-range" data-range="${i}">${esc(label)}</button>
         `).join("")}
       </div>
-      ${(climate.insidePts.length > 1 || climate.outsidePts.length > 1) ? svgLineChart({
+      ${(climateTl?.series?.inside_temp?.length > 1 || climateTl?.series?.outside_temp?.length > 1) ? svgTimelineExplorer({
+        height: 210,
         series: [
-          { points: climate.outsidePts, color: "var(--faint)", dashed: true, name: "Outside" },
-          { points: climate.insidePts, color: "var(--accent)", width: 2.2, name: "Inside" },
-        ].filter((s) => s.points.length > 1),
-        yTicks: autoTicks([...climate.insidePts, ...climate.outsidePts].map((p) => p[1]), 4),
-        xTicks: buildDayTicks(climate.insidePts.length > 1 ? climate.insidePts : climate.outsidePts),
+          { key: "outside_temp", name: "Outside", color: "var(--faint)", dashed: true, points: climateTl.series.outside_temp || [] },
+          { key: "inside_temp", name: "Inside", color: "var(--accent)", width: 2.2, points: climateTl.series.inside_temp || [] },
+        ],
+        segments: climateTl.segments || [],
+        stageColor: STAGE_COLOR, stageLabel: STAGE_LABEL,
+        warp: { levels: {} },
+        interactive: false,
       }) : miniEmptyHtml(`No cabin temperature samples in the last ${esc(TIMELINE_RANGES[state.ovClimateRange][0])}`)}
-      ${climateTl?.points?.length ? batteryStageStripHtml(climateTl.segments, climateTl.points[0].ts, climateTl.points[climateTl.points.length - 1].ts) : ""}
       <div class="tm-flex-row" style="gap:16px;margin-top:10px;font-size:12px;color:var(--sub);">
         <span style="display:flex;align-items:center;gap:6px;"><span style="width:14px;height:2px;background:var(--accent);flex:none;"></span>Inside</span>
         <span style="display:flex;align-items:center;gap:6px;"><span style="width:14px;border-top:2px dashed var(--faint);flex:none;"></span>Outside</span>
       </div>
-      ${climateTl?.points?.length ? batteryStageLegendHtml(climateTl.stage_hours) : ""}
+      ${climateTl?.segments?.length ? batteryStageLegendHtml(climateTl.stage_hours) : ""}
       ${climateVerdictHtml(latest, inside, outside)}
     </div>
   `);
