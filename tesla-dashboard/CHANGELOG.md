@@ -9,6 +9,25 @@ feature or screen, the **patch** version for fixes/tweaks/copy changes, and the
 configured. See `CLAUDE.md` at the repo root for the policy on keeping this file
 and `APP_VERSION` (in `app.js`) in sync.
 
+## 1.21.1 — 2026-07-12
+
+Chart explorer: widened the zoom ladder's dynamic range — "I want to
+zoom in to a sub minute (30 sec?) while driving option. Also zoom out
+should be longer for everything on left click."
+
+- Ladder changed from `[1, 4, 16, 64, 256]` to `[0.25, 2, 16, 128,
+  1024]` (level 3 stays weight 16, so driving's default look is
+  unchanged) — a 16x wider top-to-bottom range.
+- Verified live: a 1-minute driving segment now reaches **~15 sec**
+  intervals at max zoom (finer than the ~30 sec asked for); a 61-minute
+  drive improves from ~10 min to ~5 min at max (a longer drive can't
+  physically reach sub-minute ticks in a fixed-width chart — that would
+  need ~6800px of width for one segment — but it's noticeably sharper,
+  and the existing drag-to-zoom can narrow the absolute window for true
+  fine-grained inspection of a slice of a long drive).
+- A charging/connected/resting segment's default (zoomed-out) state now
+  shows ~1 day intervals instead of ~2 h — meaningfully coarser, as asked.
+
 ## 1.21.0 — 2026-07-12
 
 Chart explorer: driving gets true bidirectional zoom, everything else

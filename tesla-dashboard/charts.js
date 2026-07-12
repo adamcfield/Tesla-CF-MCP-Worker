@@ -316,7 +316,7 @@ export function svgTimelineExplorer({
   // simple two-state toggle instead: click jumps straight to max detail,
   // click again returns to the default. "Reset zoomed parts" still clears
   // every override at once regardless of stage.
-  const LEVEL_WEIGHTS = [1, 4, 16, 64, 256];
+  const LEVEL_WEIGHTS = [0.25, 2, 16, 128, 1024];
   const defaultLevel = (stage) => (stage === "driving" ? 3 : 1);
   // Tick step sizes shared with the axis-label generator below AND with the
   // "what will a click do" resolution hint -- one source of truth so the
