@@ -9,6 +9,32 @@ feature or screen, the **patch** version for fixes/tweaks/copy changes, and the
 configured. See `CLAUDE.md` at the repo root for the policy on keeping this file
 and `APP_VERSION` (in `app.js`) in sync.
 
+## 1.17.4 — 2026-07-12
+
+Four state-strip fixes on the Chart explorer's smart axis, all from one
+report: "the state bar shows resting but there's speed recorded; some of
+the state bar is empty; hovering the state bar directly should show the
+duration of the phase; the change between car states should have the
+time on the axis when it's not too crowded."
+
+- **Fixed a real mismatch**: the tooltip's car-state row was computed by
+  an independent TIME-based segment search, which could disagree with
+  the segment actually drawn under the cursor in a densely-packed
+  region (e.g. showing "Resting" while the plot showed driving speed).
+  It now reads the SAME piece used to draw the strip and invert the
+  cursor position — state row and strip can no longer disagree.
+- **No more blank strip sections**: time ranges with no recorded data
+  (a connectivity gap) now render as a dashed "No data" outline instead
+  of being skipped — the strip is always a continuous width.
+- **Hover the strip directly** for a focused phase + duration readout
+  ("Driving · 61 min") instead of the full signal breakdown — verified
+  live to match exactly what hovering the plot above it reports.
+- **State-change tick labels**: the moment the car's state changes now
+  gets priority for an axis time label (reserved first, before the
+  regular evenly-spaced grid ticks fill remaining gaps) — 7 of 9 labels
+  in a tested 24h window landed exactly on a state change, making the
+  non-linear axis legible at a glance.
+
 ## 1.17.3 — 2026-07-12
 
 Fix: the tooltip listed every harsh-brake/accel marker "nearby" in time,

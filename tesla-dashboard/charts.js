@@ -90,19 +90,41 @@ document.addEventListener("mousemove", (ev) => {
   const meta = svg ? CHART_REGISTRY.get(svg.dataset.tmchart) : null;
   if (!meta) { t.style.display = "none"; return; }
 
-  // Map client-x into viewBox units (the SVG scales uniformly, width-driven).
+  // Map client position into viewBox units (the SVG scales uniformly, width-driven).
   const rect = svg.getBoundingClientRect();
   const svgX = ((ev.clientX - rect.left) / rect.width) * meta.width;
   const frac = (svgX - meta.left) / (meta.right - meta.left);
   if (frac < -0.02 || frac > 1.02) { t.style.display = "none"; return; }
-  let dataX;
+
+  // `pc` (the matched warp piece) is the SAME piece used to draw the state
+  // strip at this x — reused below for the state row and the dedicated
+  // strip-hover tooltip so both always agree with what's visually under the
+  // cursor, instead of an independent time-based segment search that can
+  // disagree in a densely-packed region.
+  let dataX, pc = null;
   if (meta.warpPieces?.length) {
-    // Non-linear (smart) axis: invert the piecewise time->px mapping.
     const px = Math.max(meta.left, Math.min(meta.right, svgX));
-    const pc = meta.warpPieces.find((p) => px >= p.x0 && px <= p.x1) || meta.warpPieces[meta.warpPieces.length - 1];
+    pc = meta.warpPieces.find((p) => px >= p.x0 && px <= p.x1) || meta.warpPieces[meta.warpPieces.length - 1];
     dataX = pc.t0 + ((px - pc.x0) / ((pc.x1 - pc.x0) || 1)) * (pc.t1 - pc.t0);
   } else {
     dataX = meta.X0 + Math.max(0, Math.min(1, frac)) * (meta.X1 - meta.X0);
+  }
+
+  // Hovering the state strip itself (Chart explorer): a focused phase +
+  // duration readout instead of the full signal breakdown -- "so it will be
+  // easy to understand the non-linear axis".
+  if (meta.stripY != null && meta.height) {
+    const svgY = ((ev.clientY - rect.top) / rect.height) * meta.height;
+    if (svgY >= meta.stripY - 2 && svgY <= meta.stripY + meta.stripH + 2 && pc) {
+      t.innerHTML = `<div class="tm-chart-tip-x">${esc(fmtTipX(dataX))}</div>`
+        + `<div class="tm-chart-tip-row"><span class="tm-chart-tip-dot" style="background:${meta.stageColor?.[pc.stage] || "var(--faint)"};"></span><strong>${esc(pc.label || pc.stage || "No data")}</strong></div>`;
+      t.style.display = "block";
+      const tw = t.offsetWidth || 120;
+      const x = ev.clientX + 14 + tw > window.innerWidth ? ev.clientX - tw - 12 : ev.clientX + 14;
+      t.style.left = `${x}px`;
+      t.style.top = `${Math.max(4, ev.clientY - t.offsetHeight - 10)}px`;
+      return;
+    }
   }
 
   const lines = meta.series
@@ -113,15 +135,11 @@ document.addEventListener("mousemove", (ev) => {
     });
   if (!lines.length) { t.style.display = "none"; return; }
 
-  // Car-state row (Chart explorer): which stage segment the cursor is inside.
+  // Car-state row (Chart explorer): the SAME piece (`pc`) drives this, so it
+  // can never disagree with the strip segment actually under the cursor.
   let stateRow = "";
-  if (meta.segments?.length) {
-    const seg = meta.segments.find((s) => dataX >= s.start_ts && dataX <= s.end_ts)
-      // between segments (sampling gap): fall back to the nearest one ending before the cursor
-      || [...meta.segments].reverse().find((s) => s.start_ts <= dataX);
-    if (seg) {
-      stateRow = `<div class="tm-chart-tip-row"><span class="tm-chart-tip-dot" style="background:${meta.stageColor?.[seg.stage] || "var(--faint)"};"></span><strong>${esc(meta.stageLabel?.[seg.stage] || seg.stage)}</strong></div>`;
-    }
+  if (meta.segments?.length && pc) {
+    stateRow = `<div class="tm-chart-tip-row"><span class="tm-chart-tip-dot" style="background:${meta.stageColor?.[pc.stage] || "var(--faint)"};"></span><strong>${esc(pc.label || pc.stage || "No data")}</strong></div>`;
   }
 
   // Event markers directly under the cursor — PIXEL proximity to where each
@@ -133,7 +151,7 @@ document.addEventListener("mousemove", (ev) => {
   if (meta.markers?.length) {
     const markerPx = (ts) => {
       if (!meta.warpPieces?.length) return meta.left + ((ts - meta.X0) / ((meta.X1 - meta.X0) || 1)) * (meta.right - meta.left);
-      const p = meta.warpPieces.find((pc) => ts >= pc.t0 && ts <= pc.t1) || meta.warpPieces[meta.warpPieces.length - 1];
+      const p = meta.warpPieces.find((mp) => ts >= mp.t0 && ts <= mp.t1) || meta.warpPieces[meta.warpPieces.length - 1];
       return p.x0 + ((ts - p.t0) / ((p.t1 - p.t0) || 1)) * (p.x1 - p.x0);
     };
     const NEAR_PX = 8; // ~the drawn marker circle's radius + a little hover slop
@@ -320,29 +338,51 @@ export function svgTimelineExplorer({
   // a stretched drive gets minute marks, a squeezed overnight charge maybe one.
   const STEPS = [60, 120, 300, 600, 900, 1800, 3600, 7200, 10800, 21600, 43200, 86400];
   const fmtTick = (ts) => new Date(ts * 1000).toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit", hour12: false });
-  const ticks = [];
+  const regularTicks = [];
   for (const p of pieces) {
     const pxW = p.x1 - p.x0;
     if (pxW < 34) continue;
     const dur = p.t1 - p.t0;
     const step = STEPS.find((s) => (dur / s) * 56 <= pxW) ?? STEPS[STEPS.length - 1];
-    for (let ts = Math.ceil(p.t0 / step) * step; ts <= p.t1; ts += step) ticks.push({ ts, x: X(ts) });
+    for (let ts = Math.ceil(p.t0 / step) * step; ts <= p.t1; ts += step) regularTicks.push({ ts, x: X(ts) });
   }
-  ticks.sort((a, b) => a.x - b.x);
-  let lastX = -1e9;
-  const xLabels = ticks
-    .filter((tk) => (tk.x - lastX >= 46 && tk.x >= plotL + 14 && tk.x <= plotR - 14) ? (lastX = tk.x, true) : false)
+  // Boundary ticks: exactly where the car's state changes -- teaches the
+  // viewer how the smart axis compresses/stretches time at a glance. These
+  // get PRIORITY placement over the regular grid ticks (reserved first),
+  // and only appear where there's room (same 46px min-gap rule).
+  const boundaryTicks = pieces.slice(1).map((p) => ({ ts: p.t0, x: p.x0 }));
+  const MIN_TICK_GAP = 46;
+  const placedTicks = [];
+  const tryPlaceTick = (tk) => {
+    if (tk.x < plotL + 14 || tk.x > plotR - 14) return;
+    if (placedTicks.some((pl) => Math.abs(pl.x - tk.x) < MIN_TICK_GAP)) return;
+    placedTicks.push(tk);
+  };
+  boundaryTicks.slice().sort((a, b) => a.x - b.x).forEach(tryPlaceTick);
+  regularTicks.slice().sort((a, b) => a.x - b.x).forEach(tryPlaceTick);
+  const xLabels = placedTicks
+    .sort((a, b) => a.x - b.x)
     .map((tk) => `<text x="${tk.x}" y="${height - 5}" text-anchor="middle" style="font:10.5px var(--mono);fill:var(--faint);">${esc(fmtTick(tk.ts))}</text>`)
     .join("");
 
   // ---- State strip (clickable: expand <-> compress a part) ----------------
+  // Every piece is drawn, including data GAPS (stage null) -- the strip must
+  // never have a blank/empty stretch, since that reads as "unknown" rather
+  // than "the car reported nothing here". Gaps get a distinct hollow/dashed
+  // treatment (not a solid stage color) and aren't click-to-zoom targets.
   const fmtDur = (s) => s >= 5400 ? `${(s / 3600).toFixed(1)} h` : `${Math.round(s / 60)} min`;
+  const stripLabel = (p) => {
+    if (p.stage == null) return `No data · ${fmtDur(p.t1 - p.t0)}`;
+    const zoomNote = p.zoomed === "expanded" ? " (expanded)" : p.zoomed === "compressed" ? " (compressed)" : "";
+    return `${stageLabel[p.stage] || p.stage} · ${fmtDur(p.t1 - p.t0)}${zoomNote}`;
+  };
   const strip = pieces
-    .filter((p) => p.stage != null)
     .map((p) => {
       const w = Math.max(1.2, p.x1 - p.x0);
-      const zoomNote = p.zoomed === "expanded" ? " (expanded)" : p.zoomed === "compressed" ? " (compressed)" : "";
-      const title = `${stageLabel[p.stage] || p.stage} · ${fmtDur(p.t1 - p.t0)}${zoomNote} — click to expand / compress this part`;
+      if (p.stage == null) {
+        return `<rect x="${p.x0.toFixed(1)}" y="${stripY}" width="${w.toFixed(1)}" height="${stripH}" rx="2" style="fill:none;stroke:var(--faint);stroke-width:1;stroke-dasharray:3 2;opacity:0.5;"><title>${esc(stripLabel(p))}</title></rect>`;
+      }
+      const title = `${stripLabel(p)} — click to expand / compress this part`;
       return `<rect x="${p.x0.toFixed(1)}" y="${stripY}" width="${w.toFixed(1)}" height="${stripH}" rx="2" data-action="explorer-seg" data-seg="${p.segStart}" style="fill:${stageColor[p.stage] || "var(--faint)"};cursor:pointer;${p.zoomed ? "stroke:var(--text);stroke-width:1;" : ""}"><title>${esc(title)}</title></rect>`;
     })
     .join("");
@@ -371,9 +411,15 @@ export function svgTimelineExplorer({
     })
     .join("");
 
-  const warpPieces = pieces.map((p) => ({ t0: p.t0, t1: p.t1, x0: p.x0, x1: p.x1 }));
+  // Each piece carries its own display label (built once here, shared verbatim
+  // by the tooltip handler when hovering the state strip directly) plus its
+  // stage, so the shared listener can do PIXEL-consistent state lookups --
+  // the exact same piece used to draw the strip and invert the cursor
+  // position, instead of an independent time-based segment search that can
+  // disagree with what's visually under the cursor in a densely-packed region.
+  const warpPieces = pieces.map((p) => ({ t0: p.t0, t1: p.t1, x0: p.x0, x1: p.x1, stage: p.stage, label: stripLabel(p) }));
   const chartId = registerChart({
-    width, X0, X1, left: plotL, right: plotR, warpPieces,
+    width, height, X0, X1, left: plotL, right: plotR, warpPieces, stripY, stripH,
     series: drawable.map((s) => ({ name: s.name, unit: s.unit, color: s.color, points: s.points })),
     segments, stageColor, stageLabel, markers, markerColor,
   });
