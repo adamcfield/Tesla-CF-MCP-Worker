@@ -5,7 +5,7 @@ import { destroyMaps, renderPointMap, renderRouteMap, renderLifetimeMap, createR
 // Bump on every change to this dashboard (UI, features, or the /data/*
 // endpoints it depends on) and add a matching entry to CHANGELOG.md — see
 // the versioning policy in the repo's CLAUDE.md. Shown in the sidebar footer.
-const APP_VERSION = "1.14.1";
+const APP_VERSION = "1.15.0";
 
 const root = document.getElementById("app");
 let shellBound = false; // guards one-time attach of the root click handler + sync timer
@@ -182,6 +182,23 @@ function monthLabel(ts) {
 }
 
 // ---------------------------------------------------------------------------
+// Shared chart-range presets — the "how far back" ladder used by the Battery
+// timeline screen and Overview's Charge level / Cabin climate cards. Fine
+// windows (10 min .. 1 hour) exist so a just-started charge or a recent
+// climate change is actually visible instead of drowning in a multi-day view.
+// ---------------------------------------------------------------------------
+const TIMELINE_RANGES = [
+  ["10 min", 1 / 6],
+  ["30 min", 0.5],
+  ["1 hour", 1],
+  ["6 hours", 6],
+  ["24 hours", 24],
+  ["7 days", 24 * 7],
+  ["30 days", 24 * 30],
+];
+const TIMELINE_RANGES_DEFAULT = 4; // "24 hours"
+
+// ---------------------------------------------------------------------------
 // App state
 // ---------------------------------------------------------------------------
 
@@ -191,7 +208,9 @@ const state = {
   vehicle: null, // { vin, display_name, state }
   vehicleData: null, // last on-demand get_vehicle_data snapshot
   driveFilter: 1, // 0=7d, 1=30d, 2=all
-  batteryTimelineRange: 0, // index into BATTERY_TIMELINE_RANGES (Battery timeline screen)
+  batteryTimelineRange: TIMELINE_RANGES_DEFAULT, // index into TIMELINE_RANGES (Battery timeline screen)
+  ovChargeRange: TIMELINE_RANGES_DEFAULT, // index into TIMELINE_RANGES (Overview's Charge level card)
+  ovClimateRange: TIMELINE_RANGES_DEFAULT, // index into TIMELINE_RANGES (Overview's Cabin climate card)
   tfCat: "__all", // Telemetry-fields screen: active category chip
   tfQuery: "", // Telemetry-fields screen: search text
   tfField: null, // field-history popup: { tesla, canonical, hours }
@@ -574,6 +593,12 @@ function onRootClick(e) {
   } else if (action === "battery-timeline-range") {
     state.batteryTimelineRange = Number(t.dataset.range);
     renderBatteryTimeline();
+  } else if (action === "ov-charge-range") {
+    state.ovChargeRange = Number(t.dataset.range);
+    renderOverview();
+  } else if (action === "ov-climate-range") {
+    state.ovClimateRange = Number(t.dataset.range);
+    renderOverview();
   } else if (action === "tf-cat") {
     state.tfCat = t.dataset.cat;
     renderTelemetryFields();
@@ -1414,24 +1439,31 @@ async function renderOverview() {
 
   const hasLive = soc != null || range != null;
 
-  const socChart = await cached("ov_soc7", async () => {
-    try {
-      const pts = await data.series(vin(), "soc", 7 * 24);
-      return pts.filter((p) => typeof p.value === "number").map((p) => [p.ts, p.value]);
-    } catch { return []; }
-  });
+  // Charge level: SoC + driving/charging/connected/resting stage, range-picked
+  // via chips (issue: "hasn't changed ever" — it was pinned to a flat 7-day
+  // view; now it shares the Battery timeline screen's own derivation, so a
+  // 10-minute-old charge is visible immediately instead of buried in a week).
+  const chargeHours = TIMELINE_RANGES[state.ovChargeRange][1];
+  const chargeTl = await safe(cached(`ov_batterytl:${chargeHours}`, () => data.batteryTimeline(vin(), chargeHours)), null);
 
-  // Cabin climate: inside vs outside over 24h ("is the AC keeping up?").
-  // Both are long-standing position columns, so this works on any worker build.
-  const climate = await cached("ov_climate24", async () => {
-    const grab = async (field) => {
-      try {
-        const pts = await data.series(vin(), field, 24);
-        return pts.filter((p) => typeof p.value === "number").map((p) => [p.ts, p.value]);
-      } catch { return []; }
-    };
-    return { insidePts: await grab("inside_temp"), outsidePts: await grab("outside_temp") };
-  });
+  // Cabin climate: inside vs outside, same range chips, PLUS the same stage
+  // strip so "what was the car doing" is visible under the temperature line
+  // (e.g. AC struggling while driving vs. cabin drifting while just parked).
+  // Keying the batteryTimeline cache by hours means this reuses the Charge
+  // level fetch above for free whenever both cards share a range.
+  const climateHours = TIMELINE_RANGES[state.ovClimateRange][1];
+  const [climate, climateTl] = await Promise.all([
+    cached(`ov_climate:${climateHours}`, async () => {
+      const grab = async (field) => {
+        try {
+          const pts = await data.series(vin(), field, climateHours);
+          return pts.filter((p) => typeof p.value === "number").map((p) => [p.ts, p.value]);
+        } catch { return []; }
+      };
+      return { insidePts: await grab("inside_temp"), outsidePts: await grab("outside_temp") };
+    }),
+    safe(cached(`ov_batterytl:${climateHours}`, () => data.batteryTimeline(vin(), climateHours)), null),
+  ]);
 
   const recentFeed = await cached("ov_recent", async () => {
     try {
@@ -1533,14 +1565,14 @@ async function renderOverview() {
       <div class="tm-card tm-card-pad tm-card-hover" data-action="nav" data-screen="bt">
         <div class="tm-card-head">
           <div class="tm-card-head-title">Charge level</div>
-          <div class="tm-card-head-sub">last 7 days &middot; click for the full timeline</div>
+          <div class="tm-card-head-sub">${esc(TIMELINE_RANGES[state.ovChargeRange][0])} &middot; click for the full timeline</div>
         </div>
-        ${socChart.length > 1 ? svgLineChart({
-          series: [{ points: socChart, area: true }],
-          yTicks: [0, 25, 50, 75, 100].map((v) => ({ value: v, label: String(v) })),
-          xTicks: buildDayTicks(socChart),
-          yDomain: [0, 100],
-        }) : miniEmptyHtml("No SoC history yet")}
+        <div class="tm-flex-row" style="gap:6px;flex-wrap:wrap;margin-bottom:10px;">
+          ${TIMELINE_RANGES.map(([label], i) => `
+            <button type="button" class="tm-chip-btn ${state.ovChargeRange === i ? "active" : ""}" data-action="ov-charge-range" data-range="${i}">${esc(label)}</button>
+          `).join("")}
+        </div>
+        ${chargeTl?.points?.length > 1 ? chargeLevelChartHtml(chargeTl) : miniEmptyHtml("No SoC history in this window")}
       </div>
       <div class="tm-card tm-card-pad">
         <div style="font-size:14px;font-weight:600;margin-bottom:14px;">Recent activity</div>
@@ -1563,7 +1595,12 @@ async function renderOverview() {
     <div class="tm-card tm-card-pad" id="tm-ov-climate">
       <div class="tm-card-head">
         <div class="tm-card-head-title">Cabin climate</div>
-        <div class="tm-card-head-sub">inside vs outside · last 24h</div>
+        <div class="tm-card-head-sub">inside vs outside &middot; ${esc(TIMELINE_RANGES[state.ovClimateRange][0])}</div>
+      </div>
+      <div class="tm-flex-row" style="gap:6px;flex-wrap:wrap;margin-bottom:10px;">
+        ${TIMELINE_RANGES.map(([label], i) => `
+          <button type="button" class="tm-chip-btn ${state.ovClimateRange === i ? "active" : ""}" data-action="ov-climate-range" data-range="${i}">${esc(label)}</button>
+        `).join("")}
       </div>
       ${(climate.insidePts.length > 1 || climate.outsidePts.length > 1) ? svgLineChart({
         series: [
@@ -1572,11 +1609,13 @@ async function renderOverview() {
         ].filter((s) => s.points.length > 1),
         yTicks: autoTicks([...climate.insidePts, ...climate.outsidePts].map((p) => p[1]), 4),
         xTicks: buildDayTicks(climate.insidePts.length > 1 ? climate.insidePts : climate.outsidePts),
-      }) : miniEmptyHtml("No cabin temperature samples in the last 24h")}
+      }) : miniEmptyHtml(`No cabin temperature samples in the last ${esc(TIMELINE_RANGES[state.ovClimateRange][0])}`)}
+      ${climateTl?.points?.length ? batteryStageStripHtml(climateTl.segments, climateTl.points[0].ts, climateTl.points[climateTl.points.length - 1].ts) : ""}
       <div class="tm-flex-row" style="gap:16px;margin-top:10px;font-size:12px;color:var(--sub);">
         <span style="display:flex;align-items:center;gap:6px;"><span style="width:14px;height:2px;background:var(--accent);flex:none;"></span>Inside</span>
         <span style="display:flex;align-items:center;gap:6px;"><span style="width:14px;border-top:2px dashed var(--faint);flex:none;"></span>Outside</span>
       </div>
+      ${climateTl?.points?.length ? batteryStageLegendHtml(climateTl.stage_hours) : ""}
       ${climateVerdictHtml(latest, inside, outside)}
     </div>
   `);
@@ -3315,7 +3354,6 @@ function autoTicks(values, n) {
 // Battery timeline
 // ---------------------------------------------------------------------------
 
-const BATTERY_TIMELINE_RANGES = [["24 hours", 24], ["7 days", 24 * 7], ["30 days", 24 * 30]];
 const STAGE_COLOR = { driving: "var(--accent)", charging: "var(--good)", connected: "var(--warn)", resting: "var(--faint)" };
 const STAGE_LABEL = { driving: "Driving", charging: "Charging", connected: "Connected (not charging)", resting: "Resting" };
 const STAGE_ORDER = ["driving", "charging", "connected", "resting"];
@@ -3341,13 +3379,26 @@ function batteryStageLegendHtml(stageHours) {
   </div>`;
 }
 
+/** SoC line chart + stage strip + stage legend from a getBatteryTimeline() result — shared by
+ * Overview's Charge level card and the full Battery timeline screen. Caller must check tl.points.length > 1. */
+function chargeLevelChartHtml(tl) {
+  const socPts = tl.points.map((p) => [p.ts, p.soc]);
+  const x0 = tl.points[0].ts, x1 = tl.points[tl.points.length - 1].ts;
+  return svgLineChart({
+    series: [{ points: socPts, area: true }],
+    yTicks: [0, 25, 50, 75, 100].map((v) => ({ value: v, label: String(v) })),
+    xTicks: buildDayTicks(socPts),
+    yDomain: [0, 100],
+  }) + batteryStageStripHtml(tl.segments, x0, x1) + batteryStageLegendHtml(tl.stage_hours);
+}
+
 async function renderBatteryTimeline() {
-  const hours = BATTERY_TIMELINE_RANGES[state.batteryTimelineRange][1];
+  const hours = TIMELINE_RANGES[state.batteryTimelineRange][1];
   const tl = await safe(cached(`battery_timeline:${hours}`, () => data.batteryTimeline(vin(), hours)), null);
 
   const rangeChips = `<div class="tm-flex-row" style="gap:8px;flex-wrap:wrap;">
     <button class="tm-back-btn" data-action="nav" data-screen="ov">&larr; Overview</button>
-    ${BATTERY_TIMELINE_RANGES.map(([label], i) => `
+    ${TIMELINE_RANGES.map(([label], i) => `
       <button class="tm-chip-btn ${state.batteryTimelineRange === i ? "active" : ""}" data-action="battery-timeline-range" data-range="${i}">${esc(label)}</button>
     `).join("")}
   </div>`;
@@ -3356,24 +3407,14 @@ async function renderBatteryTimeline() {
     return setContent(`${rangeChips}${emptyHtml("No battery data in this window", "Give the car some time to log driving/charging samples, or pick a wider range.")}`);
   }
 
-  const socPts = tl.points.map((p) => [p.ts, p.soc]);
-  const x0 = tl.points[0].ts, x1 = tl.points[tl.points.length - 1].ts;
-
   setContent(`
     ${rangeChips}
     <div class="tm-card tm-card-pad" style="margin-top:14px;">
       <div class="tm-card-head">
         <div class="tm-card-head-title">Battery level</div>
-        <div class="tm-card-head-sub">${esc(BATTERY_TIMELINE_RANGES[state.batteryTimelineRange][0])}</div>
+        <div class="tm-card-head-sub">${esc(TIMELINE_RANGES[state.batteryTimelineRange][0])}</div>
       </div>
-      ${socPts.length > 1 ? svgLineChart({
-        series: [{ points: socPts, area: true }],
-        yTicks: [0, 25, 50, 75, 100].map((v) => ({ value: v, label: String(v) })),
-        xTicks: buildDayTicks(socPts),
-        yDomain: [0, 100],
-      }) : miniEmptyHtml("Not enough samples yet to plot a line")}
-      ${batteryStageStripHtml(tl.segments, x0, x1)}
-      ${batteryStageLegendHtml(tl.stage_hours)}
+      ${tl.points.length > 1 ? chargeLevelChartHtml(tl) : miniEmptyHtml("Not enough samples yet to plot a line")}
     </div>
   `);
 }

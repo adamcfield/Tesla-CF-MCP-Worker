@@ -9,6 +9,31 @@ feature or screen, the **patch** version for fixes/tweaks/copy changes, and the
 configured. See `CLAUDE.md` at the repo root for the policy on keeping this file
 and `APP_VERSION` (in `app.js`) in sync.
 
+## 1.15.0 — 2026-07-12
+
+Overview's Charge level and Cabin climate cards, brought up to the Battery
+timeline screen's level — asked as "the Charge level hasn't changed ever,
+I want it to have by sec, minute, 10 minutes, half hour... all the time
+frames, and be colorful like the battery level timeline. The inside
+temperature should also have the timeframe grouping and tell what is the
+car doing at that time".
+
+- **Charge level**: was pinned to a flat, un-interactive 7-day view (which
+  is also why it looked "unchanged" — a week of 60-80% SoC barely moves a
+  0-100 axis). Now has range chips (10 min / 30 min / 1 hour / 6 hours /
+  24 hours / 7 days / 30 days) and the same colored driving/charging/
+  connected/resting stage strip + legend as the Battery timeline screen —
+  shares that screen's own derivation, so both stay in sync.
+- **Cabin climate**: same range chips, plus the stage strip/legend
+  underneath the inside/outside temperature lines — so a temperature jump
+  now visibly lines up with "was driving" / "was charging" / "was just
+  parked" instead of needing a guess.
+- Both cards' range selections are independent, and share a data fetch
+  when they happen to match (switching Charge level to 24h is then free
+  for Cabin climate too, and vice versa).
+- Backend: no changes — `/data/battery-timeline` and `/data/series`
+  already accepted fractional `hours`.
+
 ## 1.14.1 — 2026-07-12
 
 Two follow-up fixes to 1.14.0's Places rework.
