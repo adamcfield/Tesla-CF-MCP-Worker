@@ -5,7 +5,7 @@ import { destroyMaps, renderPointMap, renderRouteMap, renderLifetimeMap, createR
 // Bump on every change to this dashboard (UI, features, or the /data/*
 // endpoints it depends on) and add a matching entry to CHANGELOG.md — see
 // the versioning policy in the repo's CLAUDE.md. Shown in the sidebar footer.
-const APP_VERSION = "1.16.1";
+const APP_VERSION = "1.17.0";
 
 const root = document.getElementById("app");
 let shellBound = false; // guards one-time attach of the root click handler + sync timer
@@ -214,6 +214,7 @@ const state = {
   explorerHours: 24, // Chart explorer window DURATION in hours (chips set presets, drag-zoom sets exact values)
   explorerEnd: null, // Chart explorer window END anchor (unix s) — null = live "now" (stock-chart pan/zoom)
   explorerFields: ["speed", "soc", "inside_temp", "outside_temp"], // Chart explorer: overlaid signals
+  explorerSegZoom: {}, // Chart explorer smart axis: per-segment width override ({[start_ts]: 4|0.25}); cleared on window change
   tfCat: "__all", // Telemetry-fields screen: active category chip
   tfQuery: "", // Telemetry-fields screen: search text
   tfField: null, // field-history popup: { tesla, canonical, hours }
@@ -606,15 +607,29 @@ function onRootClick(e) {
   } else if (action === "explorer-range") {
     // Duration change keeps the window's right edge (stock-chart behavior).
     state.explorerHours = Number(t.dataset.hours);
+    state.explorerSegZoom = {};
     renderExplorer();
   } else if (action === "explorer-pan") {
     const dir = Number(t.dataset.dir); // -1 back, +1 forward
     const now = Math.floor(Date.now() / 1000);
     const end = (state.explorerEnd ?? now) + dir * state.explorerHours * 3600;
     state.explorerEnd = end >= now ? null : end; // panning to/past the present re-anchors live
+    state.explorerSegZoom = {};
     renderExplorer();
   } else if (action === "explorer-live") {
     state.explorerEnd = null;
+    state.explorerSegZoom = {};
+    renderExplorer();
+  } else if (action === "explorer-seg") {
+    // Cycle this part of the timeline: normal → expanded ×4 → compressed ×¼ → normal.
+    const k = t.dataset.seg;
+    const cur = state.explorerSegZoom[k];
+    if (cur === undefined) state.explorerSegZoom[k] = 4;
+    else if (cur === 4) state.explorerSegZoom[k] = 0.25;
+    else delete state.explorerSegZoom[k];
+    renderExplorer();
+  } else if (action === "explorer-warp-reset") {
+    state.explorerSegZoom = {};
     renderExplorer();
   } else if (action === "explorer-field") {
     const f = t.dataset.field;
@@ -3489,11 +3504,13 @@ async function renderExplorer() {
   const windowLabel = win
     ? `${fmtWindowTs(win.start_ts)} → ${win.live ? "now" : fmtWindowTs(win.end_ts)}`
     : "";
+  const hasOverrides = Object.keys(state.explorerSegZoom).length > 0;
   const rangeChips = `<div class="tm-flex-row" style="gap:8px;flex-wrap:wrap;align-items:center;">
     ${TIMELINE_RANGES.map(([label, h]) => `
       <button type="button" class="tm-chip-btn ${isPreset(h) ? "active" : ""}" data-action="explorer-range" data-hours="${h}">${esc(label)}</button>
     `).join("")}
     ${!TIMELINE_RANGES.some(([, h]) => isPreset(h)) ? `<span class="tm-chip-btn active" style="cursor:default;">${esc(fmtDurationMin(hours * 60))} zoom</span>` : ""}
+    ${hasOverrides ? `<button type="button" class="tm-chip-btn" data-action="explorer-warp-reset" title="Undo per-part expand/compress">↺ Reset zoomed parts</button>` : ""}
     <span style="flex:1;"></span>
     <button type="button" class="tm-chip-btn" data-action="explorer-pan" data-dir="-1" title="Pan one window back">←</button>
     <span class="tm-mono" style="font-size:12px;color:var(--sub);white-space:nowrap;">${esc(windowLabel)}</span>
@@ -3509,7 +3526,7 @@ async function renderExplorer() {
   </div>`;
 
   if (!tl || !Object.values(tl.series || {}).some((pts) => pts.length > 1)) {
-    return setContent(`${rangeChips}${fieldChips}${emptyHtml("No samples in this window", "Pick a wider range, or different signals — data collects as the car drives, charges and streams.")}`);
+    return setContent(`${fieldChips}${rangeChips}${emptyHtml("No samples in this window", "Pick a wider range, or different signals — data collects as the car drives, charges and streams.")}`);
   }
 
   const seriesDefs = EXPLORER_FIELDS
@@ -3517,16 +3534,14 @@ async function renderExplorer() {
     .map(([f, label, unit, color, dashed]) => ({ key: f, name: label, unit, color, dashed: !!dashed, points: tl.series[f] }));
   const markerColor = Object.fromEntries(Object.entries(MARKER_META).map(([k, [, c]]) => [k, c]));
   const presentKinds = [...new Set((tl.markers || []).map((m) => m.kind))];
-  const allPts = seriesDefs.flatMap((s) => s.points);
   const overflowNote = Object.entries(tl.marker_overflow || {}).map(([k, n]) => `${n} ${MARKER_META[k]?.[0] || k} markers beyond the cap not shown`).join(" · ");
 
   setContent(`
-    ${rangeChips}
     ${fieldChips}
     <div class="tm-card tm-card-pad" style="margin-top:14px;">
       <div class="tm-card-head">
         <div class="tm-card-head-title">Signals over time</div>
-        <div class="tm-card-head-sub">${esc(windowLabel)} · drag across the chart to zoom in, ← → to pan · hover for real values, events & car state</div>
+        <div class="tm-card-head-sub">${esc(windowLabel)} · smart axis: drives stretched, charging/sleep compressed — click a strip segment to expand/compress that part · drag to zoom · hover for values, events & state</div>
       </div>
       <div id="tm-explorer-chart" style="position:relative;">
         ${svgTimelineExplorer({
@@ -3534,9 +3549,12 @@ async function renderExplorer() {
           segments: tl.segments || [],
           markers: tl.markers || [],
           stageColor: STAGE_COLOR, stageLabel: STAGE_LABEL, markerColor,
-          xTicks: allPts.length ? buildDayTicks(allPts.sort((a, b) => a[0] - b[0])) : [],
+          warp: { factors: { driving: 16, connected: 2, charging: 1, resting: 1 }, overrides: state.explorerSegZoom },
         })}
         <div id="tm-explorer-sel" style="position:absolute;top:0;bottom:0;display:none;background:color-mix(in oklab, var(--accent) 14%, transparent);border-left:1px solid var(--accent);border-right:1px solid var(--accent);pointer-events:none;"></div>
+      </div>
+      <div style="margin-top:12px;padding-top:12px;border-top:1px solid var(--line2);">
+        ${rangeChips}
       </div>
       <div class="tm-flex-row" style="gap:16px;flex-wrap:wrap;margin-top:10px;">
         ${seriesDefs.map((s) => `
@@ -3566,9 +3584,18 @@ function bindExplorerZoom() {
   const svg = wrap?.querySelector("svg[data-tmchart]");
   const sel = document.getElementById("tm-explorer-sel");
   if (!wrap || !svg || !sel) return;
+  // Pixel → timestamp through the smart axis' piecewise mapping (falls back
+  // to linear when the chart was drawn without a warp).
+  let warpPieces = null;
+  try { warpPieces = JSON.parse(svg.dataset.warp || "null"); } catch { /* linear fallback */ }
   const toTs = (clientX) => {
     const rect = svg.getBoundingClientRect();
     const svgX = ((clientX - rect.left) / rect.width) * Number(svg.dataset.w);
+    if (warpPieces?.length) {
+      const px = Math.max(Number(svg.dataset.left), Math.min(Number(svg.dataset.right), svgX));
+      const pc = warpPieces.find((p) => px >= p.x0 && px <= p.x1) || warpPieces[warpPieces.length - 1];
+      return pc.t0 + ((px - pc.x0) / ((pc.x1 - pc.x0) || 1)) * (pc.t1 - pc.t0);
+    }
     const frac = Math.max(0, Math.min(1, (svgX - Number(svg.dataset.left)) / (Number(svg.dataset.right) - Number(svg.dataset.left))));
     return Number(svg.dataset.x0) + frac * (Number(svg.dataset.x1) - Number(svg.dataset.x0));
   };

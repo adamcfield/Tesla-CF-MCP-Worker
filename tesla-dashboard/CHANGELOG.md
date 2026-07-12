@@ -9,6 +9,32 @@ feature or screen, the **patch** version for fixes/tweaks/copy changes, and the
 configured. See `CLAUDE.md` at the repo root for the policy on keeping this file
 and `APP_VERSION` (in `app.js`) in sync.
 
+## 1.17.0 — 2026-07-12
+
+Chart explorer: the **smart axis** — asked as "this is an example of a not
+'smart' chart… the driving is interesting and I would like to see more
+detail, the overnight charging is less. I want to be able to expand or
+contract any 'part' — not hide it. Have the drive with the most granular
+time breakdown and the charging section by the hour. The timeframe windows
+should be under the chart, like Google sheets stock chart has."
+
+- **Non-linear time axis**: the x-axis is now piecewise — a driving minute
+  gets ~16× the width of a charging/resting minute, so a 40-minute drive
+  is fully readable next to a 17-hour overnight charge that compresses to
+  a sliver (visible, never hidden — every part keeps a minimum width).
+  Dashed guides mark where the axis scale changes.
+- **Expand/contract any part**: click a segment on the state strip to
+  cycle it normal → expanded ×4 → compressed ×¼ → normal (zoomed parts get
+  an outline; a "↺ Reset zoomed parts" chip undoes everything).
+- **Per-part tick density**: each segment labels time at the density its
+  width affords — minute marks inside a stretched drive, hourly (or less)
+  in a compressed charge.
+- **Time controls moved below the chart**, Google-Finance style: duration
+  presets, zoom chip, pan ← →, window label and ⦿ Live all live under the
+  plot now.
+- Hover and drag-to-zoom both invert the warped axis exactly (verified: a
+  drag across a stretched drive lands on the same minutes the axis shows).
+
 ## 1.16.1 — 2026-07-12
 
 Chart explorer: a real stock-chart **time window** — asked as "I want to

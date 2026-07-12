@@ -79,7 +79,15 @@ document.addEventListener("mousemove", (ev) => {
   const svgX = ((ev.clientX - rect.left) / rect.width) * meta.width;
   const frac = (svgX - meta.left) / (meta.right - meta.left);
   if (frac < -0.02 || frac > 1.02) { t.style.display = "none"; return; }
-  const dataX = meta.X0 + Math.max(0, Math.min(1, frac)) * (meta.X1 - meta.X0);
+  let dataX;
+  if (meta.warpPieces?.length) {
+    // Non-linear (smart) axis: invert the piecewise time->px mapping.
+    const px = Math.max(meta.left, Math.min(meta.right, svgX));
+    const pc = meta.warpPieces.find((p) => px >= p.x0 && px <= p.x1) || meta.warpPieces[meta.warpPieces.length - 1];
+    dataX = pc.t0 + ((px - pc.x0) / ((pc.x1 - pc.x0) || 1)) * (pc.t1 - pc.t0);
+  } else {
+    dataX = meta.X0 + Math.max(0, Math.min(1, frac)) * (meta.X1 - meta.X0);
+  }
 
   const lines = meta.series
     .filter((sr) => sr.points.length)
@@ -191,7 +199,12 @@ export function svgTimelineExplorer({
   width = 760, height = 320,
   series = [], segments = [], markers = [],
   stageColor = {}, stageLabel = {}, markerColor = {},
-  xTicks = [], xDomain,
+  xDomain,
+  // Smart (non-linear) axis: per-stage horizontal weight factors + per-segment
+  // user overrides ({[start_ts]: multiplier}). A driving minute gets ~16x the
+  // width of a charging/resting minute by default, so drives are readable and
+  // an overnight charge compresses to a sliver — visible, never hidden.
+  warp = null,
 }) {
   const drawable = series.filter((s) => s.points.length > 1);
   if (!drawable.length && !segments.length) return "";
@@ -203,6 +216,7 @@ export function svgTimelineExplorer({
   const xLabelH = 18;
   const bottom = height - xLabelH - stripH - 6; // plot bottom
   const stripY = bottom + 4;
+  const plotL = l, plotR = width - r, plotW = plotR - plotL;
 
   // Shared x domain across everything visible.
   const allX = [
@@ -212,30 +226,103 @@ export function svgTimelineExplorer({
   ];
   const X0 = xDomain?.[0] ?? Math.min(...allX);
   const X1 = xDomain?.[1] ?? Math.max(...allX);
-  const X = (v) => +(l + ((v - X0) / ((X1 - X0) || 1)) * (width - l - r)).toFixed(1);
 
-  // Faint reference lines at 25/50/75% of the plot band (no shared y axis —
-  // every series lives in its own normalized band).
+  // ---- Piecewise time->px mapping ("smart axis") --------------------------
+  // Tile [X0,X1] with the stage segments (gaps between/around them become
+  // weight-1 tiles), weight each tile by stage factor x user override, hand
+  // each tile a proportional pixel share (with a floor so nothing vanishes),
+  // then map time linearly WITHIN each tile.
+  const tiles = [];
+  let cursor = X0;
+  for (const seg of segments) {
+    const s0 = Math.max(X0, seg.start_ts), s1 = Math.min(X1, Math.max(seg.end_ts, seg.start_ts));
+    if (s1 <= cursor) continue;
+    if (s0 > cursor) tiles.push({ t0: cursor, t1: s0, stage: null, segStart: null });
+    tiles.push({ t0: Math.max(cursor, s0), t1: s1, stage: seg.stage, segStart: seg.start_ts });
+    cursor = s1;
+  }
+  if (cursor < X1) tiles.push({ t0: cursor, t1: X1, stage: null, segStart: null });
+  if (!tiles.length) tiles.push({ t0: X0, t1: X1, stage: null, segStart: null });
+
+  const factors = warp?.factors || {};
+  const overrides = warp?.overrides || {};
+  for (const tile of tiles) {
+    const dur = Math.max(1, tile.t1 - tile.t0);
+    const factor = warp ? (factors[tile.stage] ?? 1) : 1;
+    const mult = tile.segStart != null && overrides[tile.segStart] ? overrides[tile.segStart] : 1;
+    tile.weight = dur * factor * mult;
+    tile.zoomed = mult > 1 ? "expanded" : mult < 1 ? "compressed" : null;
+  }
+  const totalW = tiles.reduce((s, x) => s + x.weight, 0) || 1;
+  for (const tile of tiles) tile.px = (tile.weight / totalW) * plotW;
+  // Floor: any tile longer than a minute stays at least 16px wide (clickable,
+  // visible); take the excess proportionally from the bigger tiles.
+  const MINPX = 16;
+  const need = tiles.filter((x) => x.t1 - x.t0 > 60 && x.px < MINPX);
+  const deficit = need.reduce((s, x) => s + (MINPX - x.px), 0);
+  if (deficit > 0) {
+    const donors = tiles.filter((x) => !need.includes(x));
+    const donorPx = donors.reduce((s, x) => s + x.px, 0) || 1;
+    for (const x of need) x.px = MINPX;
+    for (const x of donors) x.px -= (x.px / donorPx) * deficit;
+  }
+  let acc = plotL;
+  const pieces = tiles.map((x) => {
+    const p = { t0: x.t0, t1: x.t1, x0: acc, x1: acc + x.px, stage: x.stage, segStart: x.segStart, zoomed: x.zoomed };
+    acc = p.x1;
+    return p;
+  });
+  const X = (v) => {
+    if (v <= X0) return plotL;
+    if (v >= X1) return plotR;
+    const p = pieces.find((pc) => v >= pc.t0 && v <= pc.t1) || pieces[pieces.length - 1];
+    return +(p.x0 + ((v - p.t0) / ((p.t1 - p.t0) || 1)) * (p.x1 - p.x0)).toFixed(1);
+  };
+
+  // ---- Grid + per-piece time ticks ----------------------------------------
   let grid = "";
   for (const f of [0.25, 0.5, 0.75]) {
     const y = +(t + f * (bottom - t)).toFixed(1);
-    grid += `<line x1="${l}" x2="${width - r}" y1="${y}" y2="${y}" style="stroke:var(--line2);stroke-width:1;opacity:0.6;"></line>`;
+    grid += `<line x1="${plotL}" x2="${plotR}" y1="${y}" y2="${y}" style="stroke:var(--line2);stroke-width:1;opacity:0.6;"></line>`;
   }
-
-  const xLabels = xTicks
-    .map((tk) => `<text x="${X(tk.value)}" y="${height - 5}" text-anchor="middle" style="font:10.5px var(--mono);fill:var(--faint);">${esc(tk.label)}</text>`)
+  // Boundary guides where the axis scale changes (skip hairline tiles).
+  let boundaries = "";
+  for (const p of pieces.slice(1)) {
+    if (p.x1 - p.x0 < 8) continue;
+    boundaries += `<line x1="${p.x0.toFixed(1)}" x2="${p.x0.toFixed(1)}" y1="${t}" y2="${bottom}" style="stroke:var(--line2);stroke-width:1;stroke-dasharray:2 4;opacity:0.7;pointer-events:none;"></line>`;
+  }
+  // Ticks: each piece labels itself at the density its own width affords —
+  // a stretched drive gets minute marks, a squeezed overnight charge maybe one.
+  const STEPS = [60, 120, 300, 600, 900, 1800, 3600, 7200, 10800, 21600, 43200, 86400];
+  const fmtTick = (ts) => new Date(ts * 1000).toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit", hour12: false });
+  const ticks = [];
+  for (const p of pieces) {
+    const pxW = p.x1 - p.x0;
+    if (pxW < 34) continue;
+    const dur = p.t1 - p.t0;
+    const step = STEPS.find((s) => (dur / s) * 56 <= pxW) ?? STEPS[STEPS.length - 1];
+    for (let ts = Math.ceil(p.t0 / step) * step; ts <= p.t1; ts += step) ticks.push({ ts, x: X(ts) });
+  }
+  ticks.sort((a, b) => a.x - b.x);
+  let lastX = -1e9;
+  const xLabels = ticks
+    .filter((tk) => (tk.x - lastX >= 46 && tk.x >= plotL + 14 && tk.x <= plotR - 14) ? (lastX = tk.x, true) : false)
+    .map((tk) => `<text x="${tk.x}" y="${height - 5}" text-anchor="middle" style="font:10.5px var(--mono);fill:var(--faint);">${esc(fmtTick(tk.ts))}</text>`)
     .join("");
 
-  // State strip (the "what was the car doing" layer).
-  const strip = segments
-    .map((seg) => {
-      const x = X(seg.start_ts);
-      const w = Math.max(1.2, X(Math.max(seg.end_ts, seg.start_ts)) - x);
-      return `<rect x="${x}" y="${stripY}" width="${w.toFixed(1)}" height="${stripH}" rx="2" style="fill:${stageColor[seg.stage] || "var(--faint)"};"><title>${esc(stageLabel[seg.stage] || seg.stage)}</title></rect>`;
+  // ---- State strip (clickable: expand <-> compress a part) ----------------
+  const fmtDur = (s) => s >= 5400 ? `${(s / 3600).toFixed(1)} h` : `${Math.round(s / 60)} min`;
+  const strip = pieces
+    .filter((p) => p.stage != null)
+    .map((p) => {
+      const w = Math.max(1.2, p.x1 - p.x0);
+      const zoomNote = p.zoomed === "expanded" ? " (expanded)" : p.zoomed === "compressed" ? " (compressed)" : "";
+      const title = `${stageLabel[p.stage] || p.stage} · ${fmtDur(p.t1 - p.t0)}${zoomNote} — click to expand / compress this part`;
+      return `<rect x="${p.x0.toFixed(1)}" y="${stripY}" width="${w.toFixed(1)}" height="${stripH}" rx="2" data-action="explorer-seg" data-seg="${p.segStart}" style="fill:${stageColor[p.stage] || "var(--faint)"};cursor:pointer;${p.zoomed ? "stroke:var(--text);stroke-width:1;" : ""}"><title>${esc(title)}</title></rect>`;
     })
     .join("");
 
-  // Each series normalized to its own [min,max] band (4% padding; flat series centered).
+  // ---- Series (each normalized to its own band) ----------------------------
   const seriesMarkup = drawable
     .map((s) => {
       const ys = s.points.map((p) => p[1]);
@@ -249,7 +336,7 @@ export function svgTimelineExplorer({
     })
     .join("");
 
-  // Event markers: dot in the top band + a faint guide line down the plot.
+  // ---- Event markers --------------------------------------------------------
   const markerMarkup = markers
     .map((m) => {
       const x = X(m.ts);
@@ -259,15 +346,13 @@ export function svgTimelineExplorer({
     })
     .join("");
 
+  const warpPieces = pieces.map((p) => ({ t0: p.t0, t1: p.t1, x0: p.x0, x1: p.x1 }));
   const chartId = registerChart({
-    width, X0, X1, left: l, right: width - r,
+    width, X0, X1, left: plotL, right: plotR, warpPieces,
     series: drawable.map((s) => ({ name: s.name, unit: s.unit, color: s.color, points: s.points })),
     segments, stageColor, stageLabel, markers, markerColor,
   });
-  // data-x0/x1/left/right/w expose the time scale so the caller can implement
-  // stock-chart drag-to-zoom (mapping pixels back to timestamps) without
-  // reaching into the chart registry.
-  return `<svg viewBox="0 0 ${width} ${height}" class="tm-svg-block" data-tmchart="${chartId}" data-x0="${X0}" data-x1="${X1}" data-left="${l}" data-right="${width - r}" data-w="${width}">${grid}${strip}${seriesMarkup}${markerMarkup}${xLabels}</svg>`;
+  return `<svg viewBox="0 0 ${width} ${height}" class="tm-svg-block" data-tmchart="${chartId}" data-x0="${X0}" data-x1="${X1}" data-left="${plotL}" data-right="${plotR}" data-w="${width}" data-warp="${JSON.stringify(warpPieces).replace(/"/g, "&quot;")}">${grid}${boundaries}${strip}${seriesMarkup}${markerMarkup}${xLabels}</svg>`;
 }
 
 /**
