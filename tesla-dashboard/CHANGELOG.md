@@ -9,6 +9,35 @@ feature or screen, the **patch** version for fixes/tweaks/copy changes, and the
 configured. See `CLAUDE.md` at the repo root for the policy on keeping this file
 and `APP_VERSION` (in `app.js`) in sync.
 
+## 1.23.0 — 2026-07-12
+
+Overview's Charge level and Cabin climate cards now run on the Chart
+explorer engine — "These 2 overview charts should use the new chart
+explorer but be filtered only to the relevant series."
+
+- Both cards switched from their own bespoke charts (a plain linear
+  line chart + a separately-rendered stage strip) to `svgTimelineExplorer`
+  — the same non-linear smart axis (driving stretched, charging/rest
+  compressed) and integrated hover tooltip as the full Chart explorer
+  screen, filtered to just the one/two signals each card needs: Charge
+  level shows only Battery %, Cabin climate shows only Inside/Outside
+  temperature. No field or marker toggles — these stay compact, at-a-glance
+  summary cards.
+- New **non-interactive mode** (`interactive: false`) for
+  `svgTimelineExplorer`: keeps the smart axis and tooltip, drops the
+  strip's click-to-zoom and its "Click: ..." hint — that belongs to the
+  full Chart explorer screen, not a small embedded card (clicking these
+  cards still navigates through, as before: Charge level to the full
+  Battery timeline, both to hover for a value).
+- New per-series `yDomain` override (used for Battery %, fixed at
+  0-100 so "50%" always sits at the same height rather than drifting
+  with whatever min/max happens to be in the current window).
+- Both cards now fetch from `/data/timeline-chart` (the Chart
+  explorer's own endpoint) instead of separate `/data/battery-timeline`
+  + `/data/series` calls — one request each instead of up to three.
+- The standalone Battery timeline screen (reached via "click for the
+  full timeline") is unchanged, still its own dedicated linear chart.
+
 ## 1.22.1 — 2026-07-12
 
 Three Chart explorer fixes from a pre-release multi-agent audit of the

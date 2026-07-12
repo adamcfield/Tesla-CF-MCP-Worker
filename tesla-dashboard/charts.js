@@ -264,7 +264,7 @@ export function svgLineChart({ width = 760, height = 210, series, yTicks = [], x
  * track changes, warnings) and a car-state strip along the bottom
  * (driving/charging/connected/resting), both of which also feed the tooltip.
  *
- * `series`: [{key, name, unit, color, dashed, points:[[ts,v],...]}]
+ * `series`: [{key, name, unit, color, dashed, yDomain: [min,max]?, points:[[ts,v],...]}]
  * `segments`/`markers`: as returned by /data/timeline-chart.
  * `stageColor`/`stageLabel`/`markerColor`: display maps owned by the caller.
  */
@@ -278,6 +278,12 @@ export function svgTimelineExplorer({
   // width of a charging/resting minute by default, so drives are readable and
   // an overnight charge compresses to a sliver — visible, never hidden.
   warp = null,
+  // false for a read-only embed (e.g. Overview's compact cards): keeps the
+  // smart axis and hover tooltip, drops the strip's click-to-zoom affordance
+  // and "Click: ..." hint -- those only make sense on the full Chart explorer
+  // screen, whose click handler this same markup would otherwise be wired to
+  // regardless of which screen it's actually rendered on.
+  interactive = true,
 }) {
   const drawable = series.filter((s) => s.points.length > 1);
   if (!drawable.length && !segments.length) return "";
@@ -372,7 +378,7 @@ export function svgTimelineExplorer({
     return Math.max(1, (w / (otherWeight(tile) + w)) * plotW);
   };
   for (const tile of tiles) {
-    if (tile.stage == null) { tile.nextHint = null; continue; }
+    if (tile.stage == null || !interactive) { tile.nextHint = null; continue; }
     const dur = Math.max(1, tile.t1 - tile.t0);
     const curLevel = tile.level;
     const curStep = stepFor(dur, pxAtLevel(tile, dur, curLevel));
@@ -499,18 +505,26 @@ export function svgTimelineExplorer({
       if (p.stage == null) {
         return `<rect x="${p.x0.toFixed(1)}" y="${stripY}" width="${w.toFixed(1)}" height="${stripH}" rx="2" style="fill:none;stroke:var(--faint);stroke-width:1;stroke-dasharray:3 2;opacity:0.5;"></rect>`;
       }
-      return `<rect x="${p.x0.toFixed(1)}" y="${stripY}" width="${w.toFixed(1)}" height="${stripH}" rx="2" data-action="explorer-seg" data-seg="${p.segStart}" data-level="${p.level}" data-stage="${esc(p.stage)}" style="fill:${stageColor[p.stage] || "var(--faint)"};cursor:pointer;${p.zoomed ? "stroke:var(--text);stroke-width:1;" : ""}"></rect>`;
+      const clickAttrs = interactive ? `data-action="explorer-seg" data-seg="${p.segStart}" data-level="${p.level}" data-stage="${esc(p.stage)}" ` : "";
+      return `<rect x="${p.x0.toFixed(1)}" y="${stripY}" width="${w.toFixed(1)}" height="${stripH}" rx="2" ${clickAttrs}style="fill:${stageColor[p.stage] || "var(--faint)"};${interactive ? "cursor:pointer;" : ""}${p.zoomed ? "stroke:var(--text);stroke-width:1;" : ""}"></rect>`;
     })
     .join("");
 
-  // ---- Series (each normalized to its own band) ----------------------------
+  // ---- Series (each normalized to its own band, or a fixed yDomain when the
+  // caller supplies one -- e.g. a percentage like SoC, where "50%" should
+  // always sit at the same vertical spot rather than drifting with whatever
+  // min/max happens to be in the current window) ----------------------------
   const seriesMarkup = drawable
     .map((s) => {
-      const ys = s.points.map((p) => p[1]);
-      let y0 = Math.min(...ys), y1 = Math.max(...ys);
-      if (y0 === y1) { y0 -= 1; y1 += 1; }
-      const pad = (y1 - y0) * 0.04;
-      y0 -= pad; y1 += pad;
+      let y0, y1;
+      if (s.yDomain) [y0, y1] = s.yDomain;
+      else {
+        const ys = s.points.map((p) => p[1]);
+        y0 = Math.min(...ys); y1 = Math.max(...ys);
+        if (y0 === y1) { y0 -= 1; y1 += 1; }
+        const pad = (y1 - y0) * 0.04;
+        y0 -= pad; y1 += pad;
+      }
       const Y = (v) => +(t + (1 - (v - y0) / (y1 - y0)) * (bottom - t)).toFixed(1);
       const pts = s.points.map((p) => `${X(p[0])},${Y(p[1])}`).join(" ");
       return `<polyline points="${pts}" style="fill:none;stroke:${s.color || "var(--accent)"};stroke-width:${s.width || 1.8};stroke-linejoin:round;stroke-linecap:round;opacity:0.92;${s.dashed ? "stroke-dasharray:5 4;" : ""}"></polyline>`;
