@@ -243,6 +243,38 @@ export async function ensureSchema(env: Env): Promise<void> {
     `CREATE UNIQUE INDEX IF NOT EXISTS idx_charges_one_active ON charge_sessions (vin) WHERE status='active'`,
   ).run();
 
+  // vehicle_states has the identical race: the cron connectivity check and the
+  // ingest path both call updateStateTimeline, and its read-then-write (find
+  // the open row, close it, insert a new one) isn't atomic. Observed live
+  // 2026-07-08: four rows inserted within the same 2 seconds, one of them left
+  // permanently open (end_ts IS NULL) because it wasn't the most-recent by
+  // start_ts, so getOpenState's ORDER BY start_ts DESC never found it again —
+  // it eventually got end_ts stamped 70 hours later by an unrelated update,
+  // producing a bogus multi-day "driving" entry in the Timeline/activity feed.
+  // Same fix as drives/charge_sessions: supersede any live duplicates first
+  // (keep the most-recent start_ts — the row getOpenState would actually pick),
+  // then a partial unique index so a race hits a constraint instead of an
+  // orphan.
+  // Keeps whichever open row getOpenState's own ORDER BY start_ts DESC would
+  // pick (ties broken by id) -- not just MAX(id) -- since a race is exactly a
+  // case where insertion order and start_ts order can disagree (the historical
+  // bad row had a LOWER start_ts than a row inserted right after it).
+  await env.DB.prepare(
+    `UPDATE vehicle_states SET end_ts = start_ts WHERE end_ts IS NULL
+     AND id NOT IN (
+       SELECT v1.id FROM vehicle_states v1
+       WHERE v1.end_ts IS NULL
+       AND NOT EXISTS (
+         SELECT 1 FROM vehicle_states v2
+         WHERE v2.vin = v1.vin AND v2.end_ts IS NULL
+         AND (v2.start_ts > v1.start_ts OR (v2.start_ts = v1.start_ts AND v2.id > v1.id))
+       )
+     )`,
+  ).run();
+  await env.DB.prepare(
+    `CREATE UNIQUE INDEX IF NOT EXISTS idx_vehicle_states_one_open ON vehicle_states (vin) WHERE end_ts IS NULL`,
+  ).run();
+
   // Posted-speed-limit cache (OSM maxspeed by ~110 m grid; -1 = negative cache).
   await env.DB.prepare(
     `CREATE TABLE IF NOT EXISTS road_segments (
