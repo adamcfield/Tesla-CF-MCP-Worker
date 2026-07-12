@@ -9,6 +9,35 @@ feature or screen, the **patch** version for fixes/tweaks/copy changes, and the
 configured. See `CLAUDE.md` at the repo root for the policy on keeping this file
 and `APP_VERSION` (in `app.js`) in sync.
 
+## 1.19.0 — 2026-07-12
+
+Chart explorer: fixed a stale hover tooltip after clicking a strip segment,
+moved the zoom-level indicator, and added marker on/off toggles — from
+follow-up feedback on 1.18.0: "The next interval upon click does not
+update after the click... The level indicator needs to be on the click
+line, not the data... I want to be able to turn on and off the markers
+(brake, acceleration, etc)."
+
+- **Fixed: the strip-hover tooltip no longer goes stale after a click.**
+  Clicking a segment re-renders the chart, but the cursor doesn't move —
+  so the browser never fires a fresh `mousemove` to refresh the tooltip,
+  and it kept showing the pre-click phase/level/hint text. The shared
+  tooltip now replays the last known cursor position against the new
+  chart right after every click-driven re-render, so the level and
+  "Click: ..." hint are correct immediately, with no mouse jiggle needed.
+- **Moved the zoom-level tag from the phase line onto the "Click: ..."
+  hint line** (e.g. "Click: ~30 min → ~15 min intervals (level 4/5 →
+  5/5)"), so it no longer also leaks into the main tooltip's car-state
+  row when hovering the data/plot area, where it read as out of place.
+- **Re-verified the state-strip-vs-hover mismatch** reported alongside
+  the above: confirmed (via direct DOM-level testing, isolating a single
+  click with no other pending state changes) that hovering the plot area
+  and hovering the strip at the same x always agree on the same segment —
+  no separate bug found beyond the stale-tooltip issue above.
+- **Marker kind toggle chips**: hard brake, hard accel, track change and
+  warning markers can now each be switched on/off independently, above
+  the signal chips — "I want to be able to turn on and off the markers."
+
 ## 1.18.0 — 2026-07-12
 
 Chart explorer: 5-level per-part zoom + a hover hint that explains what

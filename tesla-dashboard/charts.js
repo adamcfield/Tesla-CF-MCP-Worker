@@ -84,15 +84,25 @@ function fmtTipY(y) {
   return typeof y === "number" ? String(Math.round(y * 100) / 100) : String(y);
 }
 
-document.addEventListener("mousemove", (ev) => {
-  const svg = ev.target?.closest?.("svg[data-tmchart]");
+// Click-driven re-renders (e.g. cycling a strip segment's zoom level) replace
+// the chart DOM without the mouse itself moving, so the real `mousemove`
+// event that would normally refresh the tooltip never fires -- it's left
+// showing whatever it had right before the click. `updateTooltip` is the
+// shared body both the live listener AND `refreshChartTooltip` (called after
+// a re-render, replaying the last known cursor position) drive, so the
+// tooltip always reflects what's actually under the cursor right now.
+let lastMouse = null;
+
+function updateTooltip(clientX, clientY) {
+  const el = document.elementFromPoint(clientX, clientY);
+  const svg = el?.closest?.("svg[data-tmchart]");
   const t = tip();
   const meta = svg ? CHART_REGISTRY.get(svg.dataset.tmchart) : null;
   if (!meta) { t.style.display = "none"; return; }
 
   // Map client position into viewBox units (the SVG scales uniformly, width-driven).
   const rect = svg.getBoundingClientRect();
-  const svgX = ((ev.clientX - rect.left) / rect.width) * meta.width;
+  const svgX = ((clientX - rect.left) / rect.width) * meta.width;
   const frac = (svgX - meta.left) / (meta.right - meta.left);
   if (frac < -0.02 || frac > 1.02) { t.style.display = "none"; return; }
 
@@ -117,16 +127,16 @@ document.addEventListener("mousemove", (ev) => {
   // own duration/pixel share, not a fixed value) -- "hovering the state bar
   // should explain what is going to happen next click".
   if (meta.stripY != null && meta.height) {
-    const svgY = ((ev.clientY - rect.top) / rect.height) * meta.height;
+    const svgY = ((clientY - rect.top) / rect.height) * meta.height;
     if (svgY >= meta.stripY - 2 && svgY <= meta.stripY + meta.stripH + 2 && pc) {
       t.innerHTML = `<div class="tm-chart-tip-x">${esc(fmtTipX(dataX))}</div>`
         + `<div class="tm-chart-tip-row"><span class="tm-chart-tip-dot" style="background:${meta.stageColor?.[pc.stage] || "var(--faint)"};"></span><strong>${esc(pc.label || pc.stage || "No data")}</strong></div>`
         + (pc.nextHint ? `<div class="tm-chart-tip-row" style="color:var(--sub);font-size:10.5px;">${esc(pc.nextHint)}</div>` : "");
       t.style.display = "block";
       const tw = t.offsetWidth || 120;
-      const x = ev.clientX + 14 + tw > window.innerWidth ? ev.clientX - tw - 12 : ev.clientX + 14;
+      const x = clientX + 14 + tw > window.innerWidth ? clientX - tw - 12 : clientX + 14;
       t.style.left = `${x}px`;
-      t.style.top = `${Math.max(4, ev.clientY - t.offsetHeight - 10)}px`;
+      t.style.top = `${Math.max(4, clientY - t.offsetHeight - 10)}px`;
       return;
     }
   }
@@ -172,10 +182,26 @@ document.addEventListener("mousemove", (ev) => {
   t.style.display = "block";
   // Keep the tooltip inside the viewport: flip to the left of the cursor near the right edge.
   const tw = t.offsetWidth || 120;
-  const x = ev.clientX + 14 + tw > window.innerWidth ? ev.clientX - tw - 12 : ev.clientX + 14;
+  const x = clientX + 14 + tw > window.innerWidth ? clientX - tw - 12 : clientX + 14;
   t.style.left = `${x}px`;
-  t.style.top = `${Math.max(4, ev.clientY - t.offsetHeight - 10)}px`;
+  t.style.top = `${Math.max(4, clientY - t.offsetHeight - 10)}px`;
+}
+
+document.addEventListener("mousemove", (ev) => {
+  lastMouse = { x: ev.clientX, y: ev.clientY };
+  updateTooltip(ev.clientX, ev.clientY);
 });
+
+/**
+ * Re-evaluates the tooltip at the last known cursor position. Needed after
+ * any click that re-renders the chart DOM in place (e.g. cycling a strip
+ * segment's zoom level) -- the cursor hasn't moved, so no new `mousemove`
+ * fires on its own, and without this the tooltip is left showing whatever
+ * it had right before the click.
+ */
+export function refreshChartTooltip() {
+  if (lastMouse) updateTooltip(lastMouse.x, lastMouse.y);
+}
 
 /**
  * Multi-series line/area chart. `series`: [{points:[[x,y],...], color, dashed, area}]
@@ -339,7 +365,7 @@ export function svgTimelineExplorer({
     };
     const curStep = stepFor(dur, pxAt(curLevel));
     const nextStep = stepFor(dur, pxAt(nextLevel));
-    tile.nextHint = `Click: ~${fmtStepSize(curStep)} → ~${fmtStepSize(nextStep)} intervals`;
+    tile.nextHint = `Click: ~${fmtStepSize(curStep)} → ~${fmtStepSize(nextStep)} intervals (level ${curLevel}/5 → ${nextLevel}/5)`;
   }
   // Floor: any tile longer than a minute stays at least 16px wide (clickable,
   // visible); take the excess proportionally from the bigger tiles.
@@ -415,10 +441,13 @@ export function svgTimelineExplorer({
   // than "the car reported nothing here". Gaps get a distinct hollow/dashed
   // treatment (not a solid stage color) and aren't click-to-zoom targets.
   const fmtDur = (s) => s >= 5400 ? `${(s / 3600).toFixed(1)} h` : `${Math.round(s / 60)} min`;
+  // Plain phase + duration -- the zoom level lives on the "Click: ..." hint
+  // line instead (built above), not here: this label is also reused for the
+  // main tooltip's car-state row when hovering the DATA/plot area, where a
+  // zoom-level tag would read as out of place.
   const stripLabel = (p) => {
     if (p.stage == null) return `No data · ${fmtDur(p.t1 - p.t0)}`;
-    const zoomNote = p.zoomed ? ` (level ${p.level}/5)` : "";
-    return `${stageLabel[p.stage] || p.stage} · ${fmtDur(p.t1 - p.t0)}${zoomNote}`;
+    return `${stageLabel[p.stage] || p.stage} · ${fmtDur(p.t1 - p.t0)}`;
   };
   const strip = pieces
     .map((p) => {

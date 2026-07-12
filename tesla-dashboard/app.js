@@ -1,11 +1,11 @@
 import { auth, data, mcp, verifyToken, exportUrl, ApiError } from "./api.js";
-import { svgLineChart, svgBarChart, svgDonut, svgSplitBar, svgDriveChart, svgTimelineExplorer } from "./charts.js";
+import { svgLineChart, svgBarChart, svgDonut, svgSplitBar, svgDriveChart, svgTimelineExplorer, refreshChartTooltip } from "./charts.js";
 import { destroyMaps, renderPointMap, renderRouteMap, renderLifetimeMap, createReplayMarker, invalidateMaps } from "./map.js";
 
 // Bump on every change to this dashboard (UI, features, or the /data/*
 // endpoints it depends on) and add a matching entry to CHANGELOG.md — see
 // the versioning policy in the repo's CLAUDE.md. Shown in the sidebar footer.
-const APP_VERSION = "1.18.0";
+const APP_VERSION = "1.19.0";
 
 const root = document.getElementById("app");
 let shellBound = false; // guards one-time attach of the root click handler + sync timer
@@ -214,6 +214,7 @@ const state = {
   explorerHours: 24, // Chart explorer window DURATION in hours (chips set presets, drag-zoom sets exact values)
   explorerEnd: null, // Chart explorer window END anchor (unix s) — null = live "now" (stock-chart pan/zoom)
   explorerFields: ["speed", "soc", "inside_temp", "outside_temp"], // Chart explorer: overlaid signals
+  explorerMarkerKinds: ["harsh_brake", "harsh_accel", "music", "alert"], // Chart explorer: enabled event marker kinds
   explorerSegLevel: {}, // Chart explorer smart axis: per-segment detail level override ({[start_ts]: 1-5}); cleared on window change. Unset segments use their stage default (driving=4, else=1).
   tfCat: "__all", // Telemetry-fields screen: active category chip
   tfQuery: "", // Telemetry-fields screen: search text
@@ -638,6 +639,13 @@ function onRootClick(e) {
     const has = state.explorerFields.includes(f);
     if (has && state.explorerFields.length > 1) state.explorerFields = state.explorerFields.filter((x) => x !== f);
     else if (!has && state.explorerFields.length < 8) state.explorerFields = [...state.explorerFields, f];
+    renderExplorer();
+  } else if (action === "explorer-marker-kind") {
+    const k = t.dataset.kind;
+    const has = state.explorerMarkerKinds.includes(k);
+    state.explorerMarkerKinds = has
+      ? state.explorerMarkerKinds.filter((x) => x !== k)
+      : [...state.explorerMarkerKinds, k];
     renderExplorer();
   } else if (action === "tf-cat") {
     state.tfCat = t.dataset.cat;
@@ -3526,20 +3534,29 @@ async function renderExplorer() {
       </button>
     `).join("")}
   </div>`;
+  const markerKindChips = `<div class="tm-flex-row" style="gap:8px;flex-wrap:wrap;margin-top:8px;">
+    ${Object.entries(MARKER_META).map(([k, [label, color]]) => `
+      <button type="button" class="tm-chip-btn ${state.explorerMarkerKinds.includes(k) ? "active" : ""}" data-action="explorer-marker-kind" data-kind="${k}" title="Toggle ${esc(label)} markers">
+        <span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:${color};margin-right:6px;vertical-align:baseline;"></span>${esc(label)}
+      </button>
+    `).join("")}
+  </div>`;
 
   if (!tl || !Object.values(tl.series || {}).some((pts) => pts.length > 1)) {
-    return setContent(`${fieldChips}${rangeChips}${emptyHtml("No samples in this window", "Pick a wider range, or different signals — data collects as the car drives, charges and streams.")}`);
+    return setContent(`${fieldChips}${markerKindChips}${rangeChips}${emptyHtml("No samples in this window", "Pick a wider range, or different signals — data collects as the car drives, charges and streams.")}`);
   }
 
   const seriesDefs = EXPLORER_FIELDS
     .filter(([f]) => fields.includes(f) && tl.series[f]?.length > 1)
     .map(([f, label, unit, color, dashed]) => ({ key: f, name: label, unit, color, dashed: !!dashed, points: tl.series[f] }));
   const markerColor = Object.fromEntries(Object.entries(MARKER_META).map(([k, [, c]]) => [k, c]));
-  const presentKinds = [...new Set((tl.markers || []).map((m) => m.kind))];
+  const shownMarkers = (tl.markers || []).filter((m) => state.explorerMarkerKinds.includes(m.kind));
+  const presentKinds = [...new Set(shownMarkers.map((m) => m.kind))];
   const overflowNote = Object.entries(tl.marker_overflow || {}).map(([k, n]) => `${n} ${MARKER_META[k]?.[0] || k} markers beyond the cap not shown`).join(" · ");
 
   setContent(`
     ${fieldChips}
+    ${markerKindChips}
     <div class="tm-card tm-card-pad" style="margin-top:14px;">
       <div class="tm-card-head">
         <div class="tm-card-head-title">Signals over time</div>
@@ -3549,7 +3566,7 @@ async function renderExplorer() {
         ${svgTimelineExplorer({
           series: seriesDefs,
           segments: tl.segments || [],
-          markers: tl.markers || [],
+          markers: shownMarkers,
           stageColor: STAGE_COLOR, stageLabel: STAGE_LABEL, markerColor,
           warp: { levels: state.explorerSegLevel },
         })}
@@ -3574,6 +3591,10 @@ async function renderExplorer() {
   `);
 
   bindExplorerZoom();
+  // The cursor doesn't move on a click-driven re-render (e.g. cycling a strip
+  // segment's zoom level), so re-evaluate the tooltip against the new DOM at
+  // its last known position instead of leaving stale pre-click content on screen.
+  refreshChartTooltip();
 }
 
 /**
