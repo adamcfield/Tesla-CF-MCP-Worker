@@ -9,6 +9,32 @@ feature or screen, the **patch** version for fixes/tweaks/copy changes, and the
 configured. See `CLAUDE.md` at the repo root for the policy on keeping this file
 and `APP_VERSION` (in `app.js`) in sync.
 
+## 1.20.0 — 2026-07-12
+
+Chart explorer: replaced the 5-level click-to-cycle zoom with explicit
+zoom-in/reset, and made each car-state's zoom steps its own size —
+"maybe drop the preset altogether and have a zoom in, zoom out and
+reset to default" + "the intervals should be different for each state."
+
+- **Click now zooms in one step only, clamped at max — no more 5→1
+  wraparound.** The only way back out is the existing "↺ Reset zoomed
+  parts" chip (already the natural "I overdid it, start over" action).
+  A maxed-out segment's hover hint now reads "Already at max detail
+  (level 5/5) — use ↺ Reset to zoom back out" instead of promising a
+  click that would jump backwards.
+- **Per-stage zoom ladders instead of one universal doubling scale.**
+  Driving already carries plenty of native detail by default, so its
+  ladder climbs gently (weights 6→8→10→13→16, default at 8 — unchanged
+  from before). Every other stage (charging, connected, resting, data
+  gaps) typically spans hours with little worth seeing, so its ladder
+  jumps hard (weights 1→4→16→64→256) — one or two clicks turns a flat
+  multi-hour smear into something readable, instead of the same gentle
+  doubling driving gets.
+- Verified live: a driving segment now needs exactly 3 clicks to hit
+  max (2→3→4→5) and a charging segment 4 clicks (1→2→3→4→5); both
+  clamp on further clicks instead of wrapping, and Reset correctly
+  restores each to its (new) stage default.
+
 ## 1.19.1 — 2026-07-12
 
 Chart explorer: removed the duplicate legend under the chart — "Why do we

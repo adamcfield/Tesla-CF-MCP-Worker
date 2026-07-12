@@ -302,16 +302,21 @@ export function svgTimelineExplorer({
 
   // ---- Piecewise time->px mapping ("smart axis") --------------------------
   // Tile [X0,X1] with the stage segments (gaps between/around them become
-  // weight-1 tiles), weight each tile by a 5-level zoom scale, hand each
-  // tile a proportional pixel share (with a floor so nothing vanishes), then
-  // map time linearly WITHIN each tile.
+  // weight-1 tiles), weight each tile by a 5-level per-stage zoom ladder, hand
+  // each tile a proportional pixel share (with a floor so nothing vanishes),
+  // then map time linearly WITHIN each tile.
   //
-  // 5 discrete levels (1 = min .. 5 = max), weight doubling per level, applied
-  // PER SEGMENT: driving defaults to level 4, every other stage (charging,
-  // connected, resting, and data gaps) defaults to level 1 (min) -- clicking
-  // a segment cycles its OWN level 1->2->3->4->5->1, overriding the default.
-  const LEVEL_WEIGHTS = [1, 2, 4, 8, 16];
-  const defaultLevel = (stage) => (stage === "driving" ? 4 : 1);
+  // 5 discrete levels per segment, but the WEIGHT each level carries depends
+  // on the stage: driving already gets plenty of native detail by default, so
+  // its ladder climbs gently (finer control near the top); every other stage
+  // (charging, connected, resting, and data gaps -- typically hours long with
+  // little worth seeing) starts coarse and climbs hard, so one or two clicks
+  // is enough to turn a flat multi-hour smear into something readable.
+  // Clicking a segment zooms IN one step, clamped at its ladder's max (never
+  // wraps back around) -- the only way back out is "Reset zoomed parts".
+  const LEVEL_WEIGHTS = { driving: [6, 8, 10, 13, 16], other: [1, 4, 16, 64, 256] };
+  const weightsFor = (stage) => (stage === "driving" ? LEVEL_WEIGHTS.driving : LEVEL_WEIGHTS.other);
+  const defaultLevel = (stage) => (stage === "driving" ? 2 : 1);
   // Tick step sizes shared with the axis-label generator below AND with the
   // "what will the next click do" resolution hint -- one source of truth so
   // the hint can never claim a granularity the axis wouldn't actually show.
@@ -342,30 +347,36 @@ export function svgTimelineExplorer({
     const level = tile.stage == null ? 1
       : (tile.segStart != null && levelOverrides[tile.segStart]) || defaultLevel(tile.stage);
     tile.level = level;
-    tile.weight = dur * (warp ? LEVEL_WEIGHTS[level - 1] : 1);
+    tile.weight = dur * (warp ? weightsFor(tile.stage)[level - 1] : 1);
     tile.zoomed = tile.stage != null && level !== defaultLevel(tile.stage);
   }
   const totalW = tiles.reduce((s, x) => s + x.weight, 0) || 1;
   for (const tile of tiles) tile.px = (tile.weight / totalW) * plotW;
-  // Predicted resolution before/after the next click, for the strip-hover
-  // hint ("Click: ~1 min -> ~30 sec intervals") -- computed from each real
-  // segment's OWN duration and its (approximate, floor-less) pixel share at
-  // its current vs. next level, holding every other tile's weight constant.
-  // Approximate because the floor-redistribution below can shift shares
-  // slightly; close enough to describe what a click will roughly do.
+  // Predicted resolution after the next click (zoom-in only, clamped at the
+  // ladder's max), for the strip-hover hint ("Click: zoom in ~1 min -> ~30
+  // sec intervals") -- computed from each real segment's OWN duration and
+  // its (approximate, floor-less) pixel share at its current vs. next
+  // level, holding every other tile's weight constant. Approximate because
+  // the floor-redistribution below can shift shares slightly; close enough
+  // to describe what a click will roughly do.
   const otherWeight = (tile) => totalW - tile.weight;
   for (const tile of tiles) {
     if (tile.stage == null) { tile.nextHint = null; continue; }
     const dur = Math.max(1, tile.t1 - tile.t0);
+    const weights = weightsFor(tile.stage);
     const curLevel = tile.level;
-    const nextLevel = curLevel >= 5 ? 1 : curLevel + 1;
+    if (curLevel >= weights.length) {
+      tile.nextHint = `Already at max detail (level ${curLevel}/5) — use ↺ Reset to zoom back out`;
+      continue;
+    }
+    const nextLevel = curLevel + 1;
     const pxAt = (lvl) => {
-      const w = dur * LEVEL_WEIGHTS[lvl - 1];
+      const w = dur * weights[lvl - 1];
       return Math.max(1, (w / (otherWeight(tile) + w)) * plotW);
     };
     const curStep = stepFor(dur, pxAt(curLevel));
     const nextStep = stepFor(dur, pxAt(nextLevel));
-    tile.nextHint = `Click: ~${fmtStepSize(curStep)} → ~${fmtStepSize(nextStep)} intervals (level ${curLevel}/5 → ${nextLevel}/5)`;
+    tile.nextHint = `Click: zoom in ~${fmtStepSize(curStep)} → ~${fmtStepSize(nextStep)} intervals (level ${curLevel}/5 → ${nextLevel}/5)`;
   }
   // Floor: any tile longer than a minute stays at least 16px wide (clickable,
   // visible); take the excess proportionally from the bigger tiles.
@@ -435,7 +446,7 @@ export function svgTimelineExplorer({
     .map((tk) => `<text x="${tk.x}" y="${height - 5}" text-anchor="middle" style="font:10.5px var(--mono);fill:var(--faint);">${esc(fmtTick(tk.ts))}</text>`)
     .join("");
 
-  // ---- State strip (clickable: expand <-> compress a part) ----------------
+  // ---- State strip (clickable: zoom in one step per click) ----------------
   // Every piece is drawn, including data GAPS (stage null) -- the strip must
   // never have a blank/empty stretch, since that reads as "unknown" rather
   // than "the car reported nothing here". Gaps get a distinct hollow/dashed
@@ -455,7 +466,7 @@ export function svgTimelineExplorer({
       if (p.stage == null) {
         return `<rect x="${p.x0.toFixed(1)}" y="${stripY}" width="${w.toFixed(1)}" height="${stripH}" rx="2" style="fill:none;stroke:var(--faint);stroke-width:1;stroke-dasharray:3 2;opacity:0.5;"><title>${esc(stripLabel(p))}</title></rect>`;
       }
-      const title = `${stripLabel(p)} — ${p.nextHint || "click to change detail"}`;
+      const title = `${stripLabel(p)} — ${p.nextHint || "click to zoom in"}`;
       return `<rect x="${p.x0.toFixed(1)}" y="${stripY}" width="${w.toFixed(1)}" height="${stripH}" rx="2" data-action="explorer-seg" data-seg="${p.segStart}" data-level="${p.level}" style="fill:${stageColor[p.stage] || "var(--faint)"};cursor:pointer;${p.zoomed ? "stroke:var(--text);stroke-width:1;" : ""}"><title>${esc(title)}</title></rect>`;
     })
     .join("");
