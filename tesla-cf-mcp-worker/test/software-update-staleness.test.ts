@@ -87,7 +87,7 @@ describe("software-update timeline staleness", () => {
     expect(await latestTimelineState(env)).toBe("updating");
   });
 
-  it("charging still wins over a fresh 'updating' signal", async () => {
+  it("a fresh 'updating' signal wins over charging (Tesla installs while plugged in)", async () => {
     const env = makeEnv();
     await ensureSchema(env);
     const t = 1_750_000_000;
@@ -95,6 +95,47 @@ describe("software-update timeline staleness", () => {
       vin: VIN, gear: "P", speed: 0, charging_state: "Charging",
       software_update_pct: 1, software_update_pct_ts: t,
     } as LatestState);
+    expect(await latestTimelineState(env)).toBe("updating");
+  });
+
+  it("charging still wins once the update signal has gone stale", async () => {
+    const env = makeEnv();
+    await ensureSchema(env);
+    const t = 1_750_000_000;
+    const staleTs = t - 91 * 60;
+    await applyDerivation(env, VIN, t, null, {
+      vin: VIN, gear: "P", speed: 0, charging_state: "Charging",
+      software_update_pct: 1, software_update_pct_ts: staleTs,
+    } as LatestState);
     expect(await latestTimelineState(env)).toBe("charging");
+  });
+
+  it("regression: a brief mid-install charging blip no longer fragments one long update into several timeline entries (observed live 2026-07-12: a real ~10h install split into 4 separate 'updating' runs around 17-60s 'charging' splinters)", async () => {
+    const env = makeEnv();
+    await ensureSchema(env);
+    const t = 1_750_000_000;
+    let previous: LatestState | null = null;
+    // Each entry is a PATCH (only the fields that changed), merged onto the
+    // running state the same way mergeLatest does -- so the brief charging
+    // blip's own row carries the PRIOR (still-fresh) software_update_pct
+    // forward, exactly like a real field-level telemetry stream would.
+    const patches: Array<[number, Partial<LatestState>]> = [
+      [0, { gear: "P", speed: 0, charging_state: "Disconnected", software_update_pct: 1, software_update_pct_ts: t }],
+      [4 * 3600, { software_update_pct: 40, software_update_pct_ts: t + 4 * 3600 }],
+      [4 * 3600 + 48, { charging_state: "Charging" }], // the ~48s blip
+      [4 * 3600 + 66, { charging_state: "Disconnected", software_update_pct: 55, software_update_pct_ts: t + 4 * 3600 + 66 }],
+      [9 * 3600, { software_update_pct: 90, software_update_pct_ts: t + 9 * 3600 }],
+    ];
+    for (const [offset, patch] of patches) {
+      const ts = t + offset;
+      const current = { ...(previous ?? {}), ...patch, vin: VIN, updated_at: ts } as LatestState;
+      await applyDerivation(env, VIN, ts, previous, current);
+      previous = current;
+    }
+    const rows = await env.DB.prepare(
+      `SELECT state FROM vehicle_states WHERE vin = ?1 ORDER BY start_ts ASC`,
+    ).bind(VIN).all<{ state: string }>();
+    const states = (rows.results ?? []).map((r) => r.state);
+    expect(states).toEqual(["updating"]); // one continuous run, not fragmented by the blip
   });
 });

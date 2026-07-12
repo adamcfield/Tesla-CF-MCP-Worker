@@ -112,11 +112,19 @@ const UPDATE_STALE_S = 90 * 60;
 /** Maps activity (plus a possible software update) to a state-timeline label. */
 function timelineState(s: LatestState, activity: Activity, ts: number): string {
   if (activity === "driving") return "driving";
-  if (activity === "charging") return "charging";
+  // Checked BEFORE "charging": Tesla installs updates while plugged in, and a
+  // multi-hour install can have the charger briefly top up (or just report a
+  // flickery few-second "Charging" blip) partway through. If charging won,
+  // that single blip split one real ~10h update into several fragmented
+  // "Software update" timeline/activity entries with tiny charging splinters
+  // between them (observed live 2026-07-12: one continuous install fragmented
+  // into 4 separate "updating" runs). An active fresh install is the more
+  // salient state to show regardless of a momentary charge reading.
   const pct = num(s.software_update_pct);
   const seenTs = num(s.software_update_pct_ts);
   const fresh = seenTs !== null && ts - seenTs < UPDATE_STALE_S;
   if (pct !== null && pct > 0 && pct < 100 && fresh) return "updating";
+  if (activity === "charging") return "charging";
   return "online";
 }
 
