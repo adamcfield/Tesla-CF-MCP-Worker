@@ -82,6 +82,27 @@ describe("activity-aware downsampling", () => {
     expect(out.series.speed.length).toBeGreaterThan(1500);
   });
 
+  it("anchors the window at `end` (stock-chart pan) instead of always at now", async () => {
+    const env = makeEnv();
+    await ensureSchema(env);
+    const t0 = NOW - 3600 * 10;
+    // Three hourly clusters: only the middle one falls inside a 1h window
+    // ending 8h ago.
+    await insertPos(env, t0, "idle", { soc: 40 });
+    await insertPos(env, t0 + 3600 * 1.5, "idle", { soc: 50 });
+    await insertPos(env, t0 + 3600 * 5, "idle", { soc: 60 });
+    const end = t0 + 3600 * 2;
+    const out = (await getTimelineChart(env, VIN, 1, ["soc"], end)) as {
+      series: Record<string, [number, number][]>;
+      window: { start_ts: number; end_ts: number; live: boolean };
+    };
+    expect(out.window).toEqual({ start_ts: end - 3600, end_ts: end, live: false });
+    expect(out.series.soc.map(([, v]) => v)).toEqual([50]); // only the in-window cluster
+    // No end -> live window ending now.
+    const live = (await getTimelineChart(env, VIN, 1, ["soc"])) as { window: { live: boolean } };
+    expect(live.window.live).toBe(true);
+  });
+
   it("rejects unknown junk fields instead of interpolating them into SQL", async () => {
     const env = makeEnv();
     await ensureSchema(env);

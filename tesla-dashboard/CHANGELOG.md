@@ -9,6 +9,25 @@ feature or screen, the **patch** version for fixes/tweaks/copy changes, and the
 configured. See `CLAUDE.md` at the repo root for the policy on keeping this file
 and `APP_VERSION` (in `app.js`) in sync.
 
+## 1.16.1 — 2026-07-12
+
+Chart explorer: a real stock-chart **time window** — asked as "I want to
+be able to select the duration of the chart - like a stock chart there
+is a time window".
+
+- **Drag to zoom**: drag any region of the chart and it becomes the new
+  window (exact, not snapped to presets — a "42 min zoom" chip shows when
+  you're off-preset). Never narrower than 2 minutes.
+- **Pan**: ← → buttons step one window back/forward through history;
+  panning into the future re-anchors to live. Double-click the chart to
+  jump back to now. A `start → end` window label always shows what you're
+  looking at; the duration presets keep the window's right edge when
+  switched (stock-chart behavior).
+- Backend: `/data/timeline-chart` takes an optional `end` anchor (unix
+  seconds; default = now) — every series, stage segment and marker query
+  is bounded to `[end − hours, end]`, and the response reports the
+  resolved `window {start_ts, end_ts, live}`.
+
 ## 1.16.0 — 2026-07-12
 
 New **Chart explorer** screen (Data section) — asked as "a timeline chart

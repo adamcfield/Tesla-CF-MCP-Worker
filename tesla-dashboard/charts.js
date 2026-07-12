@@ -264,7 +264,10 @@ export function svgTimelineExplorer({
     series: drawable.map((s) => ({ name: s.name, unit: s.unit, color: s.color, points: s.points })),
     segments, stageColor, stageLabel, markers, markerColor,
   });
-  return `<svg viewBox="0 0 ${width} ${height}" class="tm-svg-block" data-tmchart="${chartId}">${grid}${strip}${seriesMarkup}${markerMarkup}${xLabels}</svg>`;
+  // data-x0/x1/left/right/w expose the time scale so the caller can implement
+  // stock-chart drag-to-zoom (mapping pixels back to timestamps) without
+  // reaching into the chart registry.
+  return `<svg viewBox="0 0 ${width} ${height}" class="tm-svg-block" data-tmchart="${chartId}" data-x0="${X0}" data-x1="${X1}" data-left="${l}" data-right="${width - r}" data-w="${width}">${grid}${strip}${seriesMarkup}${markerMarkup}${xLabels}</svg>`;
 }
 
 /**

@@ -5,7 +5,7 @@ import { destroyMaps, renderPointMap, renderRouteMap, renderLifetimeMap, createR
 // Bump on every change to this dashboard (UI, features, or the /data/*
 // endpoints it depends on) and add a matching entry to CHANGELOG.md — see
 // the versioning policy in the repo's CLAUDE.md. Shown in the sidebar footer.
-const APP_VERSION = "1.16.0";
+const APP_VERSION = "1.16.1";
 
 const root = document.getElementById("app");
 let shellBound = false; // guards one-time attach of the root click handler + sync timer
@@ -211,7 +211,8 @@ const state = {
   batteryTimelineRange: TIMELINE_RANGES_DEFAULT, // index into TIMELINE_RANGES (Battery timeline screen)
   ovChargeRange: TIMELINE_RANGES_DEFAULT, // index into TIMELINE_RANGES (Overview's Charge level card)
   ovClimateRange: TIMELINE_RANGES_DEFAULT, // index into TIMELINE_RANGES (Overview's Cabin climate card)
-  explorerRange: TIMELINE_RANGES_DEFAULT, // index into TIMELINE_RANGES (Chart explorer screen)
+  explorerHours: 24, // Chart explorer window DURATION in hours (chips set presets, drag-zoom sets exact values)
+  explorerEnd: null, // Chart explorer window END anchor (unix s) — null = live "now" (stock-chart pan/zoom)
   explorerFields: ["speed", "soc", "inside_temp", "outside_temp"], // Chart explorer: overlaid signals
   tfCat: "__all", // Telemetry-fields screen: active category chip
   tfQuery: "", // Telemetry-fields screen: search text
@@ -603,7 +604,17 @@ function onRootClick(e) {
     state.ovClimateRange = Number(t.dataset.range);
     renderOverview();
   } else if (action === "explorer-range") {
-    state.explorerRange = Number(t.dataset.range);
+    // Duration change keeps the window's right edge (stock-chart behavior).
+    state.explorerHours = Number(t.dataset.hours);
+    renderExplorer();
+  } else if (action === "explorer-pan") {
+    const dir = Number(t.dataset.dir); // -1 back, +1 forward
+    const now = Math.floor(Date.now() / 1000);
+    const end = (state.explorerEnd ?? now) + dir * state.explorerHours * 3600;
+    state.explorerEnd = end >= now ? null : end; // panning to/past the present re-anchors live
+    renderExplorer();
+  } else if (action === "explorer-live") {
+    state.explorerEnd = null;
     renderExplorer();
   } else if (action === "explorer-field") {
     const f = t.dataset.field;
@@ -3461,16 +3472,33 @@ const MARKER_META = {
   alert: ["Warning", "#E9C46A"],
 };
 
-async function renderExplorer() {
-  const hours = TIMELINE_RANGES[state.explorerRange][1];
-  const fields = state.explorerFields;
-  const key = `explorer:${hours}:${[...fields].sort().join(",")}`;
-  const tl = await safe(cached(key, () => data.timelineChart(vin(), hours, fields)), null);
+/** Compact "Jul 12 14:05" for the explorer's window label. */
+function fmtWindowTs(ts) {
+  return new Date(ts * 1000).toLocaleString(undefined, { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit", hour12: false });
+}
 
-  const rangeChips = `<div class="tm-flex-row" style="gap:8px;flex-wrap:wrap;">
-    ${TIMELINE_RANGES.map(([label], i) => `
-      <button type="button" class="tm-chip-btn ${state.explorerRange === i ? "active" : ""}" data-action="explorer-range" data-range="${i}">${esc(label)}</button>
+async function renderExplorer() {
+  const hours = state.explorerHours;
+  const end = state.explorerEnd;
+  const fields = state.explorerFields;
+  const key = `explorer:${hours}:${end ?? "live"}:${[...fields].sort().join(",")}`;
+  const tl = await safe(cached(key, () => data.timelineChart(vin(), hours, fields, end)), null);
+
+  const isPreset = (h) => Math.abs(h - hours) < 1e-9;
+  const win = tl?.window;
+  const windowLabel = win
+    ? `${fmtWindowTs(win.start_ts)} → ${win.live ? "now" : fmtWindowTs(win.end_ts)}`
+    : "";
+  const rangeChips = `<div class="tm-flex-row" style="gap:8px;flex-wrap:wrap;align-items:center;">
+    ${TIMELINE_RANGES.map(([label, h]) => `
+      <button type="button" class="tm-chip-btn ${isPreset(h) ? "active" : ""}" data-action="explorer-range" data-hours="${h}">${esc(label)}</button>
     `).join("")}
+    ${!TIMELINE_RANGES.some(([, h]) => isPreset(h)) ? `<span class="tm-chip-btn active" style="cursor:default;">${esc(fmtDurationMin(hours * 60))} zoom</span>` : ""}
+    <span style="flex:1;"></span>
+    <button type="button" class="tm-chip-btn" data-action="explorer-pan" data-dir="-1" title="Pan one window back">←</button>
+    <span class="tm-mono" style="font-size:12px;color:var(--sub);white-space:nowrap;">${esc(windowLabel)}</span>
+    <button type="button" class="tm-chip-btn" data-action="explorer-pan" data-dir="1" title="Pan one window forward" ${!end ? "disabled style='opacity:0.4;'" : ""}>→</button>
+    ${end ? `<button type="button" class="tm-chip-btn" data-action="explorer-live" title="Back to now">⦿ Live</button>` : ""}
   </div>`;
   const fieldChips = `<div class="tm-flex-row" style="gap:8px;flex-wrap:wrap;margin-top:10px;">
     ${EXPLORER_FIELDS.map(([f, label, , color]) => `
@@ -3498,15 +3526,18 @@ async function renderExplorer() {
     <div class="tm-card tm-card-pad" style="margin-top:14px;">
       <div class="tm-card-head">
         <div class="tm-card-head-title">Signals over time</div>
-        <div class="tm-card-head-sub">${esc(TIMELINE_RANGES[state.explorerRange][0])} · each signal scaled to its own band — hover for real values, events & car state</div>
+        <div class="tm-card-head-sub">${esc(windowLabel)} · drag across the chart to zoom in, ← → to pan · hover for real values, events & car state</div>
       </div>
-      ${svgTimelineExplorer({
-        series: seriesDefs,
-        segments: tl.segments || [],
-        markers: tl.markers || [],
-        stageColor: STAGE_COLOR, stageLabel: STAGE_LABEL, markerColor,
-        xTicks: allPts.length ? buildDayTicks(allPts.sort((a, b) => a[0] - b[0])) : [],
-      })}
+      <div id="tm-explorer-chart" style="position:relative;">
+        ${svgTimelineExplorer({
+          series: seriesDefs,
+          segments: tl.segments || [],
+          markers: tl.markers || [],
+          stageColor: STAGE_COLOR, stageLabel: STAGE_LABEL, markerColor,
+          xTicks: allPts.length ? buildDayTicks(allPts.sort((a, b) => a[0] - b[0])) : [],
+        })}
+        <div id="tm-explorer-sel" style="position:absolute;top:0;bottom:0;display:none;background:color-mix(in oklab, var(--accent) 14%, transparent);border-left:1px solid var(--accent);border-right:1px solid var(--accent);pointer-events:none;"></div>
+      </div>
       <div class="tm-flex-row" style="gap:16px;flex-wrap:wrap;margin-top:10px;">
         ${seriesDefs.map((s) => `
           <span style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--sub);">
@@ -3521,6 +3552,61 @@ async function renderExplorer() {
       <div class="tm-foot-note">Resolution adapts to what the car was doing: driving keeps up to ~4× more points than idle/charging (this window: ${fmt0(tl.resolution?.kept ?? 0)} of ${fmt0(tl.resolution?.rows ?? 0)} samples kept${tl.resolution?.stride_driving > 1 ? `, driving thinned ×${tl.resolution.stride_driving}` : ", driving at full resolution"}).${overflowNote ? " " + esc(overflowNote) + "." : ""}</div>
     </div>
   `);
+
+  bindExplorerZoom();
+}
+
+/**
+ * Stock-chart drag-to-zoom: drag a region on the explorer chart to make it the
+ * new window. Pixel→timestamp mapping comes from the data-x0/x1/left/right/w
+ * attributes svgTimelineExplorer stamps on its SVG.
+ */
+function bindExplorerZoom() {
+  const wrap = document.getElementById("tm-explorer-chart");
+  const svg = wrap?.querySelector("svg[data-tmchart]");
+  const sel = document.getElementById("tm-explorer-sel");
+  if (!wrap || !svg || !sel) return;
+  const toTs = (clientX) => {
+    const rect = svg.getBoundingClientRect();
+    const svgX = ((clientX - rect.left) / rect.width) * Number(svg.dataset.w);
+    const frac = Math.max(0, Math.min(1, (svgX - Number(svg.dataset.left)) / (Number(svg.dataset.right) - Number(svg.dataset.left))));
+    return Number(svg.dataset.x0) + frac * (Number(svg.dataset.x1) - Number(svg.dataset.x0));
+  };
+  let dragStartX = null;
+  wrap.addEventListener("mousedown", (e) => {
+    if (e.button !== 0) return;
+    dragStartX = e.clientX;
+    e.preventDefault(); // no text selection while dragging
+  });
+  wrap.addEventListener("mousemove", (e) => {
+    if (dragStartX == null) return;
+    const rect = wrap.getBoundingClientRect();
+    const a = Math.min(dragStartX, e.clientX) - rect.left;
+    const b = Math.max(dragStartX, e.clientX) - rect.left;
+    sel.style.display = "block";
+    sel.style.left = `${a}px`;
+    sel.style.width = `${b - a}px`;
+  });
+  const finish = (e) => {
+    if (dragStartX == null) return;
+    const startX = dragStartX;
+    dragStartX = null;
+    sel.style.display = "none";
+    if (Math.abs(e.clientX - startX) < 12) return; // a click, not a drag
+    const t0 = toTs(Math.min(startX, e.clientX));
+    const t1 = toTs(Math.max(startX, e.clientX));
+    if (!(t1 > t0)) return;
+    state.explorerHours = Math.max(120, t1 - t0) / 3600; // never below a 2-min window
+    state.explorerEnd = Math.round(t1);
+    renderExplorer();
+  };
+  wrap.addEventListener("mouseup", finish);
+  wrap.addEventListener("mouseleave", (e) => { if (dragStartX != null) finish(e); });
+  // Double-click: jump back to the live default without touching the duration.
+  wrap.addEventListener("dblclick", () => {
+    state.explorerEnd = null;
+    renderExplorer();
+  });
 }
 
 // ---------------------------------------------------------------------------

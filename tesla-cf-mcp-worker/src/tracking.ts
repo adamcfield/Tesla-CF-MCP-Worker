@@ -1392,9 +1392,14 @@ export async function getTimelineChart(
   vin: string,
   hours = 24,
   fields: string[] = ["speed", "soc", "inside_temp", "outside_temp"],
+  endTs?: number,
 ): Promise<unknown> {
   await ensureSchema(env);
-  const since = Math.floor(Date.now() / 1000) - Math.round(hours * 3600);
+  // Stock-chart-style windowing: the window ENDS at `endTs` (default: now),
+  // so the dashboard can pan back through history and drag-zoom into a
+  // region instead of always being anchored to the present.
+  const end = endTs && Number.isFinite(endTs) ? Math.round(endTs) : Math.floor(Date.now() / 1000);
+  const since = end - Math.round(hours * 3600);
 
   // Requested fields split by storage: positions columns are validated against
   // the POSITION_COLUMNS whitelist (they are interpolated into SQL), EAV field
@@ -1405,9 +1410,9 @@ export async function getTimelineChart(
 
   const cols = [...new Set(["activity", "charging_state", "lon_accel", ...posFields])];
   const rs = await env.DB.prepare(
-    `SELECT ts, ${cols.join(", ")} FROM positions WHERE vin = ?1 AND ts >= ?2 ORDER BY ts ASC`,
+    `SELECT ts, ${cols.join(", ")} FROM positions WHERE vin = ?1 AND ts >= ?2 AND ts <= ?3 ORDER BY ts ASC`,
   )
-    .bind(vin, since)
+    .bind(vin, since, end)
     .all<Record<string, unknown> & { ts: number; activity: string | null; charging_state: string | null; lon_accel: number | null }>();
   const rows = rs.results ?? [];
 
@@ -1450,9 +1455,9 @@ export async function getTimelineChart(
   for (const f of eavFields) {
     const ev = await env.DB.prepare(
       `SELECT ts, value_num FROM telemetry_events
-       WHERE vin = ?1 AND field = ?2 AND ts >= ?3 AND value_num IS NOT NULL ORDER BY ts ASC LIMIT 5000`,
+       WHERE vin = ?1 AND field = ?2 AND ts >= ?3 AND ts <= ?4 AND value_num IS NOT NULL ORDER BY ts ASC LIMIT 5000`,
     )
-      .bind(vin, f, since)
+      .bind(vin, f, since, end)
       .all<{ ts: number; value_num: number }>();
     const evRows = ev.results ?? [];
     const step = Math.max(1, Math.ceil(evRows.length / EXPLORER_OTHER_BUDGET));
@@ -1501,14 +1506,14 @@ export async function getTimelineChart(
   const [titles, artists] = await Promise.all([
     env.DB.prepare(
       `SELECT ts, value_text FROM telemetry_events
-       WHERE vin = ?1 AND field = 'media_title' AND ts >= ?2 AND value_text IS NOT NULL AND value_text != ''
+       WHERE vin = ?1 AND field = 'media_title' AND ts >= ?2 AND ts <= ?3 AND value_text IS NOT NULL AND value_text != ''
        ORDER BY ts ASC LIMIT 2000`,
-    ).bind(vin, since).all<{ ts: number; value_text: string }>(),
+    ).bind(vin, since, end).all<{ ts: number; value_text: string }>(),
     env.DB.prepare(
       `SELECT ts, value_text FROM telemetry_events
-       WHERE vin = ?1 AND field = 'media_artist' AND ts >= ?2 AND value_text IS NOT NULL AND value_text != ''
+       WHERE vin = ?1 AND field = 'media_artist' AND ts >= ?2 AND ts <= ?3 AND value_text IS NOT NULL AND value_text != ''
        ORDER BY ts ASC LIMIT 2000`,
-    ).bind(vin, since).all<{ ts: number; value_text: string }>(),
+    ).bind(vin, since, end).all<{ ts: number; value_text: string }>(),
   ]);
   const artistRows = artists.results ?? [];
   const artistNear = (ts: number): string | null => {
@@ -1530,9 +1535,9 @@ export async function getTimelineChart(
   // Warnings: everything the worker itself alerted on in the window (rule
   // fires, watchdogs, budget warnings — vin-specific or global).
   const al = await env.DB.prepare(
-    `SELECT ts, message FROM alert_log WHERE ts >= ?1 AND (vin = ?2 OR vin IS NULL) ORDER BY ts ASC LIMIT 200`,
+    `SELECT ts, message FROM alert_log WHERE ts >= ?1 AND ts <= ?2 AND (vin = ?3 OR vin IS NULL) ORDER BY ts ASC LIMIT 200`,
   )
-    .bind(since, vin)
+    .bind(since, end, vin)
     .all<{ ts: number; message: string }>();
   for (const a of al.results ?? []) markers.push({ ts: a.ts, kind: "alert", label: String(a.message ?? "").slice(0, 140) });
 
@@ -1551,6 +1556,7 @@ export async function getTimelineChart(
   return {
     vin,
     hours,
+    window: { start_ts: since, end_ts: end, live: endTs === undefined },
     fields: [...posFields, ...eavFields],
     series,
     segments,
