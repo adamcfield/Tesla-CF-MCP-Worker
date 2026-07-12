@@ -9,6 +9,23 @@ feature or screen, the **patch** version for fixes/tweaks/copy changes, and the
 configured. See `CLAUDE.md` at the repo root for the policy on keeping this file
 and `APP_VERSION` (in `app.js`) in sync.
 
+## 1.17.1 — 2026-07-12
+
+Fix: chart tooltip had no background — chart lines showed straight
+through the text, unreadable over a busy Chart-explorer overlay.
+
+- Root cause: every theme color (`--card`, `--text`, ...) is scoped to
+  `[data-tm-root]`; the tooltip is a permanent `document.body` child (so
+  it survives screen re-renders) living OUTSIDE that scope, so
+  `background: var(--card)` silently resolved to transparent.
+- Fix: the tooltip now carries `data-tm-root` + the live `data-theme`
+  on itself, re-synced on every hover, so it resolves the same
+  variables without needing to be nested inside the themed root (which
+  would risk it being wiped out by a full app-shell reset).
+- Verified live in both themes: computed background is now `rgb(255,255,255)`
+  (light) / `rgb(22,24,29)` (dark) — exact `--card` matches, was
+  `rgba(0,0,0,0)` before.
+
 ## 1.17.0 — 2026-07-12
 
 Chart explorer: the **smart axis** — asked as "this is an example of a not

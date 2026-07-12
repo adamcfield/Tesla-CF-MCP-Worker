@@ -42,8 +42,19 @@ function tip() {
     tipEl = document.createElement("div");
     tipEl.className = "tm-chart-tip";
     tipEl.style.display = "none";
+    // [data-tm-root] is where every theme color variable (--card, --text, ...)
+    // is scoped; this element lives outside that subtree (a permanent
+    // document.body child so it survives screen re-renders), so it needs the
+    // same attribute on ITSELF to resolve those variables — otherwise
+    // `background: var(--card)` falls back to transparent and chart lines
+    // show straight through the tooltip text.
+    tipEl.setAttribute("data-tm-root", "1");
     document.body.appendChild(tipEl);
   }
+  // Keep in sync with the live theme (it can toggle after the tooltip was
+  // first created, and the real root is the source of truth for it).
+  const liveTheme = document.querySelector("[data-tm-root]")?.getAttribute("data-theme");
+  if (liveTheme) tipEl.setAttribute("data-theme", liveTheme);
   return tipEl;
 }
 
