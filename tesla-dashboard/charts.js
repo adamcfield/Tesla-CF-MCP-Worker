@@ -124,12 +124,21 @@ document.addEventListener("mousemove", (ev) => {
     }
   }
 
-  // Nearby event markers (within ~1.5% of the window around the cursor).
+  // Event markers directly under the cursor — PIXEL proximity to where each
+  // marker dot is actually drawn, not time proximity. Time-based "nearby"
+  // breaks under the smart (warped) axis: 1.5% of a 24h window is ~20
+  // minutes, which on a stretched driving segment can span hundreds of
+  // pixels — several unrelated events would all show up on every hover.
   let markerRows = "";
   if (meta.markers?.length) {
-    const near = (meta.X1 - meta.X0) * 0.015;
+    const markerPx = (ts) => {
+      if (!meta.warpPieces?.length) return meta.left + ((ts - meta.X0) / ((meta.X1 - meta.X0) || 1)) * (meta.right - meta.left);
+      const p = meta.warpPieces.find((pc) => ts >= pc.t0 && ts <= pc.t1) || meta.warpPieces[meta.warpPieces.length - 1];
+      return p.x0 + ((ts - p.t0) / ((p.t1 - p.t0) || 1)) * (p.x1 - p.x0);
+    };
+    const NEAR_PX = 8; // ~the drawn marker circle's radius + a little hover slop
     markerRows = meta.markers
-      .filter((m) => Math.abs(m.ts - dataX) <= near)
+      .filter((m) => Math.abs(markerPx(m.ts) - svgX) <= NEAR_PX)
       .slice(0, 3)
       .map((m) => `<div class="tm-chart-tip-row"><span class="tm-chart-tip-dot" style="background:${meta.markerColor?.[m.kind] || "var(--warn)"};"></span>${esc(m.label)}</div>`)
       .join("");

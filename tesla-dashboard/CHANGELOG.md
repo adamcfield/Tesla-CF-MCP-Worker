@@ -9,6 +9,24 @@ feature or screen, the **patch** version for fixes/tweaks/copy changes, and the
 configured. See `CLAUDE.md` at the repo root for the policy on keeping this file
 and `APP_VERSION` (in `app.js`) in sync.
 
+## 1.17.3 — 2026-07-12
+
+Fix: the tooltip listed every harsh-brake/accel marker "nearby" in time,
+even ones the cursor wasn't anywhere near on screen — "shouldn't be in
+the tooltip unless directly hovering on them".
+
+- Root cause: marker inclusion was based on time-distance (within 1.5%
+  of the total window), which breaks under the smart (warped) axis — on
+  a stretched driving segment, 1.5% of a 24h window can span hundreds
+  of pixels, so several unrelated events all showed up on every hover.
+- Fix: markers now only appear when the cursor is within ~8px of where
+  the marker dot is actually DRAWN (same piecewise warp mapping the
+  chart itself uses), not a fraction of the time window.
+- Verified live: hovering exactly on a marker cluster shows its
+  events; moving 60px away (a different, correctly-updated data point)
+  now shows zero marker rows, where before it kept repeating the same
+  three regardless of cursor position.
+
 ## 1.17.2 — 2026-07-12
 
 Fix (regression from 1.17.1): the tooltip fix caused a full-screen black
