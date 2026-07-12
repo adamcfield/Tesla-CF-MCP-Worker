@@ -6,7 +6,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { scoreDrive } from "../src/scoring";
 import { ensureSchema, resetSchemaCacheForTests } from "../src/store";
-import { applyDerivation } from "../src/tracking";
+import { applyDerivation, deriveActivity } from "../src/tracking";
 import { backfillSyntheticDrives, closeStaleSessions, getEfficiencyByTemp, getMonthlyReport } from "../src/tracking";
 import type { LatestState } from "../src/store";
 import { FakeD1 } from "./helpers/d1";
@@ -48,6 +48,22 @@ async function insertDrive(
     .bind(VIN, o.start_ts, o.start_ts + 1800, o.distance_km, o.efficiency_wh_km, o.outside_temp_avg, o.energy ?? 5)
     .run();
 }
+
+describe("deriveActivity", () => {
+  it("classifies moving-but-stale-gear as driving (regression: a real 4+ min, 60-90 km/h drive was misclassified 'idle' for its whole duration because Gear/ShiftState streams independently of VehicleSpeed and can stay stuck at a pre-drive 'P' for the entire trip)", () => {
+    expect(deriveActivity({ vin: VIN, updated_at: 0, gear: "P", speed: 83 } as LatestState)).toBe("driving");
+    expect(deriveActivity({ vin: VIN, updated_at: 0, gear: "P", speed: 14 } as LatestState)).toBe("driving");
+  });
+
+  it("still prefers gear D/R when both are fresh", () => {
+    expect(deriveActivity({ vin: VIN, updated_at: 0, gear: "D", speed: 0 } as LatestState)).toBe("driving");
+  });
+
+  it("classifies a genuinely parked, stationary car as idle or charging (not driving)", () => {
+    expect(deriveActivity({ vin: VIN, updated_at: 0, gear: "P", speed: 0 } as LatestState)).toBe("idle");
+    expect(deriveActivity({ vin: VIN, updated_at: 0, gear: "P", speed: 0, charging_state: "Charging" } as LatestState)).toBe("charging");
+  });
+});
 
 describe("efficiency by temperature", () => {
   let env: Env;
