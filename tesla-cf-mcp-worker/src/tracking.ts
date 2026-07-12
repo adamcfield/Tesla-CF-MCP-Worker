@@ -505,11 +505,24 @@ async function updateStateTimeline(
     const endTs = Math.max(ts, open.start_ts);
     await env.DB.prepare(`UPDATE vehicle_states SET end_ts = ?2 WHERE id = ?1`).bind(open.id, endTs).run();
   }
-  await env.DB.prepare(
-    `INSERT INTO vehicle_states (vin, state, start_ts, source) VALUES (?1,?2,?3,?4)`,
-  )
-    .bind(vin, state, ts, source)
-    .run();
+  try {
+    await env.DB.prepare(
+      `INSERT INTO vehicle_states (vin, state, start_ts, source) VALUES (?1,?2,?3,?4)`,
+    )
+      .bind(vin, state, ts, source)
+      .run();
+  } catch (e) {
+    // idx_vehicle_states_one_open fired: a concurrent invocation (cron
+    // connectivity check vs telemetry ingest) already opened a row for this
+    // vin between our read above and this insert. That row already records
+    // the state change (or a near-simultaneous one); inserting our own would
+    // create a second open row that getOpenState's ORDER BY start_ts DESC
+    // could permanently lose track of -- the exact mechanism behind a real
+    // ~70h phantom "driving" entry (observed live 2026-07-08). Nothing to do:
+    // defer to whichever row won the race.
+    const stillOpen = await getOpenState(env, vin);
+    if (!stillOpen) throw e;
+  }
 }
 
 /**
