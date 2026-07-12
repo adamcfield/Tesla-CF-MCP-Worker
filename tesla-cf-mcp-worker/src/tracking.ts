@@ -27,6 +27,7 @@ import {
   insertPosition,
   LatestState,
   num,
+  POSITION_COLUMNS,
   PositionSample,
   tzOffsetMinutes,
 } from "./store";
@@ -1353,6 +1354,215 @@ export async function getBatteryTimeline(env: Env, vin: string, hours = 24): Pro
       resting: round((stageSeconds.resting ?? 0) / 3600, 2),
       connected: round((stageSeconds.connected ?? 0) / 3600, 2),
     },
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Chart explorer — multi-signal overlay timeline
+// ---------------------------------------------------------------------------
+
+/**
+ * Point budgets for the explorer's activity-aware downsampling: driving keeps
+ * ~4x the resolution of everything else, because that's where per-second
+ * signals (speed, IMU, pedals) actually carry information — an hour of
+ * charging or sleeping is happy with a handful of points.
+ */
+const EXPLORER_DRIVING_BUDGET = 2400;
+const EXPLORER_OTHER_BUDGET = 600;
+const EXPLORER_MAX_FIELDS = 8;
+/** Harsh-event marker thresholds — the same ~0.25-0.3 g industry lines scoring.ts uses. */
+const MARKER_ACCEL = 2.5; // m/s²
+const MARKER_BRAKE = 3.0; // m/s²
+/** One physical maneuver spans several 1 Hz samples — merge qualifying samples
+ * within this gap into ONE marker at the peak (the drive-audit lesson about
+ * per-sample counting inflating events). */
+const MARKER_DEBOUNCE_S = 8;
+/** Per-kind marker caps so a marker-storm can't bloat the payload; the counts
+ * of what was dropped are reported in `marker_overflow`. */
+const MARKER_CAPS: Record<string, number> = { harsh_brake: 120, harsh_accel: 120, music: 150, alert: 100 };
+
+/**
+ * Everything the Chart explorer screen needs in one call: any mix of signals
+ * (positions columns full-fidelity where it matters + EAV fields), the
+ * driving/charging/connected/resting stage layer, and event markers (harsh
+ * brake/accel, track changes, alerts) — over one shared time window.
+ */
+export async function getTimelineChart(
+  env: Env,
+  vin: string,
+  hours = 24,
+  fields: string[] = ["speed", "soc", "inside_temp", "outside_temp"],
+): Promise<unknown> {
+  await ensureSchema(env);
+  const since = Math.floor(Date.now() / 1000) - Math.round(hours * 3600);
+
+  // Requested fields split by storage: positions columns are validated against
+  // the POSITION_COLUMNS whitelist (they are interpolated into SQL), EAV field
+  // names are only ever bound as parameters (shape-checked to keep junk out).
+  const wanted = [...new Set(fields)].slice(0, EXPLORER_MAX_FIELDS);
+  const posFields = wanted.filter((f) => POSITION_COLUMNS.has(f));
+  const eavFields = wanted.filter((f) => !POSITION_COLUMNS.has(f) && /^[a-z0-9_]{1,64}$/.test(f));
+
+  const cols = [...new Set(["activity", "charging_state", "lon_accel", ...posFields])];
+  const rs = await env.DB.prepare(
+    `SELECT ts, ${cols.join(", ")} FROM positions WHERE vin = ?1 AND ts >= ?2 ORDER BY ts ASC`,
+  )
+    .bind(vin, since)
+    .all<Record<string, unknown> & { ts: number; activity: string | null; charging_state: string | null; lon_accel: number | null }>();
+  const rows = rs.results ?? [];
+
+  // Stage layer — same derivation as the Battery timeline screen.
+  const segments: { stage: string; start_ts: number; end_ts: number }[] = [];
+  const stageSeconds: Record<string, number> = { driving: 0, charging: 0, resting: 0, connected: 0 };
+  for (const r of rows) {
+    const stage = batteryStage(r.activity, r.charging_state);
+    const last = segments[segments.length - 1];
+    if (last && last.stage === stage) last.end_ts = r.ts;
+    else segments.push({ stage, start_ts: r.ts, end_ts: r.ts });
+  }
+  for (const seg of segments) stageSeconds[seg.stage] = (stageSeconds[seg.stage] ?? 0) + (seg.end_ts - seg.start_ts);
+
+  // Activity-aware downsampling: independent strides for driving vs everything
+  // else, plus every activity-boundary row so stage edges stay sharp.
+  const nDriving = rows.reduce((n, r) => n + (r.activity === "driving" ? 1 : 0), 0);
+  const strideDriving = Math.max(1, Math.ceil(nDriving / EXPLORER_DRIVING_BUDGET));
+  const strideOther = Math.max(1, Math.ceil((rows.length - nDriving) / EXPLORER_OTHER_BUDGET));
+  const sampled: typeof rows = [];
+  let iDriving = 0;
+  let iOther = 0;
+  for (let i = 0; i < rows.length; i++) {
+    const r = rows[i];
+    if (!r) continue;
+    const driving = r.activity === "driving";
+    const boundary = i === 0 || i === rows.length - 1 || (rows[i - 1]?.activity === "driving") !== driving;
+    const keep = boundary || (driving ? iDriving % strideDriving === 0 : iOther % strideOther === 0);
+    if (driving) iDriving++;
+    else iOther++;
+    if (keep) sampled.push(r);
+  }
+
+  const series: Record<string, [number, number][]> = {};
+  for (const f of posFields) {
+    series[f] = sampled
+      .filter((r) => typeof (r as Record<string, unknown>)[f] === "number" && Number.isFinite((r as Record<string, unknown>)[f] as number))
+      .map((r) => [r.ts, round((r as Record<string, unknown>)[f] as number, 2)] as [number, number]);
+  }
+  for (const f of eavFields) {
+    const ev = await env.DB.prepare(
+      `SELECT ts, value_num FROM telemetry_events
+       WHERE vin = ?1 AND field = ?2 AND ts >= ?3 AND value_num IS NOT NULL ORDER BY ts ASC LIMIT 5000`,
+    )
+      .bind(vin, f, since)
+      .all<{ ts: number; value_num: number }>();
+    const evRows = ev.results ?? [];
+    const step = Math.max(1, Math.ceil(evRows.length / EXPLORER_OTHER_BUDGET));
+    series[f] = evRows
+      .filter((_, i) => i % step === 0 || i === evRows.length - 1)
+      .map((r) => [r.ts, round(r.value_num, 2)] as [number, number]);
+  }
+
+  // Markers -------------------------------------------------------------------
+  const markers: { ts: number; kind: string; label: string }[] = [];
+
+  // Harsh accel/brake from the FULL-resolution IMU stream (never the sampled
+  // one — downsampling must not eat safety events), debounced to peaks.
+  let run: { kind: string; peakTs: number; peak: number; lastTs: number } | null = null;
+  const flushRun = () => {
+    if (!run) return;
+    const g = run.peak / 9.81;
+    markers.push({
+      ts: run.peakTs,
+      kind: run.kind,
+      label: `${run.kind === "harsh_brake" ? "Hard brake" : "Hard acceleration"} ${g > 0 ? "+" : ""}${round(g, 2)} g`,
+    });
+    run = null;
+  };
+  for (const r of rows) {
+    const a = typeof r.lon_accel === "number" && Number.isFinite(r.lon_accel) ? r.lon_accel : null;
+    const kind = r.activity !== "driving" || a === null ? null
+      : a <= -MARKER_BRAKE ? "harsh_brake"
+      : a >= MARKER_ACCEL ? "harsh_accel"
+      : null;
+    if (run && (r.ts - run.lastTs > MARKER_DEBOUNCE_S || (kind !== null && kind !== run.kind))) flushRun();
+    if (kind === null) continue;
+    if (!run) run = { kind, peakTs: r.ts, peak: a as number, lastTs: r.ts };
+    else {
+      run.lastTs = r.ts;
+      if (Math.abs(a as number) > Math.abs(run.peak)) {
+        run.peak = a as number;
+        run.peakTs = r.ts;
+      }
+    }
+  }
+  flushRun();
+
+  // Track changes: every NEW media_title (consecutive repeats collapsed), with
+  // the artist matched from its own event stream when one landed nearby.
+  const [titles, artists] = await Promise.all([
+    env.DB.prepare(
+      `SELECT ts, value_text FROM telemetry_events
+       WHERE vin = ?1 AND field = 'media_title' AND ts >= ?2 AND value_text IS NOT NULL AND value_text != ''
+       ORDER BY ts ASC LIMIT 2000`,
+    ).bind(vin, since).all<{ ts: number; value_text: string }>(),
+    env.DB.prepare(
+      `SELECT ts, value_text FROM telemetry_events
+       WHERE vin = ?1 AND field = 'media_artist' AND ts >= ?2 AND value_text IS NOT NULL AND value_text != ''
+       ORDER BY ts ASC LIMIT 2000`,
+    ).bind(vin, since).all<{ ts: number; value_text: string }>(),
+  ]);
+  const artistRows = artists.results ?? [];
+  const artistNear = (ts: number): string | null => {
+    let best: { d: number; v: string } | null = null;
+    for (const a of artistRows) {
+      const d = Math.abs(a.ts - ts);
+      if (d <= 90 && (best === null || d < best.d)) best = { d, v: a.value_text };
+    }
+    return best?.v ?? null;
+  };
+  let prevTitle = "";
+  for (const t of titles.results ?? []) {
+    if (t.value_text === prevTitle) continue;
+    prevTitle = t.value_text;
+    const artist = artistNear(t.ts);
+    markers.push({ ts: t.ts, kind: "music", label: artist ? `${t.value_text} — ${artist}` : t.value_text });
+  }
+
+  // Warnings: everything the worker itself alerted on in the window (rule
+  // fires, watchdogs, budget warnings — vin-specific or global).
+  const al = await env.DB.prepare(
+    `SELECT ts, message FROM alert_log WHERE ts >= ?1 AND (vin = ?2 OR vin IS NULL) ORDER BY ts ASC LIMIT 200`,
+  )
+    .bind(since, vin)
+    .all<{ ts: number; message: string }>();
+  for (const a of al.results ?? []) markers.push({ ts: a.ts, kind: "alert", label: String(a.message ?? "").slice(0, 140) });
+
+  // Chronological + per-kind caps (report what was dropped — no silent truncation).
+  markers.sort((a, b) => a.ts - b.ts);
+  const counts: Record<string, number> = {};
+  const overflow: Record<string, number> = {};
+  const capped = markers.filter((m) => {
+    const n = (counts[m.kind] ?? 0) + 1;
+    counts[m.kind] = n;
+    if (n <= (MARKER_CAPS[m.kind] ?? 100)) return true;
+    overflow[m.kind] = (overflow[m.kind] ?? 0) + 1;
+    return false;
+  });
+
+  return {
+    vin,
+    hours,
+    fields: [...posFields, ...eavFields],
+    series,
+    segments,
+    stage_hours: {
+      driving: round((stageSeconds.driving ?? 0) / 3600, 2),
+      charging: round((stageSeconds.charging ?? 0) / 3600, 2),
+      resting: round((stageSeconds.resting ?? 0) / 3600, 2),
+      connected: round((stageSeconds.connected ?? 0) / 3600, 2),
+    },
+    markers: capped,
+    marker_overflow: overflow,
+    resolution: { rows: rows.length, kept: sampled.length, stride_driving: strideDriving, stride_other: strideOther },
   };
 }
 

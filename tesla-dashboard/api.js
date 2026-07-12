@@ -150,6 +150,7 @@ export const data = {
   vampire: (vin, days) => getJson("/data/vampire", { vin, days }),
   states: (vin, hours) => getJson("/data/states", { vin, hours }),
   batteryTimeline: (vin, hours) => getJson("/data/battery-timeline", { vin, hours }),
+  timelineChart: (vin, hours, fields) => getJson("/data/timeline-chart", { vin, hours, fields: fields.join(",") }),
   /** Live status per mapped Tesla telemetry field (canonical key, latest value, last-seen). New endpoint — may 404. */
   telemetryFields: (vin) => getJson("/data/telemetry-fields", { vin }),
   locations: () => getJson("/data/locations"),

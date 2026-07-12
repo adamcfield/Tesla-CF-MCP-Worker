@@ -85,13 +85,35 @@ document.addEventListener("mousemove", (ev) => {
     .filter((sr) => sr.points.length)
     .map((sr) => {
       const p = sr.points[nearestIdx(sr.points, dataX)];
-      return { name: sr.name, color: sr.color || "var(--accent)", x: p[0], y: p[1] };
+      return { name: sr.name, unit: sr.unit, color: sr.color || "var(--accent)", x: p[0], y: p[1] };
     });
   if (!lines.length) { t.style.display = "none"; return; }
 
-  t.innerHTML = `<div class="tm-chart-tip-x">${esc(fmtTipX(lines[0].x))}</div>` + lines
-    .map((l) => `<div class="tm-chart-tip-row"><span class="tm-chart-tip-dot" style="background:${l.color};"></span>${l.name ? esc(l.name) + ": " : ""}<strong>${esc(fmtTipY(l.y))}</strong></div>`)
-    .join("");
+  // Car-state row (Chart explorer): which stage segment the cursor is inside.
+  let stateRow = "";
+  if (meta.segments?.length) {
+    const seg = meta.segments.find((s) => dataX >= s.start_ts && dataX <= s.end_ts)
+      // between segments (sampling gap): fall back to the nearest one ending before the cursor
+      || [...meta.segments].reverse().find((s) => s.start_ts <= dataX);
+    if (seg) {
+      stateRow = `<div class="tm-chart-tip-row"><span class="tm-chart-tip-dot" style="background:${meta.stageColor?.[seg.stage] || "var(--faint)"};"></span><strong>${esc(meta.stageLabel?.[seg.stage] || seg.stage)}</strong></div>`;
+    }
+  }
+
+  // Nearby event markers (within ~1.5% of the window around the cursor).
+  let markerRows = "";
+  if (meta.markers?.length) {
+    const near = (meta.X1 - meta.X0) * 0.015;
+    markerRows = meta.markers
+      .filter((m) => Math.abs(m.ts - dataX) <= near)
+      .slice(0, 3)
+      .map((m) => `<div class="tm-chart-tip-row"><span class="tm-chart-tip-dot" style="background:${meta.markerColor?.[m.kind] || "var(--warn)"};"></span>${esc(m.label)}</div>`)
+      .join("");
+  }
+
+  t.innerHTML = `<div class="tm-chart-tip-x">${esc(fmtTipX(lines[0].x))}</div>` + stateRow + lines
+    .map((l) => `<div class="tm-chart-tip-row"><span class="tm-chart-tip-dot" style="background:${l.color};"></span>${l.name ? esc(l.name) + ": " : ""}<strong>${esc(fmtTipY(l.y))}${l.unit ? " " + esc(l.unit) : ""}</strong></div>`)
+    .join("") + markerRows;
   t.style.display = "block";
   // Keep the tooltip inside the viewport: flip to the left of the cursor near the right edge.
   const tw = t.offsetWidth || 120;
@@ -151,6 +173,98 @@ export function svgLineChart({ width = 760, height = 210, series, yTicks = [], x
     series: series.map((s) => ({ name: s.name, color: s.color, points: s.points })),
   });
   return `<svg viewBox="0 0 ${width} ${height}" class="tm-svg-block" data-tmchart="${chartId}">${grid}${xLabels}${seriesMarkup}</svg>`;
+}
+
+/**
+ * Chart-explorer overlay: N signals with WILDLY different scales (km/h, %, °C,
+ * kW…) drawn together by normalizing each to its own min-max band — the
+ * tooltip carries the real values + units, so the chart shows shape and the
+ * hover shows numbers. Adds an event-marker band on top (harsh brake/accel,
+ * track changes, warnings) and a car-state strip along the bottom
+ * (driving/charging/connected/resting), both of which also feed the tooltip.
+ *
+ * `series`: [{key, name, unit, color, dashed, points:[[ts,v],...]}]
+ * `segments`/`markers`: as returned by /data/timeline-chart.
+ * `stageColor`/`stageLabel`/`markerColor`: display maps owned by the caller.
+ */
+export function svgTimelineExplorer({
+  width = 760, height = 320,
+  series = [], segments = [], markers = [],
+  stageColor = {}, stageLabel = {}, markerColor = {},
+  xTicks = [], xDomain,
+}) {
+  const drawable = series.filter((s) => s.points.length > 1);
+  if (!drawable.length && !segments.length) return "";
+
+  const l = 14, r = 14;
+  const markerBandY = 14;      // marker dots
+  const t = 30;                // plot top (below the marker band)
+  const stripH = 12;           // state strip height
+  const xLabelH = 18;
+  const bottom = height - xLabelH - stripH - 6; // plot bottom
+  const stripY = bottom + 4;
+
+  // Shared x domain across everything visible.
+  const allX = [
+    ...drawable.flatMap((s) => [s.points[0][0], s.points[s.points.length - 1][0]]),
+    ...segments.flatMap((s) => [s.start_ts, s.end_ts]),
+    ...markers.map((m) => m.ts),
+  ];
+  const X0 = xDomain?.[0] ?? Math.min(...allX);
+  const X1 = xDomain?.[1] ?? Math.max(...allX);
+  const X = (v) => +(l + ((v - X0) / ((X1 - X0) || 1)) * (width - l - r)).toFixed(1);
+
+  // Faint reference lines at 25/50/75% of the plot band (no shared y axis —
+  // every series lives in its own normalized band).
+  let grid = "";
+  for (const f of [0.25, 0.5, 0.75]) {
+    const y = +(t + f * (bottom - t)).toFixed(1);
+    grid += `<line x1="${l}" x2="${width - r}" y1="${y}" y2="${y}" style="stroke:var(--line2);stroke-width:1;opacity:0.6;"></line>`;
+  }
+
+  const xLabels = xTicks
+    .map((tk) => `<text x="${X(tk.value)}" y="${height - 5}" text-anchor="middle" style="font:10.5px var(--mono);fill:var(--faint);">${esc(tk.label)}</text>`)
+    .join("");
+
+  // State strip (the "what was the car doing" layer).
+  const strip = segments
+    .map((seg) => {
+      const x = X(seg.start_ts);
+      const w = Math.max(1.2, X(Math.max(seg.end_ts, seg.start_ts)) - x);
+      return `<rect x="${x}" y="${stripY}" width="${w.toFixed(1)}" height="${stripH}" rx="2" style="fill:${stageColor[seg.stage] || "var(--faint)"};"><title>${esc(stageLabel[seg.stage] || seg.stage)}</title></rect>`;
+    })
+    .join("");
+
+  // Each series normalized to its own [min,max] band (4% padding; flat series centered).
+  const seriesMarkup = drawable
+    .map((s) => {
+      const ys = s.points.map((p) => p[1]);
+      let y0 = Math.min(...ys), y1 = Math.max(...ys);
+      if (y0 === y1) { y0 -= 1; y1 += 1; }
+      const pad = (y1 - y0) * 0.04;
+      y0 -= pad; y1 += pad;
+      const Y = (v) => +(t + (1 - (v - y0) / (y1 - y0)) * (bottom - t)).toFixed(1);
+      const pts = s.points.map((p) => `${X(p[0])},${Y(p[1])}`).join(" ");
+      return `<polyline points="${pts}" style="fill:none;stroke:${s.color || "var(--accent)"};stroke-width:${s.width || 1.8};stroke-linejoin:round;stroke-linecap:round;opacity:0.92;${s.dashed ? "stroke-dasharray:5 4;" : ""}"></polyline>`;
+    })
+    .join("");
+
+  // Event markers: dot in the top band + a faint guide line down the plot.
+  const markerMarkup = markers
+    .map((m) => {
+      const x = X(m.ts);
+      const col = markerColor[m.kind] || "var(--warn)";
+      return `<line x1="${x}" x2="${x}" y1="${markerBandY + 5}" y2="${bottom}" style="stroke:${col};stroke-width:1;stroke-dasharray:2 3;opacity:0.28;pointer-events:none;"></line>`
+        + `<circle cx="${x}" cy="${markerBandY}" r="4" style="fill:${col};stroke:var(--card);stroke-width:1.3;"><title>${esc(m.label)}</title></circle>`;
+    })
+    .join("");
+
+  const chartId = registerChart({
+    width, X0, X1, left: l, right: width - r,
+    series: drawable.map((s) => ({ name: s.name, unit: s.unit, color: s.color, points: s.points })),
+    segments, stageColor, stageLabel, markers, markerColor,
+  });
+  return `<svg viewBox="0 0 ${width} ${height}" class="tm-svg-block" data-tmchart="${chartId}">${grid}${strip}${seriesMarkup}${markerMarkup}${xLabels}</svg>`;
 }
 
 /**

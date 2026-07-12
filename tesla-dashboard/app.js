@@ -1,11 +1,11 @@
 import { auth, data, mcp, verifyToken, exportUrl, ApiError } from "./api.js";
-import { svgLineChart, svgBarChart, svgDonut, svgSplitBar, svgDriveChart } from "./charts.js";
+import { svgLineChart, svgBarChart, svgDonut, svgSplitBar, svgDriveChart, svgTimelineExplorer } from "./charts.js";
 import { destroyMaps, renderPointMap, renderRouteMap, renderLifetimeMap, createReplayMarker, invalidateMaps } from "./map.js";
 
 // Bump on every change to this dashboard (UI, features, or the /data/*
 // endpoints it depends on) and add a matching entry to CHANGELOG.md — see
 // the versioning policy in the repo's CLAUDE.md. Shown in the sidebar footer.
-const APP_VERSION = "1.15.0";
+const APP_VERSION = "1.16.0";
 
 const root = document.getElementById("app");
 let shellBound = false; // guards one-time attach of the root click handler + sync timer
@@ -211,6 +211,8 @@ const state = {
   batteryTimelineRange: TIMELINE_RANGES_DEFAULT, // index into TIMELINE_RANGES (Battery timeline screen)
   ovChargeRange: TIMELINE_RANGES_DEFAULT, // index into TIMELINE_RANGES (Overview's Charge level card)
   ovClimateRange: TIMELINE_RANGES_DEFAULT, // index into TIMELINE_RANGES (Overview's Cabin climate card)
+  explorerRange: TIMELINE_RANGES_DEFAULT, // index into TIMELINE_RANGES (Chart explorer screen)
+  explorerFields: ["speed", "soc", "inside_temp", "outside_temp"], // Chart explorer: overlaid signals
   tfCat: "__all", // Telemetry-fields screen: active category chip
   tfQuery: "", // Telemetry-fields screen: search text
   tfField: null, // field-history popup: { tesla, canonical, hours }
@@ -238,7 +240,7 @@ const NAV = [
   { label: "Media", items: [["md", "♪ Media"]] },
   { label: "Charging", items: [["ch", "Charges"], ["cs", "Charging stats"]] },
   { label: "Battery", items: [["bh", "Battery health"], ["pr", "Predictions"], ["vd", "Vampire drain"]] },
-  { label: "Data", items: [["tf", "Telemetry fields"]] },
+  { label: "Data", items: [["tc", "Chart explorer"], ["tf", "Telemetry fields"]] },
 ];
 
 const TITLES = {
@@ -257,6 +259,7 @@ const TITLES = {
   pr: ["Predictions", "battery forecast & range predictor"],
   vd: ["Vampire drain", "standby losses"],
   bt: ["Battery timeline", "state of charge over time, with stages"],
+  tc: ["Chart explorer", "overlay any signals over time — with events & car state"],
   tf: ["Telemetry fields", "every attribute Tesla can stream, and what this car is sending"],
   api: ["API usage", "Tesla Fleet API call log & cost — click the sidebar widget to get here"],
   cl: ["Changelog", "what's shipped, version by version — click the version number to get here"],
@@ -599,6 +602,15 @@ function onRootClick(e) {
   } else if (action === "ov-climate-range") {
     state.ovClimateRange = Number(t.dataset.range);
     renderOverview();
+  } else if (action === "explorer-range") {
+    state.explorerRange = Number(t.dataset.range);
+    renderExplorer();
+  } else if (action === "explorer-field") {
+    const f = t.dataset.field;
+    const has = state.explorerFields.includes(f);
+    if (has && state.explorerFields.length > 1) state.explorerFields = state.explorerFields.filter((x) => x !== f);
+    else if (!has && state.explorerFields.length < 8) state.explorerFields = [...state.explorerFields, f];
+    renderExplorer();
   } else if (action === "tf-cat") {
     state.tfCat = t.dataset.cat;
     renderTelemetryFields();
@@ -949,6 +961,7 @@ async function showScreen() {
       case "cs": await renderChargingStats(); break;
       case "bh": await renderBatteryHealth(); break;
       case "bt": await renderBatteryTimeline(); break;
+      case "tc": await renderExplorer(); break;
       case "tf": await renderTelemetryFields(); break;
       case "pr": await renderPredictions(); break;
       case "vd": await renderVampireDrain(); break;
@@ -3415,6 +3428,97 @@ async function renderBatteryTimeline() {
         <div class="tm-card-head-sub">${esc(TIMELINE_RANGES[state.batteryTimelineRange][0])}</div>
       </div>
       ${tl.points.length > 1 ? chargeLevelChartHtml(tl) : miniEmptyHtml("Not enough samples yet to plot a line")}
+    </div>
+  `);
+}
+
+// ---------------------------------------------------------------------------
+// Chart explorer — overlay any signals over time, with event markers and the
+// car-state layer. Data: /data/timeline-chart (activity-aware sampling:
+// driving windows keep ~4x the resolution of idle/charging/sleeping).
+// ---------------------------------------------------------------------------
+
+/** [key, label, unit, color, dashed?] — signals offered as overlay chips. */
+const EXPLORER_FIELDS = [
+  ["speed", "Speed", "km/h", "#4C7DFF"],
+  ["soc", "Battery", "%", "#2EA043"],
+  ["inside_temp", "Inside temp", "°C", "#E4572E"],
+  ["outside_temp", "Outside temp", "°C", "#8A8FA3", true],
+  ["power", "Motor power", "kW", "#B5179E"],
+  ["charger_power", "Charger power", "kW", "#0FA3B1"],
+  ["est_range", "Est. range", "km", "#FF9F1C"],
+  ["energy_remaining", "Energy left", "kWh", "#7B2D8B"],
+  ["lon_accel", "Accel/brake g", "m/s²", "#D62828"],
+  ["brake_pedal", "Brake pedal", "", "#9D4EDD"],
+  ["accel_pedal", "Accelerator", "%", "#52B788"],
+  ["media_volume", "Media volume", "", "#8A63D2"],
+];
+
+const MARKER_META = {
+  harsh_brake: ["Hard brake", "#D7263D"],
+  harsh_accel: ["Hard accel", "#F4A261"],
+  music: ["Track change", "#8A63D2"],
+  alert: ["Warning", "#E9C46A"],
+};
+
+async function renderExplorer() {
+  const hours = TIMELINE_RANGES[state.explorerRange][1];
+  const fields = state.explorerFields;
+  const key = `explorer:${hours}:${[...fields].sort().join(",")}`;
+  const tl = await safe(cached(key, () => data.timelineChart(vin(), hours, fields)), null);
+
+  const rangeChips = `<div class="tm-flex-row" style="gap:8px;flex-wrap:wrap;">
+    ${TIMELINE_RANGES.map(([label], i) => `
+      <button type="button" class="tm-chip-btn ${state.explorerRange === i ? "active" : ""}" data-action="explorer-range" data-range="${i}">${esc(label)}</button>
+    `).join("")}
+  </div>`;
+  const fieldChips = `<div class="tm-flex-row" style="gap:8px;flex-wrap:wrap;margin-top:10px;">
+    ${EXPLORER_FIELDS.map(([f, label, , color]) => `
+      <button type="button" class="tm-chip-btn ${fields.includes(f) ? "active" : ""}" data-action="explorer-field" data-field="${f}" title="Toggle ${esc(label)}">
+        <span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:${color};margin-right:6px;vertical-align:baseline;"></span>${esc(label)}
+      </button>
+    `).join("")}
+  </div>`;
+
+  if (!tl || !Object.values(tl.series || {}).some((pts) => pts.length > 1)) {
+    return setContent(`${rangeChips}${fieldChips}${emptyHtml("No samples in this window", "Pick a wider range, or different signals — data collects as the car drives, charges and streams.")}`);
+  }
+
+  const seriesDefs = EXPLORER_FIELDS
+    .filter(([f]) => fields.includes(f) && tl.series[f]?.length > 1)
+    .map(([f, label, unit, color, dashed]) => ({ key: f, name: label, unit, color, dashed: !!dashed, points: tl.series[f] }));
+  const markerColor = Object.fromEntries(Object.entries(MARKER_META).map(([k, [, c]]) => [k, c]));
+  const presentKinds = [...new Set((tl.markers || []).map((m) => m.kind))];
+  const allPts = seriesDefs.flatMap((s) => s.points);
+  const overflowNote = Object.entries(tl.marker_overflow || {}).map(([k, n]) => `${n} ${MARKER_META[k]?.[0] || k} markers beyond the cap not shown`).join(" · ");
+
+  setContent(`
+    ${rangeChips}
+    ${fieldChips}
+    <div class="tm-card tm-card-pad" style="margin-top:14px;">
+      <div class="tm-card-head">
+        <div class="tm-card-head-title">Signals over time</div>
+        <div class="tm-card-head-sub">${esc(TIMELINE_RANGES[state.explorerRange][0])} · each signal scaled to its own band — hover for real values, events & car state</div>
+      </div>
+      ${svgTimelineExplorer({
+        series: seriesDefs,
+        segments: tl.segments || [],
+        markers: tl.markers || [],
+        stageColor: STAGE_COLOR, stageLabel: STAGE_LABEL, markerColor,
+        xTicks: allPts.length ? buildDayTicks(allPts.sort((a, b) => a[0] - b[0])) : [],
+      })}
+      <div class="tm-flex-row" style="gap:16px;flex-wrap:wrap;margin-top:10px;">
+        ${seriesDefs.map((s) => `
+          <span style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--sub);">
+            <span style="width:14px;height:2px;background:${s.color};flex:none;${s.dashed ? "background:repeating-linear-gradient(90deg," + s.color + " 0 4px,transparent 4px 7px);" : ""}"></span>${esc(s.name)}
+          </span>`).join("")}
+        ${presentKinds.map((k) => `
+          <span style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--sub);">
+            <span style="width:9px;height:9px;border-radius:50%;background:${markerColor[k] || "var(--warn)"};flex:none;"></span>${esc(MARKER_META[k]?.[0] || k)}
+          </span>`).join("")}
+      </div>
+      ${batteryStageLegendHtml(tl.stage_hours)}
+      <div class="tm-foot-note">Resolution adapts to what the car was doing: driving keeps up to ~4× more points than idle/charging (this window: ${fmt0(tl.resolution?.kept ?? 0)} of ${fmt0(tl.resolution?.rows ?? 0)} samples kept${tl.resolution?.stride_driving > 1 ? `, driving thinned ×${tl.resolution.stride_driving}` : ", driving at full resolution"}).${overflowNote ? " " + esc(overflowNote) + "." : ""}</div>
     </div>
   `);
 }

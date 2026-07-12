@@ -9,6 +9,35 @@ feature or screen, the **patch** version for fixes/tweaks/copy changes, and the
 configured. See `CLAUDE.md` at the repo root for the policy on keeping this file
 and `APP_VERSION` (in `app.js`) in sync.
 
+## 1.16.0 — 2026-07-12
+
+New **Chart explorer** screen (Data section) — asked as "a timeline chart
+that has many many params overlayed one on top of the other… markers for
+important events like hard brake, music played, any warning… the car state
+as a second layer… smart resolution — when driving as small as possible,
+when charging or sleeping it doesn't matter… hovering shows anything
+displayed like the speed, temp and state of the car".
+
+- **Overlay any signals**: 12 toggleable signals (speed, battery %, inside/
+  outside temp, motor & charger power, est. range, energy left, IMU
+  accel/brake g, brake pedal, accelerator, media volume) drawn together,
+  each normalized to its own band so different units share one canvas.
+- **Event markers** on a band above the chart, with guide lines down the
+  plot: hard brakes / hard accelerations (from the real IMU stream,
+  debounced to one marker per maneuver at its peak, same ~0.3 g thresholds
+  as driver scoring), every track change (with artist), and every worker
+  warning/alert in the window.
+- **Car-state layer**: the driving/charging/connected/resting strip along
+  the bottom, same palette as the Battery timeline, with per-stage hours.
+- **Smart resolution**: the new `/data/timeline-chart` endpoint samples
+  activity-aware — driving windows keep up to ~4× more points (budget
+  2400) than idle/charging/sleeping (600), with segment boundaries always
+  kept, so a drive stays second-sharp while a night of sleeping costs a
+  handful of points. The footer says exactly what was kept.
+- **Hover = everything at that instant**: the tooltip now shows the car's
+  state, every displayed signal's real value with units, and any event
+  marker near the cursor. Time ranges: the shared 10 min → 30 days chips.
+
 ## 1.15.0 — 2026-07-12
 
 Overview's Charge level and Cabin climate cards, brought up to the Battery
