@@ -490,6 +490,15 @@ export async function applyIngest(env: Env, parsed: ParsedIngest): Promise<Lates
     // stale one indefinitely (Tesla never sends a terminal packet for this
     // field — see UPDATE_STALE_S in tracking.ts).
     if (canonical === "software_update_pct") patch.software_update_pct_ts = parsed.ts;
+    // Companion timestamp for the same merge-forever problem: Tesla's Fleet
+    // Telemetry stream has no equivalent of REST's drive_state.power (checked
+    // against the full streaming field catalog — only per-corner Di* torque/
+    // current diagnostics exist, no aggregate figure), so "power" can only
+    // ever be set here via a billed REST poll. Since those are now throttled
+    // to ~hourly whenever streaming is healthy (see poll.ts RECONCILE_BILLED_S),
+    // buildSample() needs this to know how old the value is before trusting it
+    // for a sample taken seconds ago.
+    if (canonical === "power") patch.power_ts = parsed.ts;
     // EAV history holds only fields not captured as structured position columns.
     if (!POSITION_COLUMNS.has(canonical) && !META_FIELDS.has(canonical) && canonical !== "location") {
       events.push({ field: canonical, value, ts: parsed.ts });
