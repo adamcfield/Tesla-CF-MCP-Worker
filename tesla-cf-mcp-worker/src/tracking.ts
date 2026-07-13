@@ -109,6 +109,16 @@ export function deriveActivity(s: LatestState): Activity {
 // it's older than a real OTA install ever takes.
 const UPDATE_STALE_S = 90 * 60;
 
+// "power" (drive_state.power) has no Fleet Telemetry streaming equivalent —
+// it can only be refreshed by a billed REST poll (see power_ts in ingest.ts),
+// which telemetry-first now throttles to ~hourly whenever streaming is
+// healthy. Without a staleness check, mergeLatest's merge-forever semantics
+// would smear that one hourly snapshot across every streaming-driven position
+// sample taken in between (observed live 2026-07-13: a whole day of drives
+// stuck at the single negative/zero reading from the last reconciliation
+// poll). Treat it as unknown once it's older than the normal poll cadence.
+const POWER_STALE_S = 5 * 60;
+
 /** Maps activity (plus a possible software update) to a state-timeline label. */
 function timelineState(s: LatestState, activity: Activity, ts: number): string {
   if (activity === "driving") return "driving";
@@ -121,7 +131,9 @@ function timelineState(s: LatestState, activity: Activity, ts: number): string {
 }
 
 /** Builds the structured positions sample from merged canonical state. */
-function buildSample(s: LatestState, activity: Activity): PositionSample {
+function buildSample(s: LatestState, activity: Activity, ts: number): PositionSample {
+  const powerTs = num(s.power_ts);
+  const powerFresh = powerTs !== null && ts - powerTs < POWER_STALE_S;
   return {
     activity,
     lat: num(s.lat),
@@ -129,7 +141,7 @@ function buildSample(s: LatestState, activity: Activity): PositionSample {
     elevation: num(s.elevation),
     heading: num(s.heading),
     speed: num(s.speed),
-    power: num(s.power),
+    power: powerFresh ? num(s.power) : null,
     odometer: num(s.odometer),
     soc: num(s.soc),
     usable_soc: num(s.usable_soc),
@@ -200,7 +212,7 @@ export async function applyDerivation(
   }
 
   // 2. Position sample (tagged to the open drive, if any).
-  const sample = buildSample(current, activity);
+  const sample = buildSample(current, activity, ts);
   sample.drive_id = openDrive?.id ?? null;
   await insertPosition(env, vin, ts, sample);
 
