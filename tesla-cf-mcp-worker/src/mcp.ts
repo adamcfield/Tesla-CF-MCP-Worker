@@ -828,6 +828,18 @@ const TOOLS: Tool[] = [
     handler: (env, a) => tracking.getBatteryTimeline(env, a.vin, a.hours ?? 24),
   },
   {
+    name: "get_software_updates",
+    description:
+      "Current software version, any OTA update in flight (installing/scheduled/available, with progress), " +
+      "and the version-change log — when each firmware release was first seen on this car. Free — reads logged data.",
+    inputSchema: {
+      type: "object",
+      properties: { ...vinProp },
+      required: ["vin"],
+    },
+    handler: (env, a) => tracking.getSoftwareUpdates(env, a.vin),
+  },
+  {
     name: "get_api_call_log",
     description:
       "Tesla Fleet API spend breakdown by day and call kind (vehicle data reads, commands, wakes, telemetry " +
@@ -993,6 +1005,7 @@ const READ_TOOLS = new Set([
   "get_sentry_log",
   "get_state_timeline",
   "get_battery_timeline",
+  "get_software_updates",
   "get_monthly_report",
   "get_efficiency_by_temp",
   "get_media_stats",

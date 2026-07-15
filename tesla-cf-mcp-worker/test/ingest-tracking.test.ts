@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { applyIngest, getTelemetryFieldStatus, handleIngest } from "../src/ingest";
 import { getAppState, getLatest, querySeries, resetSchemaCacheForTests } from "../src/store";
-import { getDrives, getStateTimeline, getChargeSessions, getBatteryTimeline } from "../src/tracking";
+import { getDrives, getStateTimeline, getChargeSessions, getBatteryTimeline, getSoftwareUpdates } from "../src/tracking";
 import { FakeD1 } from "./helpers/d1";
 import { FakeKV } from "./helpers/kv";
 import type { Env } from "../src/types";
@@ -300,5 +300,79 @@ describe("telemetry field status", () => {
     expect(acIn).toBeDefined();
     expect(acIn.value).toBeNull();
     expect(acIn.last_seen).toBeNull();
+  });
+});
+
+describe("software updates", () => {
+  it("logs first sighting and real transitions, ignoring build-hash variants", async () => {
+    const env = makeEnv();
+    const base = 1_700_070_000;
+    // First sighting -> one row with from_version NULL.
+    await applyIngest(env, parsed(VIN, base, { SoftwareVersion: "2026.20.3", Soc: 50, Gear: "P", VehicleSpeed: 0 }));
+    // Same version again -> no new row (merge-forever keeps the key equal).
+    await applyIngest(env, parsed(VIN, base + 60, { SoftwareVersion: "2026.20.3", Soc: 50, Gear: "P", VehicleSpeed: 0 }));
+    // REST-style "version + build hash" of the SAME release -> no new row.
+    await applyIngest(env, parsed(VIN, base + 120, { SoftwareVersion: "2026.20.3 abc123def", Soc: 50, Gear: "P", VehicleSpeed: 0 }));
+    // A genuinely new release -> transition row.
+    await applyIngest(env, parsed(VIN, base + 180, { SoftwareVersion: "2026.26.1", Soc: 50, Gear: "P", VehicleSpeed: 0 }));
+
+    const res = (await getSoftwareUpdates(env, VIN)) as any;
+    expect(res.current.version).toBe("2026.26.1");
+    expect(res.history).toHaveLength(2); // first sighting + one update, newest first
+    expect(res.history[0].to_version).toBe("2026.26.1");
+    expect(res.history[0].from_version).toBe("2026.20.3 abc123def");
+    expect(res.history[0].source).toBe("recorded");
+    expect(res.history[1].to_version).toBe("2026.20.3");
+    expect(res.history[1].from_version).toBeNull();
+  });
+
+  it("backfills history from the EAV window when the permanent table is empty", async () => {
+    const env = makeEnv();
+    const base = 1_700_070_000;
+    await applyIngest(env, parsed(VIN, base, { SoftwareVersion: "2026.20.3", Soc: 50, Gear: "P", VehicleSpeed: 0 }));
+    await applyIngest(env, parsed(VIN, base + 60, { SoftwareVersion: "2026.26.1", Soc: 50, Gear: "P", VehicleSpeed: 0 }));
+    // Simulate a deployment that predates the software_updates table: the EAV
+    // series exists but the permanent log doesn't.
+    await env.DB.prepare(`DELETE FROM software_updates`).run();
+
+    const res = (await getSoftwareUpdates(env, VIN)) as any;
+    expect(res.history).toHaveLength(2);
+    expect(res.history[0].to_version).toBe("2026.26.1");
+    expect(res.history[0].from_version).toBe("2026.20.3");
+    expect(res.history[0].source).toBe("history");
+  });
+
+  it("reports a fresh install as in progress, and a pending version as available", async () => {
+    const env = makeEnv();
+    const now = Math.floor(Date.now() / 1000);
+    await applyIngest(env, parsed(VIN, now - 60, {
+      SoftwareVersion: "2026.20.3",
+      SoftwareUpdateVersion: "2026.26.1",
+      SoftwareUpdateInstallationPercentComplete: 42,
+      Soc: 50, Gear: "P", VehicleSpeed: 0,
+    }));
+    const installing = (await getSoftwareUpdates(env, VIN)) as any;
+    expect(installing.update?.status).toBe("installing");
+    expect(installing.update?.install_pct).toBe(42);
+    expect(installing.update?.version).toBe("2026.26.1");
+
+    // A pct sample older than a real OTA install ever takes is stale -> not
+    // installing; the pending version alone downgrades the status to available.
+    const env2 = makeEnv();
+    await applyIngest(env2, parsed(VIN, now - 3 * 3600, {
+      SoftwareVersion: "2026.20.3",
+      SoftwareUpdateVersion: "2026.26.1",
+      SoftwareUpdateInstallationPercentComplete: 42,
+      Soc: 50, Gear: "P", VehicleSpeed: 0,
+    }));
+    const available = (await getSoftwareUpdates(env2, VIN)) as any;
+    expect(available.update?.status).toBe("available");
+    expect(available.update?.install_pct).toBeNull();
+
+    // No pending version and nothing fresh -> no update block at all.
+    const env3 = makeEnv();
+    await applyIngest(env3, parsed(VIN, now - 60, { SoftwareVersion: "2026.20.3", Soc: 50, Gear: "P", VehicleSpeed: 0 }));
+    const idle = (await getSoftwareUpdates(env3, VIN)) as any;
+    expect(idle.update).toBeNull();
   });
 });

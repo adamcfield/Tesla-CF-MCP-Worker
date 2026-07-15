@@ -9,6 +9,27 @@ feature or screen, the **patch** version for fixes/tweaks/copy changes, and the
 configured. See `CLAUDE.md` at the repo root for the policy on keeping this file
 and `APP_VERSION` (in `app.js`) in sync.
 
+## 1.26.0 — 2026-07-20
+
+New **Software** screen (issue #57) — "Upon click show latest software
+updates and log."
+
+- The **Software tile on Overview is now clickable** and opens the new
+  screen: current firmware version, whether an OTA update is in flight
+  (installing with a live progress bar, scheduled with its start time, or
+  available for install), and a **version history** table — when each
+  release was first seen on this car and what it replaced.
+- Backed by a new worker endpoint `/data/software-updates` and a permanent
+  `software_updates` D1 table: the worker now records a row every time the
+  car's reported firmware version changes (the raw telemetry history is
+  pruned after the retention window, so the long-term log needed its own
+  home). History that predates the new table is backfilled from whatever
+  telemetry history is still within retention. Also exposed as a new
+  read-scope MCP tool, `get_software_updates`.
+- Requires a worker redeploy; until then the screen explains exactly that
+  (the same stale-worker guidance the API-usage call log shows) instead of
+  rendering blank.
+
 ## 1.25.0 — 2026-07-20
 
 Real push notifications: worker alerts now reach the phone even with the

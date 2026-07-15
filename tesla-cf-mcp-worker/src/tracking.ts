@@ -229,6 +229,124 @@ export async function applyDerivation(
 
   // 4. Charge sessions + curve.
   await trackCharge(env, vin, current, ts, activity === "charging", priceCentsKwh);
+
+  // 5. Software version-change log (permanent — see software_updates in store.ts).
+  await recordSoftwareVersionChange(env, vin, ts, previous, current);
+}
+
+// ---------------------------------------------------------------------------
+// Software updates — version-change log + current OTA status
+// ---------------------------------------------------------------------------
+
+/**
+ * "2026.20.3 abc123" and "2026.20.3" are the same release — REST's car_version
+ * carries a build hash that the streaming SoftwareVersion field omits, so
+ * compare on the version number alone or the two sources would ping-pong the
+ * log with fake "updates" every time the poller alternates with the stream.
+ */
+function versionKey(v: unknown): string | null {
+  if (typeof v !== "string") return null;
+  const key = v.trim().split(/\s+/)[0] ?? "";
+  return key.length > 0 ? key : null;
+}
+
+/**
+ * Records a software version transition (applyDerivation step 5). The first
+ * sighting is logged too (from_version NULL) so the Software page has a row
+ * before the first OTA after deploy; merge-forever semantics on the latest
+ * doc guarantee it fires once, not per ingest.
+ */
+async function recordSoftwareVersionChange(
+  env: Env,
+  vin: string,
+  ts: number,
+  previous: LatestState | null,
+  current: LatestState,
+): Promise<void> {
+  const curKey = versionKey(current.software_version);
+  if (!curKey || curKey === versionKey(previous?.software_version)) return;
+  const from = typeof previous?.software_version === "string" ? previous.software_version : null;
+  await env.DB.prepare(
+    `INSERT INTO software_updates (vin, ts, from_version, to_version) VALUES (?1, ?2, ?3, ?4)`,
+  )
+    .bind(vin, ts, from, String(current.software_version))
+    .run();
+}
+
+/**
+ * Everything the dashboard's Software screen needs in one call: the current
+ * version, any OTA in flight (staleness-gated the same way the state timeline
+ * is — see UPDATE_STALE_S), and the version-change log. The log unions the
+ * permanent software_updates rows with transitions still visible in the EAV
+ * window, so history predating the table's deploy isn't lost until pruned.
+ */
+export async function getSoftwareUpdates(env: Env, vin: string): Promise<unknown> {
+  await ensureSchema(env);
+  const latest = await getLatest(env, vin);
+  const now = Math.floor(Date.now() / 1000);
+
+  const rec = await env.DB.prepare(
+    `SELECT ts, from_version, to_version FROM software_updates
+     WHERE vin = ?1 ORDER BY ts DESC LIMIT 100`,
+  )
+    .bind(vin)
+    .all<{ ts: number; from_version: string | null; to_version: string }>();
+  const history: { ts: number; from_version: string | null; to_version: string; source: string }[] =
+    (rec.results ?? []).map((r) => ({ ...r, source: "recorded" }));
+
+  const seen = new Set(history.map((h) => versionKey(h.to_version)));
+  const eav = await env.DB.prepare(
+    `SELECT ts, value_text FROM telemetry_events
+     WHERE vin = ?1 AND field = 'software_version' AND value_text IS NOT NULL
+     ORDER BY ts ASC`,
+  )
+    .bind(vin)
+    .all<{ ts: number; value_text: string }>();
+  let prevSeen: string | null = null;
+  for (const row of eav.results ?? []) {
+    const key = versionKey(row.value_text);
+    if (!key || key === versionKey(prevSeen)) continue;
+    if (!seen.has(key)) {
+      history.push({ ts: row.ts, from_version: prevSeen, to_version: row.value_text, source: "history" });
+      seen.add(key);
+    }
+    prevSeen = row.value_text;
+  }
+  history.sort((a, b) => b.ts - a.ts);
+
+  const currentVersion = typeof latest?.software_version === "string" ? latest.software_version : null;
+  const pct = num(latest?.software_update_pct);
+  const pctTs = num(latest?.software_update_pct_ts);
+  const installFresh = pct !== null && pctTs !== null && now - pctTs < UPDATE_STALE_S;
+  const pendingVersion =
+    typeof latest?.software_update_version === "string" && latest.software_update_version.trim() !== ""
+      ? latest.software_update_version
+      : null;
+  const scheduled = num(latest?.software_update_scheduled_ts);
+
+  let status: "installing" | "scheduled" | "available" | null = null;
+  if (pct !== null && installFresh && pct > 0 && pct < 100) status = "installing";
+  else if (scheduled !== null && scheduled > now) status = "scheduled";
+  else if (versionKey(pendingVersion) && versionKey(pendingVersion) !== versionKey(currentVersion)) status = "available";
+
+  return {
+    vin,
+    current: {
+      version: currentVersion,
+      seen_ts: num(latest?.updated_at),
+    },
+    update: status
+      ? {
+          status,
+          version: pendingVersion,
+          install_pct: installFresh ? pct : null,
+          download_pct: num(latest?.software_update_download_pct),
+          duration_min: num(latest?.software_update_duration_min),
+          scheduled_ts: scheduled,
+        }
+      : null,
+    history,
+  };
 }
 
 // ---------------------------------------------------------------------------
