@@ -36,7 +36,7 @@
 import { getVehicle, getVehicleData } from "./api";
 import { getBudgetStatus, pacedChargingIntervalS, pacedDrivingIntervalS, pollBudgetMicro } from "./budget";
 import { applyVehicleData } from "./ingest";
-import { getAppState, putAppState } from "./store";
+import { getAppState, getLatest, putAppState } from "./store";
 import { deriveActivity, recordConnectivityState } from "./tracking";
 import { Env } from "./types";
 
@@ -167,14 +167,31 @@ export async function pollOnce(env: Env, vin: string): Promise<PollResult> {
   //     drive/charge/state derivations. Keep one billed reconciliation read
   //     per hour, and fall back to normal REST pacing automatically the
   //     moment the stream goes quiet.
+  //
+  //     Exception: motor power (drive_state.power) has NO Fleet Telemetry
+  //     streaming equivalent at all (checked against the full streaming field
+  //     catalog -- only per-corner Di* diagnostics exist), so it can only ever
+  //     be refreshed here. An hour-long gap left it stuck on one stale reading
+  //     for a whole day of driving (see power_ts in ingest.ts / POWER_STALE_S
+  //     in tracking.ts). While the last streaming-derived activity is
+  //     "driving", reconcile at the same budget-paced cadence the pre-
+  //     telemetry-first poller used instead of waiting the full hour.
   const streamOk = Number((await getAppState(env, STREAM_OK(vin)).catch(() => "0")) ?? "0");
   if (now - streamOk < STREAM_FRESH_S) {
     const lastBilledTs = Number(String((await getAppState(env, BILLED_TS(vin)).catch(() => "0")) ?? "0").split(" ")[0]) || 0;
-    if (now - lastBilledTs < RECONCILE_BILLED_S) {
+    const latest = await getLatest(env, vin).catch(() => null);
+    const drivingNow = latest != null && deriveActivity(latest) === "driving";
+    const reconcileGapS = drivingNow
+      ? pacedDrivingIntervalS(budget.spent_micro, pollBudgetMicro(env))
+      : RECONCILE_BILLED_S;
+    if (now - lastBilledTs < reconcileGapS) {
       await recordConnectivityState(env, vin, "online").catch(() => {});
       return {
-        vin, state, activity: "stream_covered", polled: false, active: false,
-        next_interval_s: INTERVAL_SLEEP, budget_spent_usd: budget.spent_usd,
+        vin, state, activity: "stream_covered", polled: false, active: drivingNow,
+        next_interval_s: drivingNow
+          ? Math.max(MIN_BILLED_GAP_S, reconcileGapS - (now - lastBilledTs))
+          : INTERVAL_SLEEP,
+        budget_spent_usd: budget.spent_usd,
       };
     }
   }

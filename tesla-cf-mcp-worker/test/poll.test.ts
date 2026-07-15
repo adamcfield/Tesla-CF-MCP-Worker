@@ -249,6 +249,80 @@ describe("telemetry-first: streaming suppresses billed REST reads", () => {
     expect(r.polled).toBe(true);
     expect(r.next_interval_s).toBe(10);
   });
+
+  // "power" has no streaming equivalent at all (see power_ts in ingest.ts) --
+  // while driving, the hour-long reconciliation gap left it stuck on one
+  // stale reading for a whole day. These regression-test the shorter,
+  // budget-paced reconciliation cadence used while streaming shows driving.
+  it("while driving, reconciles at the paced cadence instead of waiting the full hour", async () => {
+    const env = makeEnv(kv);
+    let vehicleDataCalls = 0;
+    vi.stubGlobal("fetch", vi.fn(async (url: string) => {
+      const u = String(url);
+      if (u.includes("/oauth2/v3/token")) {
+        return new Response(JSON.stringify({ access_token: "A", refresh_token: "R", expires_in: 3600, token_type: "Bearer" }), { status: 200 });
+      }
+      if (u.includes("/vehicle_data")) {
+        vehicleDataCalls++;
+        return new Response(JSON.stringify({ response: {} }), { status: 200 });
+      }
+      return new Response(JSON.stringify({ response: { vin: VIN, state: "online" } }), { status: 200 });
+    }));
+    const now = Math.floor(Date.now() / 1000);
+    await putAppState(env, `stream_ok_ts:${VIN}`, String(now - 5)); // stream alive
+    await putAppState(env, `latest:${VIN}`, JSON.stringify({ vin: VIN, updated_at: now, gear: "D", speed: 45 }));
+    // Reconciled 30s ago -- well inside the hour-long gap, but past a fresh-budget
+    // 10s driving pace. Should still skip the billed read (30s > 10s already
+    // elapsed), but report active with a short remaining-gap interval, not 300s.
+    await putAppState(env, `billed_ts:${VIN}`, `${now - 5} 90`);
+    const r = await pollOnce(env, VIN);
+    expect(r.activity).toBe("stream_covered");
+    expect(r.polled).toBe(false);
+    expect(vehicleDataCalls).toBe(0);
+    expect(r.active).toBe(true); // NOT false -- driving must keep the loop going
+    expect(r.next_interval_s).toBeLessThanOrEqual(10); // paced gap, not INTERVAL_SLEEP (300)
+  });
+
+  it("bills once the driving-paced reconciliation gap has actually elapsed", async () => {
+    const env = makeEnv(kv);
+    stubTesla({ state: "online", shift: "D", speed: 45 });
+    const now = Math.floor(Date.now() / 1000);
+    await putAppState(env, `stream_ok_ts:${VIN}`, String(now - 5)); // stream alive
+    await putAppState(env, `latest:${VIN}`, JSON.stringify({ vin: VIN, updated_at: now, gear: "D", speed: 45 }));
+    // Prior billed read was itself a driving reconciliation (stamped the
+    // driving-paced interval) 15s ago -- past the fresh-budget 10s pace, and
+    // past the cross-poller dedup gap (0.8*10=8s) too.
+    await putAppState(env, `billed_ts:${VIN}`, `${now - 15} 10`);
+    const r = await pollOnce(env, VIN);
+    expect(r.polled).toBe(true); // reconciliation fired, refreshing "power"
+    expect(r.activity).toBe("driving");
+  });
+
+  it("not driving (streaming shows idle) keeps the full hour-long reconciliation gap", async () => {
+    const env = makeEnv(kv);
+    let vehicleDataCalls = 0;
+    vi.stubGlobal("fetch", vi.fn(async (url: string) => {
+      const u = String(url);
+      if (u.includes("/oauth2/v3/token")) {
+        return new Response(JSON.stringify({ access_token: "A", refresh_token: "R", expires_in: 3600, token_type: "Bearer" }), { status: 200 });
+      }
+      if (u.includes("/vehicle_data")) {
+        vehicleDataCalls++;
+        return new Response(JSON.stringify({ response: {} }), { status: 200 });
+      }
+      return new Response(JSON.stringify({ response: { vin: VIN, state: "online" } }), { status: 200 });
+    }));
+    const now = Math.floor(Date.now() / 1000);
+    await putAppState(env, `stream_ok_ts:${VIN}`, String(now - 5)); // stream alive
+    await putAppState(env, `latest:${VIN}`, JSON.stringify({ vin: VIN, updated_at: now, gear: "P", speed: 0 }));
+    await putAppState(env, `billed_ts:${VIN}`, `${now - 600} 90`); // 10 min ago -- well within the hour
+    const r = await pollOnce(env, VIN);
+    expect(r.activity).toBe("stream_covered");
+    expect(r.polled).toBe(false);
+    expect(vehicleDataCalls).toBe(0);
+    expect(r.active).toBe(false); // unaffected by the driving exception
+    expect(r.next_interval_s).toBe(300);
+  });
 });
 
 describe("DO scheduler re-arm delay", () => {
