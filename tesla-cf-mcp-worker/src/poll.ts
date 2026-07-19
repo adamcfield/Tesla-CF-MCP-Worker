@@ -36,7 +36,7 @@
 import { getVehicle, getVehicleData } from "./api";
 import { getBudgetStatus, pacedChargingIntervalS, pacedDrivingIntervalS, pollBudgetMicro } from "./budget";
 import { applyVehicleData } from "./ingest";
-import { getAppState, getLatest, putAppState } from "./store";
+import { casAppState, getAppState, getLatest, putAppState } from "./store";
 import { deriveActivity, recordConnectivityState } from "./tracking";
 import { Env } from "./types";
 
@@ -152,6 +152,13 @@ export async function pollOnce(env: Env, vin: string): Promise<PollResult> {
   await stampPollAlive(env, vin, now);
 
   // 1. FREE connectivity check — never wakes, feeds the state timeline.
+  //    A fresh telemetry stream OVERRIDES a non-online answer: the car is
+  //    demonstrably awake and transmitting, so a thrown/timed-out check (or
+  //    Tesla momentarily misreporting) must not stall every gate below for
+  //    the 300s sleep interval — against 7-28 minute drives, one bad check
+  //    could eat a large fraction of a drive's reconciliation window.
+  const streamOk = Number((await getAppState(env, STREAM_OK(vin)).catch(() => "0")) ?? "0");
+  const streamFresh = now - streamOk < STREAM_FRESH_S;
   let state = "unknown";
   try {
     const v = await getVehicle(env, vin);
@@ -160,8 +167,11 @@ export async function pollOnce(env: Env, vin: string): Promise<PollResult> {
     state = "unknown";
   }
   if (state !== "online") {
-    await recordConnectivityState(env, vin, state).catch(() => {});
-    return { vin, state, activity: state, polled: false, active: false, next_interval_s: INTERVAL_SLEEP };
+    if (!streamFresh) {
+      await recordConnectivityState(env, vin, state).catch(() => {});
+      return { vin, state, activity: state, polled: false, active: false, next_interval_s: INTERVAL_SLEEP };
+    }
+    state = "online"; // the stream is live data FROM the car; trust it over the check
   }
 
   // 2. Budget gate — when the monthly poll budget is spent, stay free-only.
@@ -196,8 +206,7 @@ export async function pollOnce(env: Env, vin: string): Promise<PollResult> {
   //     same "stuck merged-forever field" failure mode twice for gear (#50)
   //     and power (this file's own history). Reusing STREAM_FRESH_S bounds
   //     the exposure to one resend window instead of indefinitely.
-  const streamOk = Number((await getAppState(env, STREAM_OK(vin)).catch(() => "0")) ?? "0");
-  const streamFresh = now - streamOk < STREAM_FRESH_S;
+  //     (streamOk/streamFresh are read in step 1, which also uses them.)
   const latest = streamFresh ? await getLatest(env, vin).catch(() => null) : null;
   const drivingNow = latest != null && deriveActivity(latest) === "driving";
   const drivingPaceS = pacedDrivingIntervalS(budget.spent_micro, pollBudgetMicro(env));
@@ -299,10 +308,23 @@ export async function pollOnce(env: Env, vin: string): Promise<PollResult> {
 
   // Claim the billed-read slot BEFORE the network call (which takes seconds) —
   // otherwise a concurrent poller reads the stale stamp during that window and
-  // double-bills (TOCTOU). recordSpend inside getVehicleData is likewise
-  // counted before the call, so the timings match. A subsequent failed read
-  // just throttles the next poll for 8s (harmless).
-  await putAppState(env, BILLED_TS(vin), String(now)).catch(() => {});
+  // double-bills (TOCTOU). The claim is a compare-and-swap against the stamp
+  // read in step 3b: two pollers passing the gap check in the same instant
+  // both used to "claim" with a plain overwrite and both proceeded to bill —
+  // now whoever loses the CAS backs off to the free-only throttled response.
+  // recordSpend inside getVehicleData is likewise counted before the call, so
+  // the timings match. A subsequent failed read just throttles the next poll
+  // for 8s (harmless).
+  const claimed = await casAppState(
+    env, BILLED_TS(vin), rawBilled === "0" ? null : rawBilled, String(now),
+  ).catch(() => true); // a CAS-infra error must not stall polling entirely
+  if (!claimed) {
+    await recordConnectivityState(env, vin, "online").catch(() => {});
+    return {
+      vin, state, activity: "throttled", polled: false, active: true,
+      next_interval_s: MIN_BILLED_GAP_S, budget_spent_usd: budget.spent_usd,
+    };
+  }
 
   let vd: Record<string, unknown>;
   try {

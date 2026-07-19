@@ -23,6 +23,7 @@ import { postedLimitsForSamples } from "./roadlimits";
 import { scoreDrive } from "./scoring";
 import {
   ensureSchema,
+  getLatest,
   haversineMeters,
   insertPosition,
   LatestState,
@@ -193,9 +194,16 @@ export async function applyDerivation(
     const curOdo = num(current.odometer);
     const jumpKm = prevOdo !== null && curOdo !== null ? curOdo - prevOdo : 0;
     const openNow = await getOpenDrive(env, vin);
+    // Implied-speed sanity: the gap bounds how long the jump can have taken,
+    // so a jump that would need >160 km/h SUSTAINED for the whole gap is a
+    // corrupt odometer reading (unit glitch, partial write), not a drive --
+    // synthesizing it would fabricate a permanent long-distance drive row.
+    const gapH = (ts - previous.updated_at) / 3600;
+    const impliedKmh = gapH > 0 ? jumpKm / gapH : Infinity;
     if (
       !openNow &&
       jumpKm >= MIN_DRIVE_KM_SYNTH && jumpKm <= MAX_DRIVE_KM_SYNTH &&
+      impliedKmh <= 160 &&
       ts > previous.updated_at && ts - previous.updated_at <= MAX_GAP_S_SYNTH
     ) {
       await synthesizeDrive(env, vin, previous, current, ts, jumpKm).catch(() => {});
@@ -465,19 +473,24 @@ async function estimateDriveEnergy(
   startPos: { energy_remaining: number | null; soc: number | null; rated_range: number | null } | null,
   end: LatestState,
 ): Promise<number | null> {
+  // A negative estimate means the readings disagree (a stale start sample, a
+  // mid-drive top-up, BMS recalibration) -- store "unknown", not a physically
+  // impossible negative consumption that poisons every efficiency aggregate.
+  const clamp = (kwh: number) => (kwh < 0 ? null : kwh);
+
   const startEr = startPos?.energy_remaining ?? null;
   const endEr = num(end.energy_remaining);
-  if (startEr !== null && endEr !== null) return startEr - endEr;
+  if (startEr !== null && endEr !== null) return clamp(startEr - endEr);
 
   const startSoc = startPos?.soc ?? null;
   const endSoc = num(end.soc);
   const pack = await getPackKwh(env, vin);
-  if (startSoc !== null && endSoc !== null && pack !== null) return ((startSoc - endSoc) / 100) * pack;
+  if (startSoc !== null && endSoc !== null && pack !== null) return clamp(((startSoc - endSoc) / 100) * pack);
 
   const startRr = startPos?.rated_range ?? null;
   const endRr = num(end.rated_range);
   const whPerKm = await getRatedWhPerKm(env, vin);
-  if (startRr !== null && endRr !== null && whPerKm !== null) return ((startRr - endRr) * whPerKm) / 1000;
+  if (startRr !== null && endRr !== null && whPerKm !== null) return clamp(((startRr - endRr) * whPerKm) / 1000);
 
   return null;
 }
@@ -2753,7 +2766,32 @@ export async function closeStaleSessions(env: Env, maxAgeS = 6 * 3600): Promise<
     closedCharges++;
   }
 
-  return { closed_drives: closedDrives, closed_charges: closedCharges };
+  // The state timeline has the same failure mode but was never swept: a
+  // stream dying mid-drive while Sentry keeps the car "online" leaves the
+  // open 'driving'/'charging'/'updating' row untouched (the cron
+  // connectivity check defers to it), and whenever data finally resumes the
+  // row closes at that far-future ts -- a multi-day phantom span in the
+  // permanent timeline (same family as the historical 70h 'driving' entry).
+  // Close any such row older than the cutoff at the vin's last-heard-from
+  // time; the next real signal simply opens a fresh row.
+  let closedStates = 0;
+  const staleStates = await env.DB.prepare(
+    `SELECT id, vin, state, start_ts FROM vehicle_states
+     WHERE end_ts IS NULL AND state IN ('driving','charging','updating') AND start_ts < ?1`,
+  ).bind(cutoff).all<{ id: number; vin: string; state: string; start_ts: number }>();
+  for (const s of staleStates.results ?? []) {
+    const latest = await getLatest(env, s.vin).catch(() => null);
+    const lastHeard = Math.min(
+      Math.max(s.start_ts, num(latest?.updated_at) ?? s.start_ts),
+      Math.floor(Date.now() / 1000),
+    );
+    if (lastHeard >= cutoff) continue; // still receiving data -- not stale, leave it
+    await env.DB.prepare(`UPDATE vehicle_states SET end_ts = ?2 WHERE id = ?1 AND end_ts IS NULL`)
+      .bind(s.id, lastHeard).run();
+    closedStates++;
+  }
+
+  return { closed_drives: closedDrives, closed_charges: closedCharges, closed_states: closedStates };
 }
 
 // ---------------------------------------------------------------------------

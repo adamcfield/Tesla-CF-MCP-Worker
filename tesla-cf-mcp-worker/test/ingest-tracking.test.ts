@@ -29,13 +29,16 @@ function makeEnv(): Env {
 }
 
 const VIN = "TESTVIN0000000001";
+// Fixture base ts: ingest now rejects clock-insane stamps (>30d old / >5min
+// future), so fixtures anchor to the wall clock instead of tiny literals.
+const T = Math.floor(Date.now() / 1000) - 60;
 
 describe("ingest value normalization", () => {
   let env: Env;
   beforeEach(() => { env = makeEnv(); });
 
   it("stores a fleet-telemetry Location wrapper as lat/lon, not an object", async () => {
-    await handleIngest(req({ vin: VIN, ts: 1000, data: [
+    await handleIngest(req({ vin: VIN, ts: T, data: [
       { key: "Location", value: { locationValue: { latitude: 32.08, longitude: 34.78 } } },
       { key: "Soc", value: { stringValue: "72" } },
     ]}), env);
@@ -48,7 +51,7 @@ describe("ingest value normalization", () => {
   it("unwraps an arbitrary enum wrapper generically (no [object Object])", async () => {
     // Regression: only 6 wrapper keys were handled; detailedChargeStateValue
     // fell through as a raw object and stringified to "[object Object]".
-    await handleIngest(req({ vin: VIN, ts: 1000, data: [
+    await handleIngest(req({ vin: VIN, ts: T, data: [
       { key: "DetailedChargeState", value: { detailedChargeStateValue: "DetailedChargeStateCharging" } },
     ]}), env);
     const latest = await getLatest(env, VIN);
@@ -58,8 +61,8 @@ describe("ingest value normalization", () => {
   });
 
   it("skips a sensor marked {invalid:true} instead of overwriting with an object", async () => {
-    await handleIngest(req({ vin: VIN, ts: 1000, data: [{ key: "Soc", value: { stringValue: "80" } }] }), env);
-    await handleIngest(req({ vin: VIN, ts: 1001, data: [{ key: "Soc", value: { invalid: true } }] }), env);
+    await handleIngest(req({ vin: VIN, ts: T, data: [{ key: "Soc", value: { stringValue: "80" } }] }), env);
+    await handleIngest(req({ vin: VIN, ts: T + 1, data: [{ key: "Soc", value: { invalid: true } }] }), env);
     const latest = await getLatest(env, VIN);
     expect(latest?.soc).toBe(80); // not clobbered by the invalid sample
   });
@@ -67,16 +70,16 @@ describe("ingest value normalization", () => {
   it("derives motor power from streamed PackVoltage × PackCurrent (negated: pack current is negative on discharge)", async () => {
     // Sign verified live 2026-07-19: -80A at 375V while accelerating must
     // read as +30 kW propulsion, matching the REST drive_state.power sign.
-    await handleIngest(req({ vin: VIN, ts: 1000, data: {
+    await handleIngest(req({ vin: VIN, ts: T, data: {
       PackVoltage: 375, PackCurrent: -80,
     }}), env);
     const latest = await getLatest(env, VIN);
     expect(latest?.power).toBe(30);
-    expect(latest?.power_ts).toBe(1000);
+    expect(latest?.power_ts).toBe(T);
   });
 
   it("derived power reads negative during regen (positive pack current)", async () => {
-    await handleIngest(req({ vin: VIN, ts: 1000, data: {
+    await handleIngest(req({ vin: VIN, ts: T, data: {
       PackVoltage: 370, PackCurrent: 97.6,
     }}), env);
     const latest = await getLatest(env, VIN);
@@ -84,7 +87,7 @@ describe("ingest value normalization", () => {
   });
 
   it("does NOT derive power while the batch shows active charging (that inflow is charger_power's job)", async () => {
-    await handleIngest(req({ vin: VIN, ts: 1000, data: {
+    await handleIngest(req({ vin: VIN, ts: T, data: {
       PackVoltage: 375, PackCurrent: 23, ACChargingPower: 8.6,
     }}), env);
     const latest = await getLatest(env, VIN);
@@ -93,17 +96,17 @@ describe("ingest value normalization", () => {
   });
 
   it("a REST-provided power in the same batch wins over the pack-derived figure", async () => {
-    await handleIngest(req({ vin: VIN, ts: 1000, data: {
+    await handleIngest(req({ vin: VIN, ts: T, data: {
       power: 42, PackVoltage: 375, PackCurrent: -80,
     }}), env);
     const latest = await getLatest(env, VIN);
     expect(latest?.power).toBe(42); // drive_state.power is the true motor figure
-    expect(latest?.power_ts).toBe(1000);
+    expect(latest?.power_ts).toBe(T);
   });
 
   it("normalizes Tesla's imperial distance/speed fields to metric", async () => {
     // Tesla returns miles/mph on both paths regardless of region; columns are km.
-    await handleIngest(req({ vin: VIN, ts: 1000, data: {
+    await handleIngest(req({ vin: VIN, ts: T, data: {
       Odometer: 100,        // miles
       EstBatteryRange: 200, // miles
       VehicleSpeed: 60,     // mph
@@ -120,7 +123,7 @@ describe("ingest value normalization", () => {
     // Regression: unwrapFtValue returned bare primitives without coerce(), so
     // {"key":"Odometer","value":"50000"} stayed a string and toMetric's
     // number-only guard skipped the mi->km conversion.
-    await handleIngest(req({ vin: VIN, ts: 1000, data: [
+    await handleIngest(req({ vin: VIN, ts: T, data: [
       { key: "Odometer", value: "50000" },
     ]}), env);
     const latest = await getLatest(env, VIN);
@@ -129,8 +132,8 @@ describe("ingest value normalization", () => {
 
   it("reports accepted/rejected counts and rejects vin-less items", async () => {
     const resp = await handleIngest(req({ events: [
-      { vin: VIN, ts: 1000, data: { Soc: 50 } },
-      { ts: 1000, data: { Soc: 50 } }, // no vin
+      { vin: VIN, ts: T, data: { Soc: 50 } },
+      { ts: T, data: { Soc: 50 } }, // no vin
     ]}), env);
     expect(await resp.json()).toEqual({ accepted: 1, rejected: 1 });
   });
@@ -139,7 +142,7 @@ describe("ingest value normalization", () => {
 describe("stream-liveness stamp", () => {
   it("handleIngest (the streaming route) stamps stream_ok_ts; the REST path does not", async () => {
     const env = makeEnv();
-    await handleIngest(req({ vin: VIN, ts: 1000, data: { Soc: 55 } }), env);
+    await handleIngest(req({ vin: VIN, ts: T, data: { Soc: 55 } }), env);
     const stamp = await getAppState(env, `stream_ok_ts:${VIN}`);
     expect(Number(stamp)).toBeGreaterThan(0);
 
