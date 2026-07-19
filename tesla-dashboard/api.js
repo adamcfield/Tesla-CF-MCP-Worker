@@ -184,6 +184,8 @@ export const data = {
   sentryLog: (vin, days) => getJson("/data/sentry-log", { vin, days }),
   /** Tesla Fleet API call log & cost breakdown by day/kind, account-wide (no vin). New endpoint — may 404. */
   budgetCallLog: (days) => getJson("/data/budget-calls", { days }),
+  /** Recent alert-log entries (budget/watchdog/rule firings), newest first. Deliberately un-filtered by vin — budget alerts are account-wide and carry none. May 404 on an older worker. */
+  alerts: (limit) => getJson("/data/alerts", { limit }),
   /**
    * Range prediction. With no distance_km, returns {model, ready} so the screen
    * can show model quality + a form; with params, returns the prediction. New endpoint — may 404.

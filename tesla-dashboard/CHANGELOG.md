@@ -9,6 +9,44 @@ feature or screen, the **patch** version for fixes/tweaks/copy changes, and the
 configured. See `CLAUDE.md` at the repo root for the policy on keeping this file
 and `APP_VERSION` (in `app.js`) in sync.
 
+## 1.24.0 — 2026-07-20
+
+Alerts, live auto-refresh, a "Current trip" card, and a set of smaller
+close-the-loop links between screens.
+
+- **New Alerts screen** (`#al`, 🔔 in the sidebar): the worker's alert log
+  (`/data/alerts` — budget warnings, watchdog notices, automation-rule
+  errors) as a newest-first list with a kind chip, relative time, message
+  and rule id. The sidebar bell carries an unread-count badge (alerts
+  newer than the last visit, watermarked in `tm_alerts_seen`); opening
+  the screen marks everything read and clears it. New `data.alerts()`
+  fetcher in `api.js`.
+- **Auto-refresh.** Returning to the tab re-syncs the current screen
+  automatically when the last sync is older than 60 s; and while the car
+  is driving or charging, the current screen re-renders every 45 s —
+  `/data/*` reads are free, so this is just a repaint, not a Tesla API
+  call. Guarded against overlapping refreshes and idle while the tab is
+  hidden.
+- **"Current trip" card on Overview**, from the streamed nav fields:
+  destination name, wall-clock ETA, distance (`nav_miles_to_arrival`
+  arrives in miles — it's not one of the worker's miles→km-normalized
+  fields, so it's converted client-side), predicted battery % at
+  arrival, and the traffic delay when there is one. Hidden entirely when
+  the car isn't navigating.
+- **Charging ETA line** under the Overview battery gauge while actively
+  charging: "done in H:MM", the wall-clock finish time, and the charge
+  rate as km of range per hour (from `charge_rate_mph`, which the store
+  keeps imperial).
+- **Cross-links**: the place name on a charge detail and the start/end
+  labels on a drive detail now click through to the saved place; drive
+  detail gained ‹ › header chevrons stepping to the chronologically
+  previous/next drive (from the same cached list the Drives screen
+  uses). Opening a place from another section now lands properly in the
+  Places section (nav highlight, header and `#pl/{id}` hash all follow).
+- Chart explorer: **Pack voltage** (V) and **Pack current** (A) chips,
+  next to Motor power — pure config, the timeline-chart endpoint already
+  serves any EAV field.
+
 ## 1.23.0 — 2026-07-12
 
 Overview's Charge level and Cabin climate cards now run on the Chart
