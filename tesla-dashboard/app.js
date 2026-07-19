@@ -5,7 +5,7 @@ import { destroyMaps, renderPointMap, renderRouteMap, renderLifetimeMap, createR
 // Bump on every change to this dashboard (UI, features, or the /data/*
 // endpoints it depends on) and add a matching entry to CHANGELOG.md — see
 // the versioning policy in the repo's CLAUDE.md. Shown in the sidebar footer.
-const APP_VERSION = "1.24.0";
+const APP_VERSION = "1.25.0";
 
 const root = document.getElementById("app");
 let shellBound = false; // guards one-time attach of the root click handler + sync timer
@@ -929,6 +929,10 @@ function onRootClick(e) {
     showScreen();
   } else if (action === "load-live") {
     loadLiveVehicleData();
+  } else if (action === "push-enable") {
+    enablePush(t);
+  } else if (action === "push-disable") {
+    disablePush(t);
   } else if (action === "ask-send") {
     askSubmit();
   } else if (action === "ask-suggest") {
@@ -1258,22 +1262,143 @@ async function refreshAlertsBadge() {
   updateAlertsBadge(alerts.filter((a) => a.ts > seen).length);
 }
 
+// --- Web Push (the "Push notifications" card at the top of the screen) -----
+// The worker's cron delivers undelivered alert-log entries as encrypted push
+// messages (webpush.ts); this side owns the browser half: permission +
+// pushManager.subscribe with the worker's VAPID key, registered via
+// data.pushSubscribe. sw.js turns the push events into notifications.
+
+/** pushManager.subscribe wants the VAPID key as raw bytes, not base64url. */
+function urlBase64ToUint8Array(s) {
+  const b64 = (s + "=".repeat((4 - (s.length % 4)) % 4)).replace(/-/g, "+").replace(/_/g, "/");
+  return Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
+}
+
+/**
+ * Where this device stands: "unsupported" (no push API — on iOS that means
+ * "not installed to the Home Screen"), "denied" (permission blocked),
+ * "no-server" (worker predates the endpoint or has no VAPID keys),
+ * "enabled" (live subscription) or "off".
+ */
+async function getPushState() {
+  if (!("serviceWorker" in navigator) || !("Notification" in window) || !("PushManager" in window)) {
+    return { status: "unsupported" };
+  }
+  if (Notification.permission === "denied") return { status: "denied" };
+  const res = await safe(cached("push_vapid_key", () => data.pushVapidKey()), null);
+  if (!res?.key) return { status: "no-server" };
+  const reg = await navigator.serviceWorker.getRegistration().catch(() => null);
+  const sub = reg ? await reg.pushManager.getSubscription().catch(() => null) : null;
+  return { status: sub ? "enabled" : "off", key: res.key };
+}
+
+function pushCardHtml(p) {
+  const NOTES = {
+    unsupported: "This browser doesn't expose web push. On iPhone/iPad it's only available to the installed app — Share → Add to Home Screen (iOS 16.4+), then open it from the Home Screen and enable push here.",
+    denied: "Notifications are blocked for this site. Re-enable them in the browser's site settings (or, for the installed app, in the system notification settings), then reload.",
+    "no-server": "The deployed worker can't push yet — either it predates /data/push-vapid-key (redeploy it) or it has no VAPID keys: run node scripts/gen-vapid-keys.mjs in tesla-cf-mcp-worker/, set the two printed secrets, and redeploy.",
+    enabled: "Enabled on this device — undelivered alerts (budget, watchdog, rule errors) arrive as notifications on the worker's next automation tick (~15 min), even with the dashboard closed.",
+    off: "Get the worker's alerts — budget warnings, watchdog notices, rule errors — as notifications on this device, even when the dashboard is closed.",
+  };
+  const button =
+    p.status === "enabled"
+      ? `<button class="tm-chip-btn" data-action="push-disable">Disable</button>`
+      : p.status === "off"
+        ? `<button class="tm-chip-btn" data-action="push-enable">Enable</button>`
+        : "";
+  const pill =
+    p.status === "enabled"
+      ? `<span class="tm-pill tm-pill-chip" style="font-size:10.5px;">enabled</span>`
+      : p.status === "off"
+        ? ""
+        : `<span class="tm-pill tm-pill-warn" style="font-size:10.5px;">${esc(p.status === "no-server" ? "worker not configured" : p.status === "denied" ? "permission denied" : "unsupported")}</span>`;
+  return `
+    <div class="tm-card tm-card-pad" style="margin-bottom:16px;">
+      <div class="tm-flex-row" style="justify-content:space-between;gap:12px;flex-wrap:wrap;align-items:flex-start;">
+        <div style="min-width:220px;flex:1;">
+          <div style="font-weight:600;font-size:14px;">Push notifications ${pill}</div>
+          <div style="font-size:12.5px;color:var(--sub);margin-top:4px;line-height:1.55;">${esc(NOTES[p.status] || "")}</div>
+          <div id="tm-push-error" style="font-size:12px;color:var(--bad);margin-top:4px;"></div>
+        </div>
+        ${button}
+      </div>
+    </div>`;
+}
+
+function pushErrorNote(message) {
+  const el = document.getElementById("tm-push-error");
+  if (el) el.textContent = message;
+}
+
+async function enablePush(btn) {
+  btn.disabled = true;
+  btn.textContent = "Enabling…";
+  try {
+    const res = await data.pushVapidKey();
+    if (!res?.key) throw new Error("The worker has no VAPID keys — run scripts/gen-vapid-keys.mjs and set both secrets.");
+    if ((await Notification.requestPermission()) !== "granted") throw new Error("Notification permission wasn't granted");
+    const reg = await navigator.serviceWorker.getRegistration();
+    if (!reg) throw new Error("No service worker registration — push needs the app served over HTTPS");
+    await navigator.serviceWorker.ready;
+    const opts = { userVisibleOnly: true, applicationServerKey: urlBase64ToUint8Array(res.key) };
+    let sub;
+    try {
+      sub = await reg.pushManager.subscribe(opts);
+    } catch (err) {
+      // A stale subscription made under a DIFFERENT VAPID key blocks a new
+      // one (InvalidStateError) — drop it and retry once.
+      const old = await reg.pushManager.getSubscription();
+      if (!old) throw err;
+      await old.unsubscribe();
+      sub = await reg.pushManager.subscribe(opts);
+    }
+    await data.pushSubscribe(sub.toJSON());
+    renderAlerts();
+  } catch (e) {
+    btn.disabled = false;
+    btn.textContent = "Enable";
+    pushErrorNote(e?.message || "Couldn't enable push");
+  }
+}
+
+async function disablePush(btn) {
+  btn.disabled = true;
+  btn.textContent = "Disabling…";
+  try {
+    const reg = await navigator.serviceWorker.getRegistration();
+    const sub = reg ? await reg.pushManager.getSubscription() : null;
+    if (sub) {
+      const endpoint = sub.endpoint;
+      await sub.unsubscribe();
+      // Best-effort: the browser side is already unsubscribed; a row left
+      // behind ages out server-side after 10 failed sends anyway.
+      await data.pushUnsubscribe(endpoint).catch(() => {});
+    }
+    renderAlerts();
+  } catch (e) {
+    btn.disabled = false;
+    btn.textContent = "Disable";
+    pushErrorNote(e?.message || "Couldn't disable push");
+  }
+}
+
 async function renderAlerts() {
-  const alerts = await loadAlerts();
+  const [alerts, push] = await Promise.all([loadAlerts(), getPushState()]);
   // Opening the screen consumes the unread state — everything in the log up to
   // its newest entry counts as seen from here on.
   if (alerts?.length) localStorage.setItem(ALERTS_SEEN_KEY, String(alerts[0].ts));
   updateAlertsBadge(0);
+  const pushCard = pushCardHtml(push);
 
   if (!alerts) {
-    return setContent(emptyHtml("Alerts not available on the deployed worker",
+    return setContent(pushCard + emptyHtml("Alerts not available on the deployed worker",
       "This screen reads /data/alerts, which the live worker doesn't answer yet — redeploy it (cd tesla-cf-mcp-worker && npm run deploy) and alerts show up from then on."));
   }
   if (!alerts.length) {
-    return setContent(emptyHtml("No alerts yet",
+    return setContent(pushCard + emptyHtml("No alerts yet",
       "Budget warnings, watchdog notices and automation-rule errors will appear here as the worker records them."));
   }
-  setContent(`
+  setContent(pushCard + `
     <div class="tm-card tm-table-wrap">
       <div style="min-width:640px;">
         ${alerts.map((a) => `
