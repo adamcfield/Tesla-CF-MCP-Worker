@@ -122,6 +122,34 @@ describe("getMediaStats", () => {
     const res = (await getMediaStats(env, VIN, 90)) as { top_tracks: { title: string }[] };
     expect(res.top_tracks.map((t) => t.title)).toEqual(["Real Track"]);
   });
+
+  it("a playback-stopped sample ('') ends the span -- the last track of a session must not absorb the silence gap", async () => {
+    // Regression (observed live 2026-07-19): empties were filtered out BEFORE
+    // span computation, so every session's final track ran until the NEXT
+    // session's first track -- hours later, capped at exactly 600s -- and the
+    // whole leaderboard read as uniform 5-10 minute plays.
+    const t0 = NOW - 7200;
+    await recordEvents(env, VIN, [
+      { field: "media_title", value: "Short Song", ts: t0 },
+      { field: "media_title", value: "", ts: t0 + 180 }, // stopped after 3 min
+      { field: "media_title", value: "Next Session Track", ts: t0 + 3600 }, // an hour later
+    ]);
+    const res = (await getMediaStats(env, VIN, 90)) as { top_tracks: { title: string; minutes: number }[] };
+    expect(res.top_tracks.find((t) => t.title === "Short Song")!.minutes).toBe(3); // NOT 10
+  });
+
+  it("track -> stop -> same track again counts as two plays, not one", async () => {
+    // With empties filtered out, LAG saw "Encore" -> "Encore" and collapsed a
+    // genuine replay into one play.
+    const t0 = NOW - 3600;
+    await recordEvents(env, VIN, [
+      { field: "media_title", value: "Encore", ts: t0 },
+      { field: "media_title", value: "", ts: t0 + 200 },
+      { field: "media_title", value: "Encore", ts: t0 + 900 },
+    ]);
+    const res = (await getMediaStats(env, VIN, 90)) as { top_tracks: { title: string; plays: number }[] };
+    expect(res.top_tracks.find((t) => t.title === "Encore")!.plays).toBe(2);
+  });
 });
 
 describe("mediaTrackChanges — drive-page markers", () => {

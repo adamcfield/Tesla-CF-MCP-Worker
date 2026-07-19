@@ -1990,11 +1990,19 @@ async function mediaLeaderboard(
   sinceTs: number,
   nowTs: number,
 ): Promise<{ name: string; plays: number; seconds: number }[]> {
+  // Empty samples ('' = playback stopped) are KEPT in raw/starts as span
+  //   terminators and only excluded from the final aggregation. Filtering
+  //   them out earlier had two observed corruptions: every session's last
+  //   track absorbed the following silence until the NEXT track started --
+  //   hours later, capped at exactly 600s, so the whole leaderboard read as
+  //   uniform 5-10-minute plays -- and track -> stop -> same track again
+  //   collapsed into one play because the LAG never saw the stop between.
   const rs = await env.DB.prepare(
     `WITH raw AS (
-       SELECT ts, value_text AS v, LAG(value_text) OVER (ORDER BY ts) AS prev_v
+       SELECT ts, COALESCE(value_text, '') AS v,
+              LAG(COALESCE(value_text, '')) OVER (ORDER BY ts) AS prev_v
        FROM telemetry_events
-       WHERE vin = ?1 AND field = ?2 AND ts >= ?3 AND value_text IS NOT NULL AND value_text != ''
+       WHERE vin = ?1 AND field = ?2 AND ts >= ?3
      ),
      starts AS (
        SELECT ts, v FROM raw WHERE prev_v IS NULL OR prev_v != v
@@ -2006,7 +2014,7 @@ async function mediaLeaderboard(
      -- runs to wall-clock "now", so a car idle for days since its last sample
      -- would count that whole gap as listening time for whatever was last playing.
      SELECT v AS name, COUNT(*) AS plays, SUM(MAX(0, MIN(end_ts - ts, 600))) AS seconds
-     FROM spans GROUP BY v ORDER BY plays DESC`,
+     FROM spans WHERE v != '' GROUP BY v ORDER BY plays DESC`,
   )
     .bind(vin, field, sinceTs, nowTs)
     .all<{ name: string; plays: number; seconds: number }>();
@@ -2077,12 +2085,15 @@ async function mediaLeaderboardByDriver(
 ): Promise<{ driver: string; name: string; plays: number }[]> {
   const rs = await env.DB.prepare(
     `WITH raw AS (
-       SELECT ts, value_text AS v, LAG(value_text) OVER (ORDER BY ts) AS prev_v
+       SELECT ts, COALESCE(value_text, '') AS v,
+              LAG(COALESCE(value_text, '')) OVER (ORDER BY ts) AS prev_v
        FROM telemetry_events
-       WHERE vin = ?1 AND field = ?2 AND ts >= ?3 AND value_text IS NOT NULL AND value_text != ''
+       WHERE vin = ?1 AND field = ?2 AND ts >= ?3
      ),
      starts AS (
-       SELECT ts, v FROM raw WHERE prev_v IS NULL OR prev_v != v
+       -- Empty samples ('' = stopped) stay in raw as play boundaries (same
+       -- rationale as mediaLeaderboard) but never count as plays themselves.
+       SELECT ts, v FROM raw WHERE (prev_v IS NULL OR prev_v != v) AND v != ''
      )
      SELECT COALESCE(d.driver, 'Unassigned') AS driver, s.v AS name, COUNT(*) AS plays
      FROM starts s
