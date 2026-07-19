@@ -397,6 +397,46 @@ describe("telemetry-first: streaming suppresses billed REST reads", () => {
   });
 });
 
+describe("billed-read claim is a CAS, not a blind overwrite", () => {
+  let kv: FakeKV;
+  beforeEach(async () => {
+    kv = new FakeKV();
+    await kv.put("tesla:refresh_token", "R0");
+  });
+  afterEach(() => vi.restoreAllMocks());
+
+  it("two genuinely concurrent pollers past the gap bill exactly once", async () => {
+    // Both invocations start from the same stale billed_ts and both pass the
+    // step-3b gap check via microtask-interleaved reads -- pre-CAS, both then
+    // "claimed" with a plain overwrite and both billed (the TOCTOU window the
+    // adversarial review flagged as newly-hot once suspension was bypassed).
+    const env = makeEnv(kv);
+    let vehicleDataCalls = 0;
+    vi.stubGlobal("fetch", vi.fn(async (url: string) => {
+      const u = String(url);
+      if (u.includes("/oauth2/v3/token")) {
+        return new Response(JSON.stringify({ access_token: "A", refresh_token: "R", expires_in: 3600, token_type: "Bearer" }), { status: 200 });
+      }
+      if (u.includes("/vehicle_data")) {
+        vehicleDataCalls++;
+        return new Response(JSON.stringify({ response: {
+          charge_state: { battery_level: 70, charging_state: "Disconnected", battery_range: 200 },
+          climate_state: {}, drive_state: { shift_state: "D", speed: 45, latitude: 32.1, longitude: 34.8, power: 20 },
+          vehicle_state: { odometer: 1000, locked: true }, vehicle_config: {},
+        } }), { status: 200 });
+      }
+      return new Response(JSON.stringify({ response: { vin: VIN, state: "online" } }), { status: 200 });
+    }));
+    const now = Math.floor(Date.now() / 1000);
+    await putAppState(env, `billed_ts:${VIN}`, `${now - 700} 10`); // both see this stale stamp
+    const [a, b] = await Promise.all([pollOnce(env, VIN), pollOnce(env, VIN)]);
+    expect(vehicleDataCalls).toBe(1); // NOT 2 -- the CAS loser backed off
+    const billed = [a, b].filter((r) => r.polled);
+    expect(billed).toHaveLength(1);
+    expect([a, b].some((r) => r.activity === "throttled")).toBe(true);
+  });
+});
+
 describe("DO scheduler re-arm delay", () => {
   it("respects the paced interval instead of flooring it at 90s", () => {
     // Regression: the min() fold was seeded with the 90s default, so a 150s

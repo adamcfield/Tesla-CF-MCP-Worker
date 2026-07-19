@@ -243,6 +243,53 @@ export async function ensureSchema(env: Env): Promise<void> {
     `CREATE UNIQUE INDEX IF NOT EXISTS idx_charges_one_active ON charge_sessions (vin) WHERE status='active'`,
   ).run();
 
+  // One synthetic drive per (vin, start_ts): two concurrent applyDerivation
+  // calls can both see "no open drive + odometer jumped" and both synthesize
+  // the same gap. Same supersede-then-index pattern as the sessions above --
+  // the migration only runs when dup rows actually block index creation.
+  try {
+    await env.DB.prepare(
+      `CREATE UNIQUE INDEX IF NOT EXISTS idx_drives_one_synth
+       ON drives (vin, start_ts) WHERE synthetic = 1 AND status = 'complete'`,
+    ).run();
+  } catch {
+    await env.DB.prepare(
+      `UPDATE drives SET status = 'superseded' WHERE synthetic = 1 AND status = 'complete'
+       AND id NOT IN (SELECT MIN(id) FROM drives WHERE synthetic = 1 AND status = 'complete' GROUP BY vin, start_ts)`,
+    ).run();
+    await env.DB.prepare(
+      `CREATE UNIQUE INDEX IF NOT EXISTS idx_drives_one_synth
+       ON drives (vin, start_ts) WHERE synthetic = 1 AND status = 'complete'`,
+    ).run();
+  }
+
+  // One positions row per (vin, ts): a bridge retry of a failed POST (or two
+  // pollers landing the same second) must not double-insert samples that then
+  // double-count in every per-drive aggregate. Insert path uses OR IGNORE.
+  // The base schema has long created a NON-unique index under this exact name
+  // (so a bare CREATE UNIQUE ... IF NOT EXISTS silently no-ops on the name
+  // collision) -- detect that shape via sqlite_master and upgrade in place,
+  // deduping first if live duplicates block the unique build. One SELECT per
+  // cold start once migrated.
+  const posIdx = await env.DB.prepare(
+    `SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'idx_positions_vin_ts'`,
+  ).first<{ sql: string | null }>();
+  if (!posIdx || !/UNIQUE/i.test(posIdx.sql ?? "")) {
+    await env.DB.prepare(`DROP INDEX IF EXISTS idx_positions_vin_ts`).run();
+    try {
+      await env.DB.prepare(
+        `CREATE UNIQUE INDEX idx_positions_vin_ts ON positions (vin, ts)`,
+      ).run();
+    } catch {
+      await env.DB.prepare(
+        `DELETE FROM positions WHERE id NOT IN (SELECT MIN(id) FROM positions GROUP BY vin, ts)`,
+      ).run();
+      await env.DB.prepare(
+        `CREATE UNIQUE INDEX idx_positions_vin_ts ON positions (vin, ts)`,
+      ).run();
+    }
+  }
+
   // vehicle_states has the identical race: the cron connectivity check and the
   // ingest path both call updateStateTimeline, and its read-then-write (find
   // the open row, close it, insert a new one) isn't atomic. Observed live
@@ -324,6 +371,33 @@ export async function putAppState(env: Env, key: string, value: string): Promise
   )
     .bind(key, value, Math.floor(Date.now() / 1000))
     .run();
+}
+
+/**
+ * Compare-and-swap on an app_state key: writes `next` only if the stored
+ * value is still exactly `expected` (pass null for "key must not exist yet").
+ * Returns whether THIS caller won. Exists for claim slots read a moment
+ * before the write -- a plain put there lets two concurrent claimants both
+ * "succeed" (the billed-read TOCTOU in poll.ts).
+ */
+export async function casAppState(
+  env: Env,
+  key: string,
+  expected: string | null,
+  next: string,
+): Promise<boolean> {
+  await ensureSchema(env);
+  const now = Math.floor(Date.now() / 1000);
+  const res =
+    expected === null
+      ? await env.DB.prepare(
+          `INSERT INTO app_state (key, value, updated_at) VALUES (?1, ?2, ?3)
+           ON CONFLICT(key) DO NOTHING`,
+        ).bind(key, next, now).run()
+      : await env.DB.prepare(
+          `UPDATE app_state SET value = ?3, updated_at = ?4 WHERE key = ?1 AND value = ?2`,
+        ).bind(key, expected, next, now).run();
+  return (res.meta.changes ?? 0) > 0;
 }
 
 /** Adds any of `columns` not already present on `table` (nullable, no default). */
@@ -523,7 +597,7 @@ export async function insertPosition(
   s: PositionSample,
 ): Promise<number> {
   const res = await env.DB.prepare(
-    `INSERT INTO positions (
+    `INSERT OR IGNORE INTO positions (
        vin, ts, drive_id, activity, lat, lon, elevation, heading, speed, power,
        odometer, soc, usable_soc, energy_remaining, rated_range, est_range,
        ideal_range, inside_temp, outside_temp, charging_state, charger_power,

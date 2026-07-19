@@ -440,12 +440,18 @@ interface ParsedIngest {
 function parseOne(body: Record<string, unknown>): ParsedIngest | null {
   const vin = typeof body.vin === "string" ? body.vin : null;
   if (!vin) return null;
-  let ts = Math.floor(Date.now() / 1000);
+  const now = Math.floor(Date.now() / 1000);
+  let ts = now;
   if (typeof body.ts === "number") ts = Math.floor(body.ts > 1e12 ? body.ts / 1000 : body.ts);
   else if (typeof body.createdAt === "string") {
     const parsed = Date.parse(body.createdAt);
     if (!Number.isNaN(parsed)) ts = Math.floor(parsed / 1000);
   }
+  // Clock sanity: a corrupt/clock-skewed stamp must not enter the monotonic
+  // derivation machine or become a permanent drive/state boundary. Days-old
+  // buffered data is still accepted (the vehicle legitimately queues offline
+  // telemetry) -- applyIngest's late-batch guard keeps it history-only.
+  if (ts > now + 300 || ts < now - 30 * 86400) return null;
 
   const fields: Record<string, unknown> = {};
   if (Array.isArray(body.data)) {
@@ -463,9 +469,26 @@ function parseOne(body: Record<string, unknown>): ParsedIngest | null {
   return { vin, ts, fields };
 }
 
+/**
+ * A batch may arrive AFTER a newer one has already been applied: the vehicle
+ * replays buffered telemetry when connectivity returns, and separate POSTs
+ * are not ordered relative to each other (handleIngest only sorts WITHIN one
+ * POST). Applying such a batch normally would revert merged fields to older
+ * values and, worse, feed the drive/charge/state machines out of order --
+ * observed live 2026-07-18 as second-long driving/charging flip-flop rows in
+ * the permanent state timeline. Batches older than the doc's last-applied
+ * watermark (with a small tolerance for stream-vs-REST arrival jitter) are
+ * recorded as EAV history only.
+ */
+const LATE_INGEST_TOLERANCE_S = 5;
+
 /** Applies one parsed ingest: latest + structured sample + derivation + EAV + rules. */
 export async function applyIngest(env: Env, parsed: ParsedIngest): Promise<LatestState> {
   const events: TelemetryEvent[] = [];
+  // Position-column fields normally skip EAV (the positions row holds them),
+  // but a LATE batch writes no positions row -- these keep its samples from
+  // being silently discarded (recorded to EAV on that path only).
+  const posEvents: TelemetryEvent[] = [];
   const patch: Record<string, unknown> = {};
 
   for (const [field, rawValue] of Object.entries(parsed.fields)) {
@@ -502,6 +525,8 @@ export async function applyIngest(env: Env, parsed: ParsedIngest): Promise<Lates
     // EAV history holds only fields not captured as structured position columns.
     if (!POSITION_COLUMNS.has(canonical) && !META_FIELDS.has(canonical) && canonical !== "location") {
       events.push({ field: canonical, value, ts: parsed.ts });
+    } else if (POSITION_COLUMNS.has(canonical)) {
+      posEvents.push({ field: canonical, value, ts: parsed.ts });
     }
   }
 
@@ -509,6 +534,13 @@ export async function applyIngest(env: Env, parsed: ParsedIngest): Promise<Lates
   // charge type so charge sessions record AC vs DC.
   resolveCharging(patch);
   derivePower(patch, parsed.ts);
+
+  const prior = await getLatest(env, parsed.vin);
+  if (prior && parsed.ts < prior.updated_at - LATE_INGEST_TOLERANCE_S) {
+    // Late replayed batch: history only (see LATE_INGEST_TOLERANCE_S above).
+    await recordEvents(env, parsed.vin, [...events, ...posEvents]);
+    return prior;
+  }
 
   await recordEvents(env, parsed.vin, events);
   const { previous, current } = await mergeLatest(env, parsed.vin, patch, parsed.ts);
@@ -591,23 +623,31 @@ export async function handleIngest(request: Request, env: Env): Promise<Response
   const parsed = items.map(parseOne).filter((x): x is NonNullable<typeof x> => x !== null);
   parsed.sort((a, b2) => a.ts - b2.ts);
 
+  for (const p of parsed) await applyIngest(env, p);
+
   // Fleet Telemetry billing: each transmitted field is one billed signal
   // ($1/150k). Counted HERE (the streaming sink) — NOT in applyIngest, which
   // the REST poll path also calls and already bills as one vehicle_data read.
   // This lets the budget gates + pacing see streaming spend and throttle the
   // poller accordingly, so poll + stream together can't cross Tesla's line.
+  // Counted AFTER the apply loop so a bridge retry of a failed POST doesn't
+  // ledger the same signals twice (Tesla's own meter bills on vehicle
+  // transmit, once, regardless of bridge->worker delivery attempts).
   const signals = parsed.reduce((n, p) => n + Object.keys(p.fields).length, 0);
   if (signals > 0) await recordSpend(env, "signal", signals);
-
-  for (const p of parsed) await applyIngest(env, p);
 
   // Stream-liveness stamp (per vin, throttled to >=60s between writes):
   // pollOnce reads this to skip billed REST reads while streaming is
   // delivering (telemetry-first). Only the HTTP ingest route stamps it --
   // the REST poll path enters via applyVehicleData and must not count as
-  // "streaming is alive".
+  // "streaming is alive". Gated on the batch carrying RECENT event
+  // timestamps: a backlog drain of hours-old buffered data is history
+  // arriving, not a live stream, and stamping it would suppress the REST
+  // fallback exactly when the stream is most likely to actually be down.
   const nowS = Math.floor(Date.now() / 1000);
   for (const vinSeen of new Set(parsed.map((p) => p.vin))) {
+    const freshest = Math.max(...parsed.filter((p) => p.vin === vinSeen).map((p) => p.ts));
+    if (nowS - freshest > 120) continue;
     try {
       const prev = Number((await getAppState(env, `stream_ok_ts:${vinSeen}`)) ?? "0");
       if (nowS - prev >= 60) await putAppState(env, `stream_ok_ts:${vinSeen}`, String(nowS));
