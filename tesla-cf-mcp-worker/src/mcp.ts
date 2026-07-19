@@ -557,6 +557,22 @@ const TOOLS: Tool[] = [
     handler: (env, a) => tracking.getBatteryDegradation(env, a.vin),
   },
   {
+    name: "get_pack_health",
+    description:
+      "Battery pack-health report: daily brick-voltage spread (mV, split at-rest vs under-load via same-timestamp " +
+      "PackCurrent), module temperature spread, daily minimum isolation resistance, weak-brick detection (one brick " +
+      "dominating the minimum — the earliest weak-cell signal), first-vs-last-week trends and a plain-language " +
+      "verdict. Needs BrickVoltageMax/Min, NumBrickVoltageMax/Min, ModuleTempMax/Min, IsolationResistance and " +
+      "PackVoltage/PackCurrent streamed via configure_telemetry; returns has_data:false with guidance until then. " +
+      "Free — reads logged data.",
+    inputSchema: {
+      type: "object",
+      properties: { ...vinProp, days: { type: "number", default: 30 } },
+      required: ["vin"],
+    },
+    handler: (env, a) => tracking.getPackHealth(env, a.vin, a.days ?? 30),
+  },
+  {
     name: "get_vampire_drain",
     description:
       "Idle/vampire drain: SoC lost while parked, split ASLEEP vs AWAKE-IDLE (Sentry burns ~10x more than sleep), " +
@@ -972,6 +988,7 @@ const READ_TOOLS = new Set([
   "get_charge_sessions",
   "get_charge_curve",
   "get_battery_degradation",
+  "get_pack_health",
   "get_vampire_drain",
   "get_sentry_log",
   "get_state_timeline",

@@ -1807,6 +1807,239 @@ export async function getVampireDrain(env: Env, vin: string, days = 30): Promise
 }
 
 // ---------------------------------------------------------------------------
+// Derived: battery pack health (brick voltages, module temps, isolation)
+// ---------------------------------------------------------------------------
+
+const PACK_REST_MAX_A = 2; // |pack_current| below this = pack electrically at rest
+const PACK_LOAD_MIN_A = 20; // |pack_current| at/above this = genuinely under load
+const WEAK_BRICK_MIN_SHARE = 0.6;
+const WEAK_BRICK_MIN_SAMPLES = 10;
+
+/** Avg same-timestamp brick spread (mV) over [fromTs, toTs), rest samples only. */
+async function restSpreadAvgMv(env: Env, vin: string, fromTs: number, toTs: number): Promise<{ avg_mv: number | null; samples: number }> {
+  const rs = await env.DB.prepare(
+    `SELECT AVG((mx.value_num - mn.value_num) * 1000) AS avg_mv, COUNT(*) AS n
+     FROM (SELECT ts, value_num FROM telemetry_events WHERE vin = ?1 AND field = 'brick_v_max' AND ts >= ?2 AND ts < ?3 AND value_num IS NOT NULL) mx
+     JOIN (SELECT ts, value_num FROM telemetry_events WHERE vin = ?1 AND field = 'brick_v_min' AND ts >= ?2 AND ts < ?3 AND value_num IS NOT NULL) mn ON mn.ts = mx.ts
+     JOIN (SELECT ts, value_num FROM telemetry_events WHERE vin = ?1 AND field = 'pack_current' AND ts >= ?2 AND ts < ?3 AND value_num IS NOT NULL) pc ON pc.ts = mx.ts
+     WHERE ABS(pc.value_num) < ${PACK_REST_MAX_A}`,
+  )
+    .bind(vin, fromTs, toTs)
+    .first<{ avg_mv: number | null; n: number }>();
+  return { avg_mv: rs?.avg_mv ?? null, samples: rs?.n ?? 0 };
+}
+
+async function isolationAvgKohm(env: Env, vin: string, fromTs: number, toTs: number): Promise<number | null> {
+  const rs = await env.DB.prepare(
+    `SELECT AVG(value_num) AS avg FROM telemetry_events
+     WHERE vin = ?1 AND field = 'isolation_resistance' AND ts >= ?2 AND ts < ?3 AND value_num IS NOT NULL`,
+  )
+    .bind(vin, fromTs, toTs)
+    .first<{ avg: number | null }>();
+  return rs?.avg ?? null;
+}
+
+/**
+ * Pack-health report from the BMS telemetry fields. Brick voltage spread
+ * (brick_v_max - brick_v_min) is only meaningful at a known load — under load
+ * tens of mV of ohmic imbalance is normal, while at rest a healthy pack sits
+ * under ~30 mV — so every max/min pair is classified rest (<2 A) vs load
+ * (≥20 A) via the pack_current row at the SAME timestamp (the fields stream
+ * on one interval, so identical ts is the norm). Pairs with no same-ts
+ * current, or in the 2–20 A dead band, are skipped rather than misclassified.
+ *
+ * weak_brick flags one brick number dominating brick_v_min_num — a
+ * consistently-lowest brick is the earliest weak-cell signal, long before
+ * capacity or range move. isolation_trend compares first-week vs last-week
+ * isolation resistance: a sustained decline is a service-worthy safety
+ * signal (moisture/coolant finding a path to the chassis), not a wear item.
+ */
+export async function getPackHealth(env: Env, vin: string, days = 30): Promise<unknown> {
+  await ensureSchema(env);
+  const nowTs = Math.floor(Date.now() / 1000);
+  const sinceTs = nowTs - Math.round(days * 86400);
+
+  const streamed = await env.DB.prepare(
+    `SELECT COUNT(DISTINCT field) AS n FROM telemetry_events
+     WHERE vin = ?1 AND ts >= ?2 AND field IN ('brick_v_max','brick_v_min','brick_v_min_num','module_temp_max','module_temp_min','isolation_resistance')`,
+  )
+    .bind(vin, sinceTs)
+    .first<{ n: number }>();
+  if (!streamed?.n) {
+    return {
+      vin, days, has_data: false,
+      note: "No pack-health telemetry recorded yet — stream BrickVoltageMax/Min, NumBrickVoltageMax/Min, " +
+        "ModuleTempMax/Min, IsolationResistance, PackVoltage and PackCurrent via configure_telemetry to start " +
+        "tracking cell balance and isolation.",
+    };
+  }
+
+  const dayExpr = (col: string) => `date(${col}, 'unixepoch')`;
+  const spreadRs = await env.DB.prepare(
+    `SELECT ${dayExpr("mx.ts")} AS day,
+            AVG(CASE WHEN ABS(pc.value_num) < ${PACK_REST_MAX_A} THEN (mx.value_num - mn.value_num) * 1000 END) AS rest_avg_mv,
+            MAX(CASE WHEN ABS(pc.value_num) < ${PACK_REST_MAX_A} THEN (mx.value_num - mn.value_num) * 1000 END) AS rest_max_mv,
+            COUNT(CASE WHEN ABS(pc.value_num) < ${PACK_REST_MAX_A} THEN 1 END) AS rest_n,
+            AVG(CASE WHEN ABS(pc.value_num) >= ${PACK_LOAD_MIN_A} THEN (mx.value_num - mn.value_num) * 1000 END) AS load_avg_mv,
+            MAX(CASE WHEN ABS(pc.value_num) >= ${PACK_LOAD_MIN_A} THEN (mx.value_num - mn.value_num) * 1000 END) AS load_max_mv,
+            COUNT(CASE WHEN ABS(pc.value_num) >= ${PACK_LOAD_MIN_A} THEN 1 END) AS load_n
+     FROM (SELECT ts, value_num FROM telemetry_events WHERE vin = ?1 AND field = 'brick_v_max' AND ts >= ?2 AND value_num IS NOT NULL) mx
+     JOIN (SELECT ts, value_num FROM telemetry_events WHERE vin = ?1 AND field = 'brick_v_min' AND ts >= ?2 AND value_num IS NOT NULL) mn ON mn.ts = mx.ts
+     JOIN (SELECT ts, value_num FROM telemetry_events WHERE vin = ?1 AND field = 'pack_current' AND ts >= ?2 AND value_num IS NOT NULL) pc ON pc.ts = mx.ts
+     GROUP BY day ORDER BY day ASC`,
+  )
+    .bind(vin, sinceTs)
+    .all<{ day: string; rest_avg_mv: number | null; rest_max_mv: number | null; rest_n: number; load_avg_mv: number | null; load_max_mv: number | null; load_n: number }>();
+
+  const tempRs = await env.DB.prepare(
+    `SELECT ${dayExpr("tx.ts")} AS day, AVG(tx.value_num - tn.value_num) AS spread_c
+     FROM (SELECT ts, value_num FROM telemetry_events WHERE vin = ?1 AND field = 'module_temp_max' AND ts >= ?2 AND value_num IS NOT NULL) tx
+     JOIN (SELECT ts, value_num FROM telemetry_events WHERE vin = ?1 AND field = 'module_temp_min' AND ts >= ?2 AND value_num IS NOT NULL) tn ON tn.ts = tx.ts
+     GROUP BY day ORDER BY day ASC`,
+  )
+    .bind(vin, sinceTs)
+    .all<{ day: string; spread_c: number | null }>();
+
+  const isoRs = await env.DB.prepare(
+    `SELECT ${dayExpr("ts")} AS day, MIN(value_num) AS min_kohm
+     FROM telemetry_events WHERE vin = ?1 AND field = 'isolation_resistance' AND ts >= ?2 AND value_num IS NOT NULL
+     GROUP BY day ORDER BY day ASC`,
+  )
+    .bind(vin, sinceTs)
+    .all<{ day: string; min_kohm: number }>();
+
+  // Merge the three per-day aggregates on the day key (a day can have any subset).
+  interface DailyRow {
+    day: string;
+    rest_avg_spread_mv: number | null; rest_max_spread_mv: number | null; rest_samples: number;
+    load_avg_spread_mv: number | null; load_max_spread_mv: number | null; load_samples: number;
+    module_temp_spread_c: number | null; min_isolation_kohm: number | null;
+  }
+  const byDay = new Map<string, DailyRow>();
+  const rowFor = (d: string): DailyRow => {
+    let r = byDay.get(d);
+    if (!r) {
+      r = {
+        day: d,
+        rest_avg_spread_mv: null, rest_max_spread_mv: null, rest_samples: 0,
+        load_avg_spread_mv: null, load_max_spread_mv: null, load_samples: 0,
+        module_temp_spread_c: null, min_isolation_kohm: null,
+      };
+      byDay.set(d, r);
+    }
+    return r;
+  };
+  for (const s of spreadRs.results ?? []) {
+    const r = rowFor(s.day);
+    r.rest_avg_spread_mv = s.rest_avg_mv != null ? round(s.rest_avg_mv, 1) : null;
+    r.rest_max_spread_mv = s.rest_max_mv != null ? round(s.rest_max_mv, 1) : null;
+    r.rest_samples = s.rest_n;
+    r.load_avg_spread_mv = s.load_avg_mv != null ? round(s.load_avg_mv, 1) : null;
+    r.load_max_spread_mv = s.load_max_mv != null ? round(s.load_max_mv, 1) : null;
+    r.load_samples = s.load_n;
+  }
+  for (const t of tempRs.results ?? []) {
+    if (t.spread_c != null) rowFor(t.day).module_temp_spread_c = round(t.spread_c, 1);
+  }
+  for (const i of isoRs.results ?? []) rowFor(i.day).min_isolation_kohm = round(i.min_kohm, 0);
+  const daily = [...byDay.values()].sort((a, b) => a.day.localeCompare(b.day));
+
+  const brickRs = await env.DB.prepare(
+    `SELECT CAST(value_num AS INTEGER) AS brick, COUNT(*) AS n
+     FROM telemetry_events WHERE vin = ?1 AND field = 'brick_v_min_num' AND ts >= ?2 AND value_num IS NOT NULL
+     GROUP BY brick ORDER BY n DESC`,
+  )
+    .bind(vin, sinceTs)
+    .all<{ brick: number; n: number }>();
+  const brickRows = brickRs.results ?? [];
+  const brickTotal = brickRows.reduce((s, r) => s + r.n, 0);
+  const topBrick = brickRows[0];
+  const weakBrick =
+    topBrick && brickTotal >= WEAK_BRICK_MIN_SAMPLES && topBrick.n / brickTotal > WEAK_BRICK_MIN_SHARE
+      ? { number: topBrick.brick, share: round(topBrick.n / brickTotal, 3), samples: brickTotal }
+      : null;
+
+  // First vs last 7 days of the window (they overlap when days < 14 — the
+  // trend is then near-flat by construction, the honest answer for a window
+  // too short to trend).
+  const weekS = 7 * 86400;
+  const [restFirst, restLast, restAll] = await Promise.all([
+    restSpreadAvgMv(env, vin, sinceTs, sinceTs + weekS),
+    restSpreadAvgMv(env, vin, nowTs - weekS, nowTs + 1),
+    restSpreadAvgMv(env, vin, sinceTs, nowTs + 1),
+  ]);
+  const [isoFirst, isoLast] = await Promise.all([
+    isolationAvgKohm(env, vin, sinceTs, sinceTs + weekS),
+    isolationAvgKohm(env, vin, nowTs - weekS, nowTs + 1),
+  ]);
+
+  const isolationTrend = isoFirst != null && isoLast != null
+    ? {
+        first_week_avg_kohm: round(isoFirst, 0),
+        last_week_avg_kohm: round(isoLast, 0),
+        declining: isoLast < isoFirst * 0.9,
+        note: "A sustained isolation-resistance decline is a service-worthy safety signal (moisture/coolant " +
+          "finding a path to the chassis) — book an inspection if it keeps falling.",
+      }
+    : null;
+  const restSpreadTrend = restFirst.avg_mv != null && restLast.avg_mv != null
+    ? {
+        first_week_avg_mv: round(restFirst.avg_mv, 1),
+        last_week_avg_mv: round(restLast.avg_mv, 1),
+        rising: restLast.avg_mv > restFirst.avg_mv * 1.2,
+      }
+    : null;
+
+  // Plain-language verdict — honest but unalarming: these are early-warning
+  // signals, not failures, and the healthy ranges are stated so the numbers
+  // mean something to a non-BMS-engineer.
+  const restRef = restLast.avg_mv ?? restAll.avg_mv;
+  const isoRef = isoLast ?? (isoRs.results?.length ? isoRs.results[isoRs.results.length - 1]!.min_kohm : null);
+  const bits: string[] = [];
+  if (restRef != null) {
+    bits.push(
+      restRef <= 30
+        ? `Resting brick-voltage spread averages ${round(restRef, 1)} mV — under the ~30 mV that's normal at rest, so cell balance looks healthy.`
+        : `Resting brick-voltage spread averages ${round(restRef, 1)} mV — above the ~30 mV typical at rest; not alarming on its own, but worth watching.`,
+    );
+    if (restSpreadTrend?.rising) {
+      bits.push("It has also risen more than 20% first-week vs last-week — a developing-imbalance signal.");
+    }
+  } else {
+    bits.push("Not enough at-rest samples yet to judge cell balance (brick voltages need a same-timestamp PackCurrent reading to classify).");
+  }
+  if (weakBrick) {
+    bits.push(
+      `Brick ${weakBrick.number} reads lowest in ${Math.round(weakBrick.share * 100)}% of samples — a consistently-lowest brick is the earliest weak-cell signal, worth keeping an eye on.`,
+    );
+  }
+  if (isoRef != null) {
+    if (isolationTrend?.declining) {
+      bits.push(
+        `Isolation resistance fell from ~${isolationTrend.first_week_avg_kohm} to ~${isolationTrend.last_week_avg_kohm} kΩ over the window — a sustained decline is a service-worthy safety signal, so book a service inspection if it continues.`,
+      );
+    } else {
+      bits.push(
+        isoRef >= 1000
+          ? `Isolation resistance sits around ${round(isoRef, 0)} kΩ — readings in the thousands of kΩ are healthy.`
+          : `Isolation resistance sits around ${round(isoRef, 0)} kΩ — on the low side (healthy packs read in the thousands of kΩ); watch the daily minimums.`,
+      );
+    }
+  }
+
+  return {
+    vin,
+    days,
+    has_data: true,
+    daily,
+    weak_brick: weakBrick,
+    isolation_trend: isolationTrend,
+    rest_spread_trend: restSpreadTrend,
+    summary: bits.join(" "),
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Derived: Sentry Mode event log
 // ---------------------------------------------------------------------------
 
