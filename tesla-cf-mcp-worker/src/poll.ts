@@ -90,6 +90,15 @@ const BILLED_GAP_FRAC = 0.8;
 const STREAM_FRESH_S = 330;
 /** Even with a healthy stream, do one billed reconciliation read this often (odometer/full-snapshot drift). */
 const RECONCILE_BILLED_S = 3600;
+/**
+ * Reconciliation gap while streaming shows the car DRIVING. PR #56 ran this
+ * at the full 10-60s budget-paced driving cadence purely because motor power
+ * was REST-only; power is now derived from streamed PackVoltage×PackCurrent
+ * (derivePower in ingest.ts), so the billed read is back to being just an
+ * odometer/full-snapshot drift check — 10 minutes keeps drive distances
+ * honest at ~1/60th of the burst cost ($0.012/driving-hour vs $0.72).
+ */
+const DRIVING_RECONCILE_S = 600;
 
 const POLL_STATE = (vin: string) => `poll_state:${vin}`;
 const POLL_OK = (vin: string) => `poll_ok_ts:${vin}`;
@@ -201,17 +210,15 @@ export async function pollOnce(env: Env, vin: string): Promise<PollResult> {
   //     per hour, and fall back to normal REST pacing automatically the
   //     moment the stream goes quiet.
   //
-  //     Exception: motor power (drive_state.power) has NO Fleet Telemetry
-  //     streaming equivalent at all (checked against the full streaming field
-  //     catalog -- only per-corner Di* diagnostics exist), so it can only ever
-  //     be refreshed here. An hour-long gap left it stuck on one stale reading
-  //     for a whole day of driving (see power_ts in ingest.ts / POWER_STALE_S
-  //     in tracking.ts). While the last streaming-derived activity is
-  //     "driving", reconcile at the same budget-paced cadence the pre-
-  //     telemetry-first poller used instead of waiting the full hour.
+  //     While the last streaming-derived activity is "driving", tighten the
+  //     gap to DRIVING_RECONCILE_S: drives are where odometer/snapshot drift
+  //     accumulates fastest, and an hour-long blind spot once swallowed whole
+  //     drives (see PR #56/#59 history). Motor power itself no longer depends
+  //     on these reads -- it's derived stream-side from PackVoltage ×
+  //     PackCurrent (derivePower in ingest.ts).
   if (streamFresh) {
     const lastBilledTs = Number(String((await getAppState(env, BILLED_TS(vin)).catch(() => "0")) ?? "0").split(" ")[0]) || 0;
-    const reconcileGapS = drivingNow ? drivingPaceS : RECONCILE_BILLED_S;
+    const reconcileGapS = drivingNow ? DRIVING_RECONCILE_S : RECONCILE_BILLED_S;
     if (now - lastBilledTs < reconcileGapS) {
       await recordConnectivityState(env, vin, "online").catch(() => {});
       return {
@@ -259,6 +266,9 @@ export async function pollOnce(env: Env, vin: string): Promise<PollResult> {
   //     (non-driving) billed read, possibly hours old, throttles the FIRST
   //     reconciliation read after a driving transition to that stale, much
   //     slower cadence (up to 240s -- long enough to swallow a short drive).
+  //     (With DRIVING_RECONCILE_S at 600s > MAX_BILLED_GAP_S, step 2b is
+  //     currently the binding gate on that path; the cap stays as insurance
+  //     should that constant ever tighten below 240s again.)
   const rawBilled = String((await getAppState(env, BILLED_TS(vin)).catch(() => "0")) ?? "0");
   const [billedTsRaw, billedIvalRaw] = rawBilled.split(" ");
   const lastBilled = Number(billedTsRaw) || 0;

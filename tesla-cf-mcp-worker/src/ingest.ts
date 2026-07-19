@@ -508,6 +508,7 @@ export async function applyIngest(env: Env, parsed: ParsedIngest): Promise<Lates
   // Fold AC/DC charging power + energy into single canonical fields, tagging the
   // charge type so charge sessions record AC vs DC.
   resolveCharging(patch);
+  derivePower(patch, parsed.ts);
 
   await recordEvents(env, parsed.vin, events);
   const { previous, current } = await mergeLatest(env, parsed.vin, patch, parsed.ts);
@@ -536,6 +537,39 @@ function resolveCharging(patch: Record<string, unknown>): void {
     if (dcE !== undefined && (patch.charger_kind === "DC" || acE === undefined)) patch.charge_energy_added = dcE;
     else if (acE !== undefined) patch.charge_energy_added = acE;
   }
+}
+
+/**
+ * Streamed motor power. Fleet Telemetry has no drive_state.power equivalent,
+ * but PackVoltage × PackCurrent (both streamed each minute) IS the pack's
+ * instantaneous power. Sign verified against live data 2026-07-19: pack
+ * current is NEGATIVE on discharge (parked drain -0.6A, hard acceleration
+ * -90A) and POSITIVE flowing in (AC charging +23A, regen +40..98A), so the
+ * product is negated to match the REST drive_state.power convention
+ * (positive = propulsion draw, negative = regen). This is battery-side power
+ * (motor + ~1-2 kW aux), close enough to REST's figure — and unlike REST it
+ * keeps flowing when billed polling is paused, which is what ended the
+ * power-starvation bug family (#55/#56/#59) for good.
+ *
+ * Skipped while the same batch shows active charging: there the product is
+ * the CHARGER's power flowing in, which already lives in charger_power, and
+ * letting it land in "power" would smear large negative readings across a
+ * charging session's samples. (A mid-charge batch that happens to carry
+ * neither charging field can leak one such sample through — harmless, no
+ * consumer reads positions.power during charges.) A REST-provided power in
+ * the same batch wins: it's the true motor figure.
+ */
+function derivePower(patch: Record<string, unknown>, ts: number): void {
+  const asNum = (v: unknown) => (typeof v === "number" && Number.isFinite(v) ? v : undefined);
+  if (patch.power !== undefined) return;
+  const v = asNum(patch.pack_voltage);
+  const a = asNum(patch.pack_current);
+  if (v === undefined || a === undefined) return;
+  const chargerPower = asNum(patch.charger_power);
+  const chargingState = typeof patch.charging_state === "string" ? patch.charging_state : "";
+  if ((chargerPower !== undefined && chargerPower > 0) || chargingState === "Charging") return;
+  patch.power = Math.round((-(v * a) / 1000) * 10) / 10;
+  patch.power_ts = ts;
 }
 
 export async function handleIngest(request: Request, env: Env): Promise<Response> {
