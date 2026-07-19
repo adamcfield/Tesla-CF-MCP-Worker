@@ -87,6 +87,7 @@ import {
   getMediaStats,
   getMediaStatsByDriver,
   getMonthlyReport,
+  getPackHealth,
   getSafetyFeatureStats,
   getStateTimeline,
   getSuggestedLocations,
@@ -304,6 +305,8 @@ async function handleData(url: URL, env: Env): Promise<Response> {
       return json(await getTelemetryFieldStatus(env, vin));
     case "/data/vampire":
       return json(await getVampireDrain(env, vin, numParam("days", 30)));
+    case "/data/pack-health":
+      return json(await getPackHealth(env, vin, numParam("days", 30)));
     case "/data/states":
       return json(await getStateTimeline(env, vin, numParam("hours", 168)));
     case "/data/efficiency-by-temp":
