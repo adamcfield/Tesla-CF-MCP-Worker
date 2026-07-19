@@ -34,7 +34,7 @@
  */
 
 import { getVehicle, getVehicleData } from "./api";
-import { getBudgetStatus, pacedChargingIntervalS, pacedDrivingIntervalS, pollBudgetMicro } from "./budget";
+import { getBudgetStatus, pacedChargingIntervalS, pacedDrivingIntervalS, pollBudgetMicro, remainingDaysInMonth, trailingSignalMicroPerDay } from "./budget";
 import { applyVehicleData } from "./ingest";
 import { casAppState, getAppState, getLatest, putAppState } from "./store";
 import { deriveActivity, recordConnectivityState } from "./tracking";
@@ -209,7 +209,12 @@ export async function pollOnce(env: Env, vin: string): Promise<PollResult> {
   //     (streamOk/streamFresh are read in step 1, which also uses them.)
   const latest = streamFresh ? await getLatest(env, vin).catch(() => null) : null;
   const drivingNow = latest != null && deriveActivity(latest) === "driving";
-  const drivingPaceS = pacedDrivingIntervalS(budget.spent_micro, pollBudgetMicro(env));
+  // Budget the streaming draw as already-committed spend before pacing REST
+  // (see pacedDrivingIntervalS's reservedMicro doc).
+  const signalReserveMicro = Math.round(
+    (await trailingSignalMicroPerDay(env).catch(() => 0)) * remainingDaysInMonth(),
+  );
+  const drivingPaceS = pacedDrivingIntervalS(budget.spent_micro, pollBudgetMicro(env), new Date(), signalReserveMicro);
 
   // 2b. TELEMETRY-FIRST: when Fleet Telemetry is actively delivering (the
   //     ingest route stamped liveness within the freshness window), a billed
@@ -348,8 +353,8 @@ export async function pollOnce(env: Env, vin: string): Promise<PollResult> {
     const budgetTotal = pollBudgetMicro(env);
     const nextIntervalS =
       activity === "driving"
-        ? pacedDrivingIntervalS(budget.spent_micro, budgetTotal)
-        : pacedChargingIntervalS(budget.spent_micro, budgetTotal);
+        ? pacedDrivingIntervalS(budget.spent_micro, budgetTotal, new Date(), signalReserveMicro)
+        : pacedChargingIntervalS(budget.spent_micro, budgetTotal, new Date(), signalReserveMicro);
     // Re-stamp the claim with the paced interval so the cross-poller gap in
     // step 3b scales to the cadence this read was actually paced at.
     await putAppState(env, BILLED_TS(vin), `${now} ${nextIntervalS}`).catch(() => {});
