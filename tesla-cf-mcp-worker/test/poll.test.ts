@@ -298,6 +298,49 @@ describe("telemetry-first: streaming suppresses billed REST reads", () => {
     expect(r.activity).toBe("driving");
   });
 
+  // Regression: today's real drives got ZERO power reconciliation reads
+  // despite the paced-cadence fix above, because two OLDER gates -- designed
+  // around REST's own staleness bookkeeping, not streaming -- independently
+  // blocked the read using markers that go stale for hours under telemetry-
+  // first (the REST side may not have billed in a very long time).
+  it("a stale suspension marker doesn't block reconciliation once streaming shows driving", async () => {
+    const env = makeEnv(kv);
+    stubTesla({ state: "online", shift: "D", speed: 45 });
+    const now = Math.floor(Date.now() / 1000);
+    await putAppState(env, `stream_ok_ts:${VIN}`, String(now - 5)); // stream alive
+    await putAppState(env, `latest:${VIN}`, JSON.stringify({ vin: VIN, updated_at: now, gear: "D", speed: 45 }));
+    // REST hasn't seen activity in 3 hours (telemetry-first: no reason to
+    // have billed) -- old code reads this as "idle 3h" >= IDLE_SUSPEND_MIN
+    // (12min) and suspends, only probing every 15min. last_probe_ts is
+    // recent, so probeDue is false too -- without the fix this returns
+    // early as "idle" and never reaches the billed read at all.
+    await putAppState(env, `poll_state:${VIN}`, JSON.stringify({
+      last_active_ts: now - 3 * 3600, last_probe_ts: now - 60,
+    }));
+    await putAppState(env, `billed_ts:${VIN}`, `${now - 15} 10`); // clears both gap checks
+    const r = await pollOnce(env, VIN);
+    expect(r.polled).toBe(true);
+    expect(r.activity).toBe("driving");
+  });
+
+  it("a stale cross-poller interval from the last non-driving read doesn't throttle the first driving reconciliation", async () => {
+    const env = makeEnv(kv);
+    stubTesla({ state: "online", shift: "D", speed: 45 });
+    const now = Math.floor(Date.now() / 1000);
+    await putAppState(env, `stream_ok_ts:${VIN}`, String(now - 5)); // stream alive
+    await putAppState(env, `latest:${VIN}`, JSON.stringify({ vin: VIN, updated_at: now, gear: "D", speed: 45 }));
+    // Not suspended -- isolates the OTHER stale-interval gate (3b).
+    await putAppState(env, `poll_state:${VIN}`, JSON.stringify({ last_active_ts: now - 60, last_probe_ts: now - 60 }));
+    // Last billed read was an idle-cadence reconciliation stamped 90s --
+    // clears the telemetry-first driving-pace gap (20s > 10s) but, unfixed,
+    // step 3b would scale ITS gap from the stale 90s (0.8*90=72s) and
+    // throttle this for another 52s -- long enough to miss a short drive.
+    await putAppState(env, `billed_ts:${VIN}`, `${now - 20} 90`);
+    const r = await pollOnce(env, VIN);
+    expect(r.polled).toBe(true);
+    expect(r.activity).toBe("driving");
+  });
+
   it("not driving (streaming shows idle) keeps the full hour-long reconciliation gap", async () => {
     const env = makeEnv(kv);
     let vehicleDataCalls = 0;
@@ -321,7 +364,34 @@ describe("telemetry-first: streaming suppresses billed REST reads", () => {
     expect(r.polled).toBe(false);
     expect(vehicleDataCalls).toBe(0);
     expect(r.active).toBe(false); // unaffected by the driving exception
-    expect(r.next_interval_s).toBe(300);
+    // Not 300s (INTERVAL_SLEEP): re-checks at STREAM_COVERED_IDLE_POLL_S so a
+    // drive starting soon after is discovered promptly (free check only).
+    expect(r.next_interval_s).toBe(30);
+  });
+
+  it("a stuck-driving merged doc doesn't bypass suspension once the stream itself has gone stale -- bounds cost exposure if the stream dies mid-drive", async () => {
+    const env = makeEnv(kv);
+    stubTesla({ state: "online", shift: "P", speed: 0 });
+    const now = Math.floor(Date.now() / 1000);
+    // Stream died 10 minutes ago (stale relative to STREAM_FRESH_S=330s), but
+    // the merged "latest" doc is still stuck showing gear="D"/speed=45 from
+    // right before it died -- adversarial review of the driving-cadence fix
+    // flagged that gating suspension on deriveActivity(latest) alone, with no
+    // check that the stream itself is still alive, would read this as
+    // "driving forever" and permanently disable the suspension backstop,
+    // unboundedly burning the poll budget instead of resuming normal pacing.
+    await putAppState(env, `stream_ok_ts:${VIN}`, String(now - 600));
+    await putAppState(env, `latest:${VIN}`, JSON.stringify({ vin: VIN, updated_at: now - 600, gear: "D", speed: 45 }));
+    // REST-side bookkeeping reflects a long-idle car (the stream was covering
+    // everything until it died) -- suspension SHOULD apply now that the
+    // stream can no longer be trusted to say otherwise.
+    await putAppState(env, `poll_state:${VIN}`, JSON.stringify({
+      last_active_ts: now - 3 * 3600, last_probe_ts: now - 60,
+    }));
+    const r = await pollOnce(env, VIN);
+    expect(r.activity).toBe("idle"); // suspended, NOT bypassed by the stale "driving" doc
+    expect(r.polled).toBe(false);
+    expect(r.active).toBe(false);
   });
 });
 

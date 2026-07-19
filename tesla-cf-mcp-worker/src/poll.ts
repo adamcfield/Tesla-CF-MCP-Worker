@@ -53,6 +53,11 @@ export interface PollResult {
 
 const INTERVAL_IDLE = 90;
 const INTERVAL_SLEEP = 300;
+/** While stream-covered and NOT currently driving, re-check this often (free
+ *  connectivity check only) so a drive starting is discovered promptly —
+ *  otherwise a short drive can start and finish entirely inside the 300s
+ *  INTERVAL_SLEEP window before the scheduler ever wakes to notice. */
+const STREAM_COVERED_IDLE_POLL_S = 30;
 /** After this many idle-online minutes, stop per-minute reads (car can sleep). */
 const IDLE_SUSPEND_MIN = 12;
 /** While suspended-but-online (e.g. Sentry keeps the car awake), probe this often. */
@@ -160,6 +165,34 @@ export async function pollOnce(env: Env, vin: string): Promise<PollResult> {
     };
   }
 
+  // 2a. Streaming-derived activity, computed once and used to bypass every
+  //     gate below that was designed around REST's OWN staleness bookkeeping
+  //     (ps.last_active_ts, billed_ts's stamped interval). Under telemetry-
+  //     first, billed reads are rare, so that bookkeeping can go stale for
+  //     hours or days -- but a car streaming "driving" RIGHT NOW must never
+  //     be treated as suspended or throttled to a stale idle-era cadence,
+  //     regardless of how out of date the REST side's own markers are
+  //     (regression: a whole day of drives got zero reconciliation reads
+  //     because the suspension/dedup gates below, unaware of the live
+  //     streaming state, kept deferring to markers last updated hours ago).
+  //
+  //     Gated on the stream itself being fresh (not just "some latest doc
+  //     exists"): getLatest/deriveActivity trust whatever gear/speed were
+  //     last merged in, with no expiry of their own (unlike power_ts /
+  //     POWER_STALE_S). Without this gate, a stream that dies outright while
+  //     gear="D"/speed>1 happens to be the last-merged values would leave
+  //     drivingNow stuck true forever, permanently disabling the suspension
+  //     backstop below -- adversarial review of the driving-cadence fix
+  //     caught this before it shipped; this codebase has already hit the
+  //     same "stuck merged-forever field" failure mode twice for gear (#50)
+  //     and power (this file's own history). Reusing STREAM_FRESH_S bounds
+  //     the exposure to one resend window instead of indefinitely.
+  const streamOk = Number((await getAppState(env, STREAM_OK(vin)).catch(() => "0")) ?? "0");
+  const streamFresh = now - streamOk < STREAM_FRESH_S;
+  const latest = streamFresh ? await getLatest(env, vin).catch(() => null) : null;
+  const drivingNow = latest != null && deriveActivity(latest) === "driving";
+  const drivingPaceS = pacedDrivingIntervalS(budget.spent_micro, pollBudgetMicro(env));
+
   // 2b. TELEMETRY-FIRST: when Fleet Telemetry is actively delivering (the
   //     ingest route stamped liveness within the freshness window), a billed
   //     REST read is redundant -- the stream records the same signals at finer
@@ -176,30 +209,33 @@ export async function pollOnce(env: Env, vin: string): Promise<PollResult> {
   //     in tracking.ts). While the last streaming-derived activity is
   //     "driving", reconcile at the same budget-paced cadence the pre-
   //     telemetry-first poller used instead of waiting the full hour.
-  const streamOk = Number((await getAppState(env, STREAM_OK(vin)).catch(() => "0")) ?? "0");
-  if (now - streamOk < STREAM_FRESH_S) {
+  if (streamFresh) {
     const lastBilledTs = Number(String((await getAppState(env, BILLED_TS(vin)).catch(() => "0")) ?? "0").split(" ")[0]) || 0;
-    const latest = await getLatest(env, vin).catch(() => null);
-    const drivingNow = latest != null && deriveActivity(latest) === "driving";
-    const reconcileGapS = drivingNow
-      ? pacedDrivingIntervalS(budget.spent_micro, pollBudgetMicro(env))
-      : RECONCILE_BILLED_S;
+    const reconcileGapS = drivingNow ? drivingPaceS : RECONCILE_BILLED_S;
     if (now - lastBilledTs < reconcileGapS) {
       await recordConnectivityState(env, vin, "online").catch(() => {});
       return {
         vin, state, activity: "stream_covered", polled: false, active: drivingNow,
         next_interval_s: drivingNow
           ? Math.max(MIN_BILLED_GAP_S, reconcileGapS - (now - lastBilledTs))
-          : INTERVAL_SLEEP,
+          // Not driving: re-check this often so a drive starting is
+          // discovered promptly (free connectivity check only, no billed
+          // cost) instead of only every 300s -- a short drive can start and
+          // finish entirely inside that window otherwise.
+          : STREAM_COVERED_IDLE_POLL_S,
         budget_spent_usd: budget.spent_usd,
       };
     }
   }
 
-  // 3. Suspension: idle long enough that we only probe occasionally.
+  // 3. Suspension: idle long enough that we only probe occasionally. Bypassed
+  //    while streaming shows the car driving right now (see 2a) -- REST's own
+  //    "last active" bookkeeping only updates on a billed read, which under
+  //    telemetry-first may not have happened in hours, but that must never be
+  //    read as "the car has been idle" when it demonstrably has not.
   const ps = await readPollState(env, vin);
   const idleMin = ps.last_active_ts != null ? (now - ps.last_active_ts) / 60 : null;
-  const suspended = idleMin != null && idleMin >= IDLE_SUSPEND_MIN;
+  const suspended = !drivingNow && idleMin != null && idleMin >= IDLE_SUSPEND_MIN;
   if (suspended) {
     const probeDue = now - (ps.last_probe_ts ?? 0) >= PROBE_INTERVAL_S;
     const quiet = inQuietHours(env.QUIET_HOURS_UTC, new Date().getUTCHours());
@@ -218,10 +254,17 @@ export async function pollOnce(env: Env, vin: string): Promise<PollResult> {
   //     can't multiply the paced spend. Return active with the REMAINING gap
   //     so the caller retries just as the window clears. The stamp is
   //     "<ts> <intervalS>"; legacy ts-only stamps fall back to the 8s minimum.
+  //     While driving, cap the interval this scales from at the current
+  //     driving pace -- otherwise a stale interval stamped by the LAST
+  //     (non-driving) billed read, possibly hours old, throttles the FIRST
+  //     reconciliation read after a driving transition to that stale, much
+  //     slower cadence (up to 240s -- long enough to swallow a short drive).
   const rawBilled = String((await getAppState(env, BILLED_TS(vin)).catch(() => "0")) ?? "0");
   const [billedTsRaw, billedIvalRaw] = rawBilled.split(" ");
   const lastBilled = Number(billedTsRaw) || 0;
-  const lastBilledIval = Number(billedIvalRaw) || 0;
+  const lastBilledIval = drivingNow
+    ? Math.min(Number(billedIvalRaw) || drivingPaceS, drivingPaceS)
+    : Number(billedIvalRaw) || 0;
   const gapS = Math.min(MAX_BILLED_GAP_S, Math.max(MIN_BILLED_GAP_S, Math.round(lastBilledIval * BILLED_GAP_FRAC)));
   if (now - lastBilled < gapS) {
     await recordConnectivityState(env, vin, "online").catch(() => {});
