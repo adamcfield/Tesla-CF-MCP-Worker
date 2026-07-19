@@ -186,6 +186,7 @@ async function runActions(env: Env, rule: AutomationRule, actions: Action[]): Pr
   for (const a of actions) {
     const vin = rule.vin;
     const g = a.args ?? {};
+    try {
     switch (a.command) {
       case "climate_on": await cmd.climateOn(env, vin); break;
       case "climate_off": await cmd.climateOff(env, vin); break;
@@ -204,6 +205,11 @@ async function runActions(env: Env, rule: AutomationRule, actions: Action[]): Pr
       default: continue; // unknown/disallowed commands are ignored, never executed
     }
     done.push(a.command);
+    } catch {
+      // One failed command (asleep car, API blip) must not sink the alert
+      // itself or the remaining actions -- `executed` simply won't list it.
+      continue;
+    }
   }
   return done;
 }
@@ -344,7 +350,7 @@ async function evalAlert(
       if (haversineMeters(lat, lon, home.lat, home.lon) <= (home.radius_m ?? 200)) return; // at home — fine
     }
     if (await underCooldown(env, rule, 30)) return;
-    await fire(env, rule, "alert", `${rule.vin} was unlocked away from home`, { lat, lon });
+    await fire(env, rule, "alert", `${rule.vin} was unlocked away from home`, { lat, lon }, rule.actions as Action[] | undefined);
     return;
   }
 
@@ -363,7 +369,7 @@ async function evalAlert(
       if (!inWindow) return;
     }
     if (await underCooldown(env, rule, 360)) return;
-    await fire(env, rule, "alert", `${rule.vin} battery at ${curSoc}% (below ${threshold}%)`, { soc: curSoc });
+    await fire(env, rule, "alert", `${rule.vin} battery at ${curSoc}% (below ${threshold}%)`, { soc: curSoc }, rule.actions as Action[] | undefined);
     return;
   }
 
@@ -378,10 +384,55 @@ async function evalAlert(
           wheel,
           before,
           after,
-        });
+        }, rule.actions as Action[] | undefined);
         return;
       }
     }
+    return;
+  }
+
+  if (when === "sentry_event") {
+    // normalizeSentryState vocabulary: off | idle | armed | aware | panic.
+    // Only aware/panic are real trigger events (someone near the car / an
+    // impact) -- arming transitions are routine and must not page.
+    const TRIGGERED = new Set(["aware", "panic"]);
+    const before = String(previous.sentry ?? "");
+    const after = String(current.sentry ?? "");
+    if (TRIGGERED.has(after) && !TRIGGERED.has(before)) {
+      if (await underCooldown(env, rule, 10)) return;
+      await fire(env, rule, "alert", `${rule.vin} Sentry ${after === "panic" ? "PANIC" : "event"} — the car was just disturbed`, {
+        sentry: after, lat: asNum(current.lat), lon: asNum(current.lon),
+      }, rule.actions as Action[] | undefined);
+    }
+    return;
+  }
+
+  if (when === "port_open_not_plugged") {
+    // Needs persistence, not a transition: door open + latch disengaged +
+    // nothing connected, sustained for open_minutes (default 10) -- a KV
+    // timer started on first sighting and cleared whenever the condition
+    // breaks (plugged in, door closed, or driving off).
+    const openNow =
+      current.charge_port_door_open === true &&
+      String(current.charge_port_latch ?? "") !== "ChargePortLatchEngaged" &&
+      String(current.charging_state ?? "") === "Disconnected";
+    const key = `port_open_since:${rule.id}:${rule.vin}`;
+    if (!openNow) {
+      await env.TESLA_KV.delete(key);
+      return;
+    }
+    const nowS = Math.floor(Date.now() / 1000);
+    const sinceRaw = await env.TESLA_KV.get(key);
+    if (!sinceRaw) {
+      await env.TESLA_KV.put(key, String(nowS), { expirationTtl: 24 * 3600 });
+      return;
+    }
+    const openMinutes = asNum(rule.open_minutes) ?? 10;
+    if (nowS - Number(sinceRaw) < openMinutes * 60) return;
+    if (await underCooldown(env, rule, 120)) return;
+    await fire(env, rule, "alert", `${rule.vin} charge port has been open ${openMinutes}+ min without a cable`, {
+      since: Number(sinceRaw),
+    }, rule.actions as Action[] | undefined);
     return;
   }
 
@@ -395,7 +446,7 @@ async function evalAlert(
       await fire(env, rule, "alert", `${rule.vin} ${started ? "started" : "stopped"} charging (soc ${current.soc ?? "?"}%)`, {
         charging_state: after,
         soc: current.soc,
-      });
+      }, rule.actions as Action[] | undefined);
     }
   }
 }
@@ -463,6 +514,11 @@ async function runCronTickInner(env: Env): Promise<Record<string, unknown>> {
           break;
         case "sentinel":
           if (await evalSentinel(env, rule)) fired.push(rule.id);
+          break;
+        case "alert":
+          // Ingest-path alerts are transition-driven; only the deadline check
+          // belongs on the clock.
+          if (await evalCronAlert(env, rule)) fired.push(rule.id);
           break;
       }
     } catch (e) {
@@ -940,6 +996,79 @@ async function freshState(env: Env, rule: AutomationRule, online: boolean): Prom
 
 const PLUGGED_STATES = new Set(["Charging", "Starting", "Stopped", "Complete", "NoPower"]);
 
+/**
+ * Cron-side alert: "not ready by a deadline". Crossing-edge alerts like
+ * soc_below can never fire for a battery that was ALREADY low, so a car
+ * sitting at 45% all Thursday would sail silently into a Friday road trip.
+ * Rule: {when:"not_ready_by", by:"HH:MM", days?:[0-6], min_soc, warn_minutes?}.
+ * Fires once per day inside the [by - warn_minutes, by) window when SoC is
+ * under min_soc and the car isn't charging. Exported for tests.
+ */
+export async function evalCronAlert(env: Env, rule: AutomationRule): Promise<boolean> {
+  if (String(rule.when ?? "") !== "not_ready_by") return false;
+  const by = String(rule.by ?? "");
+  const m = /^(\d{1,2}):(\d{2})$/.exec(by);
+  if (!m) return false;
+  const minSoc = asNum(rule.min_soc) ?? 60;
+  const warnMin = asNum(rule.warn_minutes) ?? 120;
+
+  const tz = ruleTzOffsetMin(env, rule);
+  const local = new Date(Date.now() + tz * 60_000);
+  const days = rule.days as number[] | undefined;
+  if (days && !days.includes(local.getUTCDay())) return false;
+  const nowMin = local.getUTCHours() * 60 + local.getUTCMinutes();
+  const byMin = Number(m[1]) * 60 + Number(m[2]);
+  if (!(nowMin >= byMin - warnMin && nowMin < byMin)) return false;
+
+  const latest = await getLatest(env, rule.vin).catch(() => null);
+  const soc = asNum(latest?.soc);
+  if (soc === undefined || soc >= minSoc) return false;
+  if (String(latest?.charging_state ?? "") === "Charging") return false;
+
+  const dateKey = `${local.getUTCFullYear()}-${local.getUTCMonth() + 1}-${local.getUTCDate()}`;
+  if (await underCooldown(env, rule, 720, dateKey)) return false;
+  await fire(env, rule, "alert", `${rule.vin} is at ${soc}% but should be ${minSoc}%+ by ${by} — not charging`, {
+    soc, min_soc: minSoc, by,
+  }, rule.actions as Action[] | undefined);
+  return true;
+}
+
+/**
+ * Clock-schedule tariff window for price_charging: {days?, start, end} in the
+ * rule's timezone ("HH:MM" each, end exclusive; overnight windows like
+ * 23:00-07:00 wrap). Israel's TAOZ — and most non-spot tariffs — are FIXED
+ * clock schedules, so requiring a live price feed made the single most
+ * valuable charging automation unconfigurable for them.
+ */
+export interface TouWindow {
+  days?: number[]; // 0=Sunday..6=Saturday, default all
+  start: string;
+  end: string;
+}
+
+/** True when local time (per tzOffsetMin) falls inside any window (exported for tests). */
+export function inTouWindow(windows: TouWindow[], nowUtcMs: number, tzOffsetMin: number): boolean {
+  const local = new Date(nowUtcMs + tzOffsetMin * 60_000);
+  const day = local.getUTCDay();
+  const minutes = local.getUTCHours() * 60 + local.getUTCMinutes();
+  const toMin = (hhmm: string): number => {
+    const [h, m] = hhmm.split(":").map(Number);
+    return (h ?? 0) * 60 + (m ?? 0);
+  };
+  for (const w of windows) {
+    const start = toMin(w.start);
+    const end = toMin(w.end);
+    const wraps = end <= start;
+    // For an overnight window the pre-midnight leg belongs to the START day
+    // and the post-midnight leg to the following day.
+    const inToday = wraps ? minutes >= start : minutes >= start && minutes < end;
+    const inYesterdayTail = wraps && minutes < end;
+    const dayOk = (d: number) => !w.days || w.days.includes(d);
+    if ((inToday && dayOk(day)) || (inYesterdayTail && dayOk((day + 6) % 7))) return true;
+  }
+  return false;
+}
+
 async function evalPriceCharging(
   env: Env,
   rule: AutomationRule,
@@ -950,17 +1079,27 @@ async function evalPriceCharging(
   const chargingState = String(state.latest.charging_state ?? "");
   if (!PLUGGED_STATES.has(chargingState)) return false; // not plugged in — nothing to control
 
-  const price = await fetchNumber(rule.feed as FeedSource);
-  const cheapBelow = asNum(rule.cheap_below_cents);
-  const expensiveAbove = asNum(rule.expensive_above_cents);
   const charging = chargingState === "Charging" || chargingState === "Starting";
+  const tou = rule.tou_windows as TouWindow[] | undefined;
 
   // Classify the price regime and act only when it changes (edge-trigger),
   // so a price that stays cheap for hours doesn't re-command + re-notify every
-  // 15-min tick.
+  // 15-min tick. Two regime sources: tou_windows (clock schedule, no feed,
+  // works stream-only) or a live price feed — windows win when both are set.
   let regime = "neutral";
-  if (cheapBelow !== undefined && price <= cheapBelow) regime = "cheap";
-  else if (expensiveAbove !== undefined && price >= expensiveAbove) regime = "expensive";
+  let detail = "";
+  if (tou?.length) {
+    const cheap = inTouWindow(tou, Date.now(), ruleTzOffsetMin(env, rule));
+    regime = cheap ? "cheap" : "expensive";
+    detail = cheap ? "inside a cheap tariff window" : "outside the cheap tariff windows";
+  } else {
+    const price = await fetchNumber(rule.feed as FeedSource);
+    const cheapBelow = asNum(rule.cheap_below_cents);
+    const expensiveAbove = asNum(rule.expensive_above_cents);
+    if (cheapBelow !== undefined && price <= cheapBelow) regime = "cheap";
+    else if (expensiveAbove !== undefined && price >= expensiveAbove) regime = "expensive";
+    detail = regime === "cheap" ? `price ${price}c ≤ ${cheapBelow}c` : `price ${price}c ≥ ${expensiveAbove}c`;
+  }
   if (!(await regimeChanged(env, rule, `price:${regime}`))) return false;
 
   if (regime === "cheap") {
@@ -969,12 +1108,12 @@ async function evalPriceCharging(
     if (amps) await cmd.setChargingAmps(env, rule.vin, amps);
     if (limit) await cmd.setChargeLimit(env, rule.vin, limit);
     if (!charging) await cmd.startCharging(env, rule.vin);
-    await dispatchWebhooks(env, rule, "price_charging", `price ${price}c ≤ ${cheapBelow}c — charging at ${amps ?? "current"}A`, { price });
+    await dispatchWebhooks(env, rule, "price_charging", `${detail} — charging at ${amps ?? "current"}A`, {});
     return true;
   }
   if (regime === "expensive" && charging) {
     await cmd.stopCharging(env, rule.vin);
-    await dispatchWebhooks(env, rule, "price_charging", `price ${price}c ≥ ${expensiveAbove}c — stopped charging`, { price });
+    await dispatchWebhooks(env, rule, "price_charging", `${detail} — stopped charging`, {});
     return true;
   }
   return false;
