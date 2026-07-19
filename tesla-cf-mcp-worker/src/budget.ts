@@ -383,13 +383,19 @@ export function pacedDrivingIntervalS(
   spentMicroNow: number,
   budgetMicro: number,
   now: Date = new Date(),
+  reservedMicro = 0,
 ): number {
   if (budgetMicro <= 0) return 60;
   const daysInMonth = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 0)).getUTCDate();
   const elapsedFrac =
     (now.getUTCDate() - 1 + now.getUTCHours() / 24) / daysInMonth;
   const remainingFrac = Math.max(0.02, 1 - elapsedFrac);
-  const remainingBudgetFrac = Math.max(0, budgetMicro - spentMicroNow) / budgetMicro;
+  // reservedMicro: budget already committed to the rest of the month (the
+  // streaming signal draw, which REST pacing can't throttle). Without it the
+  // pacer hands streaming's share to the 10s driving burst early in the
+  // month, then collapses far faster than the 15->30->60s ladder assumes --
+  // the exact shape of the July 2026 early drain.
+  const remainingBudgetFrac = Math.max(0, budgetMicro - spentMicroNow - reservedMicro) / budgetMicro;
   const ratio = remainingBudgetFrac / remainingFrac;
   if (ratio >= 1) return 10;
   if (ratio >= 0.75) return 15;
@@ -402,6 +408,30 @@ export function pacedChargingIntervalS(
   spentMicroNow: number,
   budgetMicro: number,
   now: Date = new Date(),
+  reservedMicro = 0,
 ): number {
-  return pacedDrivingIntervalS(spentMicroNow, budgetMicro, now) === 10 ? 60 : 150;
+  return pacedDrivingIntervalS(spentMicroNow, budgetMicro, now, reservedMicro) === 10 ? 60 : 150;
+}
+
+/** Whole+fractional days left in the current UTC month (for reserve projections). */
+export function remainingDaysInMonth(now: Date = new Date()): number {
+  const daysInMonth = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 0)).getUTCDate();
+  return Math.max(0, daysInMonth - (now.getUTCDate() - 1 + now.getUTCHours() / 24));
+}
+
+/**
+ * Trailing signal-spend rate (micro-$/day, over up to `days` recent days with
+ * data). Streaming bills whenever the car transmits -- an unstoppable
+ * committed draw that REST pacing must treat as already spent for the rest of
+ * the month rather than available headroom.
+ */
+export async function trailingSignalMicroPerDay(env: Env, days = 7): Promise<number> {
+  await ensureSpendTable(env);
+  const sinceDay = dayKey(new Date(Date.now() - days * 86400_000));
+  const row = await env.DB.prepare(
+    `SELECT SUM(micro) micro, COUNT(DISTINCT day) n FROM api_spend_calls
+     WHERE kind = 'signal' AND day >= ?1`,
+  ).bind(sinceDay).first<{ micro: number | null; n: number }>();
+  const n = row?.n ?? 0;
+  return n > 0 ? Math.round((row?.micro ?? 0) / n) : 0;
 }

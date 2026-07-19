@@ -32,6 +32,9 @@ export interface Env {
   INGEST_TOKEN?: string;
   /** Optional shared secret sent as x-webhook-token on outbound alert webhooks. */
   WEBHOOK_SECRET?: string;
+  /** Raw-text alert receiver (an ntfy.sh topic URL) — fallback phone delivery
+   *  for watchdog/budget alerts that have no per-rule webhook (see logAlert). */
+  ALERT_WEBHOOK?: string;
   /**
    * Optional raw-history retention in days (wrangler.toml [vars] or secret).
    * Prunes telemetry_events and non-drive positions older than this on each

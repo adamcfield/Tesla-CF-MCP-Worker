@@ -457,6 +457,17 @@ describe("DO scheduler re-arm delay", () => {
 describe("budget pacing", () => {
   const mid = new Date(Date.UTC(2026, 6, 16)); // July 16 — ~48% through the month
 
+  it("a signal reserve degrades the cadence exactly like spend already burned", () => {
+    const budget = 9_000_000;
+    // On pace at 45% spent... until streaming's committed draw for the rest
+    // of the month is reserved too, which pushes the effective ratio down a
+    // tier -- the July 2026 failure shape (pacer handed streaming's share to
+    // the 10s burst, then collapsed).
+    expect(pacedDrivingIntervalS(Math.round(budget * 0.45), budget, mid)).toBe(10);
+    expect(pacedDrivingIntervalS(Math.round(budget * 0.45), budget, mid, Math.round(budget * 0.1))).toBe(15);
+    expect(pacedChargingIntervalS(Math.round(budget * 0.45), budget, mid, Math.round(budget * 0.1))).toBe(150);
+  });
+
   it("bursts at 10s when at/ahead of pace and decays as budget falls behind", () => {
     // July 16: elapsed ≈ 48.4% of the month → remainingFrac ≈ 0.516.
     // ratio = remainingBudgetFrac / remainingFrac, tiers 1 / 0.75 / 0.5.

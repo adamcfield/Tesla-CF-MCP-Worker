@@ -25,10 +25,12 @@
 
 import { generateBrief, generateCoachNote } from "./ai";
 import { getVehicle, getVehicleData } from "./api";
-import { getBudgetStatus } from "./budget";
+import { getBudgetCallLog, getBudgetForecast, getBudgetStatus } from "./budget";
 import * as cmd from "./commands";
 import { applyVehicleData } from "./ingest";
 import { getAppState, getLatest, LatestState, logAlert, putAppState, tzOffsetMinutes } from "./store";
+import { createTelemetryConfig } from "./telemetry";
+import { TELEMETRY_CA, TELEMETRY_HOSTNAME, TELEMETRY_PLANS, TELEMETRY_PORT, TelemetryPlanStep } from "./telemetry-plans";
 import { closeStaleSessions, getTirePressures, getVampireDrain, recordConnectivityState } from "./tracking";
 import { Env } from "./types";
 
@@ -485,6 +487,7 @@ async function runCronTickInner(env: Env): Promise<Record<string, unknown>> {
 
   await pollWatchdog(env, summary);
   await budgetWatchdog(env, summary);
+  await manageTelemetryLadder(env, summary);
   // Generate AI coach notes for recently-closed drives that don't have one.
   try {
     const n = await backfillCoachNotes(env);
@@ -621,29 +624,136 @@ async function pollWatchdog(env: Env, summary: Record<string, unknown>): Promise
  * exported for tests.
  */
 export async function budgetWatchdog(env: Env, summary: Record<string, unknown>): Promise<void> {
-  const COOLDOWN_S = 24 * 3600;
   try {
     const b = await getBudgetStatus(env);
     const budgetMicro = Math.round(b.poll_budget_usd * 1_000_000);
-    if (budgetMicro <= 0 || b.spent_micro < 0.95 * budgetMicro) return;
+    if (budgetMicro <= 0) return;
+    const pct = (b.spent_micro / budgetMicro) * 100;
     summary.budget_watchdog = { spent_usd: b.spent_usd, cap_usd: b.poll_budget_usd };
-    const now = Math.floor(Date.now() / 1000);
-    const last = Number((await getAppState(env, "budget_alert_ts")) ?? "0");
-    if (now - last < COOLDOWN_S) return;
-    await putAppState(env, "budget_alert_ts", String(now));
-    const pct = Math.round((b.spent_micro / budgetMicro) * 100);
+
+    // State: "<month> <lastAlertedThreshold> <forecastStreak>" -- resets when
+    // the month rolls over. Graduated crossing alerts replace the old flat
+    // 95%+24h-cooldown rule, which by design could only fire once the month
+    // was already lost (July 2026: first alert at 97%, drained next day).
+    const raw = (await getAppState(env, "budget_alert_state").catch(() => null)) ?? "";
+    const [m, thrRaw, fcRaw] = raw.split(" ");
+    let lastThr = m === b.month ? Number(thrRaw) || 0 : 0;
+    let fcStreak = m === b.month ? Number(fcRaw) || 0 : 0;
+
+    const crossed = [50, 75, 90, 100].filter((t) => pct >= t && t > lastThr).pop();
+    if (crossed) {
+      lastThr = crossed;
+      await logAlert(env, {
+        ruleId: "budget_watchdog",
+        kind: "budget",
+        message:
+          `Tesla API spend crossed ${crossed}% of the $${b.poll_budget_usd} monthly cap ` +
+          `($${b.spent_usd.toFixed(2)} MTD). Automated polling stops at the cap; streaming ` +
+          `continues up to the $${b.hard_ceiling_usd} ceiling and Tesla suspends (never ` +
+          `charges) past $10. Everything resets on the 1st.`,
+        delivered: false,
+      });
+    }
+
+    // Predictive: the forecast regression already knows when the current burn
+    // rate lands before month-end -- in July it knew ~10 days before the
+    // drain, but nothing consulted it. Two consecutive ticks of hysteresis so
+    // a single heavy road-trip day doesn't page.
+    const f = pct < 100 ? await getBudgetForecast(env).catch(() => null) : null;
+    if (f && f.budget_exhausted_in_days != null) {
+      fcStreak += 1;
+      if (fcStreak === 2) {
+        const top = (await getBudgetCallLog(env, 7).catch(() => null))?.by_kind?.[0];
+        await logAlert(env, {
+          ruleId: "budget_watchdog",
+          kind: "budget",
+          message:
+            `At the current burn rate the Tesla API budget runs out in ~${Math.round(f.budget_exhausted_in_days)} ` +
+            `days -- before month-end. Top spender last 7 days: ${top ? `${top.label} ($${top.cost_usd.toFixed(2)})` : "unknown"}. ` +
+            `The telemetry plan ladder will step fidelity down automatically if this persists.`,
+          delivered: false,
+        });
+      }
+    } else {
+      fcStreak = 0;
+    }
+
+    await putAppState(env, "budget_alert_state", `${b.month} ${lastThr} ${fcStreak}`);
+  } catch {
+    /* watchdog must never break the tick */
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Telemetry plan ladder — automatic fidelity degradation before the wall
+// ---------------------------------------------------------------------------
+
+/**
+ * Pure ladder decision (exported for tests). Steps only DOWN within a month
+ * (spend is monotonic; auto-upgrading mid-month would flap), and restores the
+ * permanent plan when the month rolls over -- which also replaces the manual
+ * "restore on the 1st" chore. pct is spend as % of the poll cap.
+ */
+export function nextTelemetryPlanStep(
+  month: string,
+  storedRaw: string | null,
+  pct: number,
+): TelemetryPlanStep | null {
+  const [m, stored] = (storedRaw ?? "").split(" ");
+  const current = m === month ? (stored as TelemetryPlanStep) : null;
+  let target: TelemetryPlanStep = current ?? "permanent";
+  if (pct >= 90) target = "minimal";
+  else if (pct >= 75 && current !== "minimal") target = "lean";
+  if (current === "minimal") target = "minimal"; // never upgrade mid-month
+  else if (current === "lean" && target === "permanent") target = "lean";
+  return target !== current ? target : null;
+}
+
+/**
+ * Applies the ladder: reads spend, decides via nextTelemetryPlanStep, pushes
+ * the new field plan to the vehicle(s) when the step changes, and alerts on
+ * every transition. The July 2026 trim was this exact operation done by hand;
+ * budget.ts's own header notes that exceeding the credit WIPES the telemetry
+ * config -- stepping down before the ceiling protects stream continuity, not
+ * just dollars. Apply failures are swallowed and retried next tick (the car
+ * syncs the config whenever it comes online; the POST itself can fail past
+ * the command ceiling).
+ */
+export async function manageTelemetryLadder(env: Env, summary: Record<string, unknown>): Promise<void> {
+  try {
+    const vins = (env.POLL_VINS ?? "").split(/[,\s]+/).map((v) => v.trim()).filter(Boolean);
+    if (!vins.length) return;
+    const b = await getBudgetStatus(env);
+    const budgetMicro = Math.round(b.poll_budget_usd * 1_000_000);
+    if (budgetMicro <= 0) return;
+    const pct = (b.spent_micro / budgetMicro) * 100;
+    const stored = await getAppState(env, "telemetry_plan_state").catch(() => null);
+    const target = nextTelemetryPlanStep(b.month, stored, pct);
+    if (!target) return;
+    await createTelemetryConfig(env, {
+      vins,
+      config: {
+        hostname: TELEMETRY_HOSTNAME,
+        port: TELEMETRY_PORT,
+        ca: TELEMETRY_CA,
+        fields: TELEMETRY_PLANS[target],
+      },
+    });
+    await putAppState(env, "telemetry_plan_state", `${b.month} ${target}`);
+    summary.telemetry_plan = target;
     await logAlert(env, {
-      ruleId: "budget_watchdog",
+      ruleId: "telemetry_ladder",
       kind: "budget",
       message:
-        `Tesla API spend is at ${pct}% of the $${b.poll_budget_usd} monthly cap ` +
-        `($${b.spent_usd.toFixed(2)} MTD). Automated polling stops at the cap; streaming ` +
-        `continues up to the $${b.hard_ceiling_usd} ceiling and Tesla suspends (never ` +
-        `charges) past $10. Everything resets on the 1st.`,
+        `Telemetry plan stepped to "${target}" (${Object.keys(TELEMETRY_PLANS[target]).length} fields) ` +
+        `at ${Math.round(pct)}% of the monthly cap. ` +
+        (target === "permanent"
+          ? "Monthly reset -- full steady-state fidelity restored."
+          : "Fidelity reduced to keep the stream alive inside the $10 credit; restores automatically on the 1st."),
       delivered: false,
     });
   } catch {
-    /* watchdog must never break the tick */
+    /* ladder must never break the tick; retried next tick */
   }
 }
 

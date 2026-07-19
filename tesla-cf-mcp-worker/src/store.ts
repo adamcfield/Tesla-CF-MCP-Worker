@@ -629,6 +629,25 @@ export async function logAlert(
   entry: { vin?: string; ruleId: string; kind: string; message: string; payload?: unknown; delivered: boolean },
 ): Promise<void> {
   await ensureSchema(env);
+  // Fallback phone delivery: without this, alerts with no per-rule webhook
+  // terminate in this table unseen (the July 2026 budget drain went unnoticed
+  // for exactly that reason). ALERT_WEBHOOK is a raw-text receiver -- an
+  // ntfy.sh topic URL is the intended one-evening setup; Slack/Telegram need
+  // a JSON relay or a per-rule notify webhook instead. Delivery failure just
+  // leaves delivered=0 for the dashboard's Alerts screen to surface.
+  let delivered = entry.delivered;
+  if (!delivered && env.ALERT_WEBHOOK) {
+    try {
+      const resp = await fetch(env.ALERT_WEBHOOK, {
+        method: "POST",
+        headers: { "content-type": "text/plain", "x-title": `Tesla ${entry.kind}` },
+        body: entry.message,
+      });
+      delivered = resp.ok;
+    } catch {
+      /* stays undelivered */
+    }
+  }
   await env.DB.prepare(
     `INSERT INTO alert_log (ts, vin, rule_id, kind, message, payload, delivered)
      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)`,
@@ -640,7 +659,7 @@ export async function logAlert(
       entry.kind,
       entry.message,
       entry.payload === undefined ? null : JSON.stringify(entry.payload),
-      entry.delivered ? 1 : 0,
+      delivered ? 1 : 0,
     )
     .run();
 }
