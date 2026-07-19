@@ -5,7 +5,7 @@ import { destroyMaps, renderPointMap, renderRouteMap, renderLifetimeMap, createR
 // Bump on every change to this dashboard (UI, features, or the /data/*
 // endpoints it depends on) and add a matching entry to CHANGELOG.md — see
 // the versioning policy in the repo's CLAUDE.md. Shown in the sidebar footer.
-const APP_VERSION = "1.23.0";
+const APP_VERSION = "1.24.0";
 
 const root = document.getElementById("app");
 let shellBound = false; // guards one-time attach of the root click handler + sync timer
@@ -238,7 +238,7 @@ const state = {
 };
 
 const NAV = [
-  { label: "", items: [["ask", "✦ Ask Tessa"], ["ov", "Overview"], ["tl", "Timeline"], ["st", "Statistics"]] },
+  { label: "", items: [["ask", "✦ Ask Tessa"], ["ov", "Overview"], ["tl", "Timeline"], ["st", "Statistics"], ["al", "🔔 Alerts"]] },
   { label: "Driving", items: [["dr", "Drives"], ["dv", "Drivers"], ["pl", "Places"], ["map", "Lifetime map"]] },
   { label: "Media", items: [["md", "♪ Media"]] },
   { label: "Charging", items: [["ch", "Charges"], ["cs", "Charging stats"]] },
@@ -251,6 +251,7 @@ const TITLES = {
   ov: ["Overview", ""],
   tl: ["Timeline", "drives, charges & sleep/wake"],
   st: ["Statistics", "last 12 months"],
+  al: ["Alerts", "budget, watchdog & automation notices"],
   dr: ["Drives", ""],
   dv: ["Drivers", "behaviour & risk scoring"],
   pl: ["Places", "saved locations & suggestions"],
@@ -452,7 +453,7 @@ function renderShell() {
         ${NAV.map((g) => `
           <div class="tm-navgroup">
             ${g.label ? `<div class="tm-navlabel">${esc(g.label)}</div>` : ""}
-            ${g.items.map(([key, label]) => `<button class="tm-navitem ${state.screen === key ? "active" : ""}" data-action="nav" data-screen="${key}">${esc(label)}</button>`).join("")}
+            ${g.items.map(([key, label]) => `<button class="tm-navitem ${state.screen === key ? "active" : ""}" data-action="nav" data-screen="${key}">${esc(label)}${key === "al" ? `<span class="tm-nav-badge" id="tm-alerts-badge" style="display:none;"></span>` : ""}</button>`).join("")}
           </div>`).join("")}
         <div class="tm-sidefoot">
           <div class="tm-sidebudget tm-sidebudget-click" id="tm-sidebudget" data-action="nav" data-screen="api" title="View API call log & cost">${sideBudgetHtml(state.apiBudget)}</div>
@@ -504,6 +505,19 @@ function renderShell() {
       renderShell();
       showScreen();
     });
+    // Coming back to the tab after a while: what's on screen is stale, so
+    // re-sync once instead of waiting for a manual refresh.
+    document.addEventListener("visibilitychange", () => {
+      if (document.visibilityState !== "visible") return;
+      if (!auth.hasToken || !auth.vin || state.syncing || autoRefreshBusy) return;
+      if (state.lastSync != null && Date.now() - state.lastSync < 60000) return;
+      state.cache = {};
+      showScreen();
+      refreshSideBudget();
+      refreshConnStatus();
+      refreshAlertsBadge();
+    });
+    setInterval(autoRefreshTick, 45000);
     shellBound = true;
   }
   // Normalize the address bar to the current screen on first paint, so a plain
@@ -511,12 +525,45 @@ function renderShell() {
   if (location.hash !== stateToHash()) { try { history.replaceState(null, "", stateToHash()); } catch { /* sandboxed */ } }
   refreshSideBudget();
   refreshConnStatus();
+  refreshAlertsBadge();
 }
 
 function tickSyncLabel() {
   if (state.syncing) return; // "syncing…" holds until the load settles
   const el = document.getElementById("tm-sync-text");
   if (el && state.lastSync) el.textContent = `synced ${agoLabel(state.lastSync)}`;
+}
+
+/**
+ * Live auto-refresh: while the car is actually doing something (driving or
+ * charging), re-render the current screen every 45 s — /data/* reads are free,
+ * so this only costs a repaint; a parked/asleep car doesn't churn the DOM.
+ * The activity probe reads whatever the last render already cached; on screens
+ * that never load states/latest it fetches the small states row itself, under
+ * the same cache key Overview uses so the two never double-fetch. Idle while
+ * the tab is hidden, and never overlaps an in-flight sync.
+ */
+let autoRefreshBusy = false;
+async function autoRefreshTick() {
+  if (document.hidden || autoRefreshBusy || state.syncing) return;
+  if (!auth.hasToken || !auth.vin) return;
+  autoRefreshBusy = true;
+  try {
+    let states = state.cache.ov_states;
+    if (!states && state.cache.latest?.charging_state !== "Charging") {
+      states = await safe(cached("ov_states", () => data.states(vin(), 3)), []);
+    }
+    const active = states?.[0]?.state === "driving" || states?.[0]?.state === "charging"
+      || state.cache.latest?.charging_state === "Charging";
+    if (!active) return;
+    state.cache = {};
+    await showScreen();
+    refreshSideBudget();
+    refreshConnStatus();
+    refreshAlertsBadge();
+  } finally {
+    autoRefreshBusy = false;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -708,9 +755,16 @@ function onRootClick(e) {
   } else if (action === "edit-driver") {
     if (!t.querySelector(".tm-driver-edit")) beginDriverEdit(t, Number(t.dataset.id));
   } else if (action === "open-place") {
+    // Reached from the Places list AND from charge/drive-detail cross-links —
+    // like open-drive/open-charge, land properly in the Places section so the
+    // nav highlight, header and hash all follow.
     state.openPlaceId = Number(t.dataset.id);
+    state.openDriveId = null;
+    state.openChargeId = null;
+    state.screen = "pl";
     state.editingPlaceTags = false;
     pushHistory();
+    renderShell();
     renderPlaceDetail();
   } else if (action === "edit-place-address") {
     const cell = t.closest(".tm-place-address");
@@ -960,6 +1014,8 @@ function skeletonHtml(screen) {
       return `<div class="tm-grid-2-wide"><div class="tm-card tm-card-pad-lg">${skel("height:20px;width:80px;")}${skel("height:54px;width:45%;margin-top:22px;")}${skel("height:10px;margin-top:22px;border-radius:999px;")}${skel("height:40px;margin-top:20px;")}</div>${mapCard(280)}</div>${metrics}<div class="tm-grid-2">${chart}${chart}</div>`;
     case "tl":
       return `<div style="max-width:760px;">${skel("height:12px;width:120px;margin-bottom:12px;")}${table(6)}</div>`;
+    case "al":
+      return table(9);
     case "st":
       return `${metrics}${chart}${chart}${table(6)}`;
     case "dr":
@@ -1008,6 +1064,7 @@ async function showScreen() {
       case "ov": await renderOverview(); break;
       case "tl": await renderTimeline(); break;
       case "st": await renderStatistics(); break;
+      case "al": await renderAlerts(); break;
       case "dr": await renderDrives(); break;
       case "dv": await renderDrivers(); break;
       case "pl": await renderPlaces(); break;
@@ -1172,6 +1229,66 @@ async function refreshConnStatus() {
   if (!vin()) return;
   const s = await safe(cached("summary", () => data.summary(vin())), null);
   updateConnStatus(s ? s.last_seen_ts ?? null : undefined);
+}
+
+// ---------------------------------------------------------------------------
+// Alerts — the worker's alert log (/data/alerts: budget warnings, watchdog
+// notices, automation-rule errors) as a screen, plus the sidebar bell badge.
+// "Unread" = newer than the last-seen watermark in localStorage; opening the
+// screen advances the watermark and clears the badge.
+// ---------------------------------------------------------------------------
+
+const ALERTS_SEEN_KEY = "tm_alerts_seen";
+const ALERT_KIND_STYLE = { budget: "tm-pill-warn", watchdog: "tm-pill-bad", rule_error: "tm-pill-bad" };
+
+function loadAlerts() {
+  return safe(cached("alerts", () => data.alerts(100)), null);
+}
+function updateAlertsBadge(count) {
+  const el = document.getElementById("tm-alerts-badge");
+  if (!el) return;
+  el.style.display = count > 0 ? "" : "none";
+  el.textContent = count > 9 ? "9+" : String(count);
+}
+async function refreshAlertsBadge() {
+  if (!vin()) return;
+  const alerts = await loadAlerts();
+  if (!alerts) return; // endpoint not deployed / unreachable — leave the bell quiet
+  const seen = Number(localStorage.getItem(ALERTS_SEEN_KEY) || 0);
+  updateAlertsBadge(alerts.filter((a) => a.ts > seen).length);
+}
+
+async function renderAlerts() {
+  const alerts = await loadAlerts();
+  // Opening the screen consumes the unread state — everything in the log up to
+  // its newest entry counts as seen from here on.
+  if (alerts?.length) localStorage.setItem(ALERTS_SEEN_KEY, String(alerts[0].ts));
+  updateAlertsBadge(0);
+
+  if (!alerts) {
+    return setContent(emptyHtml("Alerts not available on the deployed worker",
+      "This screen reads /data/alerts, which the live worker doesn't answer yet — redeploy it (cd tesla-cf-mcp-worker && npm run deploy) and alerts show up from then on."));
+  }
+  if (!alerts.length) {
+    return setContent(emptyHtml("No alerts yet",
+      "Budget warnings, watchdog notices and automation-rule errors will appear here as the worker records them."));
+  }
+  setContent(`
+    <div class="tm-card tm-table-wrap">
+      <div style="min-width:640px;">
+        ${alerts.map((a) => `
+          <div class="tm-table-row no-click" style="grid-template-columns:110px 96px 1fr;align-items:baseline;">
+            <div><span class="tm-pill ${ALERT_KIND_STYLE[a.kind] || "tm-pill-chip"}" style="font-size:10.5px;">${esc(String(a.kind || "alert").replace(/_/g, " "))}</span></div>
+            <div style="font-size:12.5px;color:var(--sub);" title="${esc(fmtDateTime(a.ts))}">${esc(fmtAgo(a.ts))}</div>
+            <div style="min-width:0;">
+              <div style="font-size:13px;white-space:normal;">${esc(a.message || "")}</div>
+              ${a.rule_id ? `<div class="tm-mono" style="font-size:11px;color:var(--faint);margin-top:2px;">${esc(a.rule_id)}</div>` : ""}
+            </div>
+          </div>`).join("")}
+        <div class="tm-foot-note">The ${alerts.length} most recent alert${alerts.length === 1 ? "" : "s"}, newest first. Opening this screen marks them all read.</div>
+      </div>
+    </div>
+  `);
 }
 
 // ---------------------------------------------------------------------------
@@ -1473,6 +1590,55 @@ function tyreStatusHtml(t) {
   return `<span style="color:var(--warn);">${c.label} ${val}${bad.length > 1 ? ` +${bad.length - 1}` : ""}</span>`;
 }
 
+/**
+ * Compact "Current trip" card from the streamed nav_* fields — only while the
+ * car is actually navigating somewhere (destination set, more than a minute
+ * out). nav_miles_to_arrival is NOT one of the worker's miles→km-normalized
+ * fields (that set is odometer/speed/ranges only), so it arrives in miles and
+ * is converted here.
+ */
+function currentTripCardHtml(latest) {
+  const name = latest?.nav_destination_name;
+  const minutes = latest?.nav_minutes_to_arrival;
+  if (typeof name !== "string" || !name.trim()) return "";
+  if (typeof minutes !== "number" || !(minutes > 1)) return "";
+  const km = typeof latest.nav_miles_to_arrival === "number" ? latest.nav_miles_to_arrival * 1.609344 : null;
+  const etaLabel = new Date(Date.now() + minutes * 60000).toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit", hour12: false });
+  const arrivalPct = latest.trip_arrival_pct;
+  const delay = latest.nav_traffic_delay_min;
+  return `
+    <div class="tm-card tm-card-pad tm-flex-row" style="gap:20px;flex-wrap:wrap;align-items:center;">
+      <div style="min-width:0;">
+        <div class="tm-stat-label">Current trip</div>
+        <div class="tm-ellipsis" style="font-size:15px;font-weight:600;margin-top:4px;">→ ${esc(name)}</div>
+      </div>
+      <div class="tm-flex-row" style="gap:24px;margin-left:auto;flex-wrap:wrap;">
+        <div><div class="tm-readout-label">ETA</div><div class="tm-readout-value">${etaLabel} <span class="tm-stat-unit">· ${esc(fmtDurationMin(minutes))}</span></div></div>
+        ${km != null ? `<div><div class="tm-readout-label">Distance</div><div class="tm-readout-value">${fmt1(km)} <span class="tm-stat-unit">km</span></div></div>` : ""}
+        ${arrivalPct != null ? `<div><div class="tm-readout-label">Battery at arrival</div><div class="tm-readout-value">~${fmt0(arrivalPct)}<span class="tm-stat-unit">%</span></div></div>` : ""}
+        ${typeof delay === "number" && delay > 0 ? `<div><div class="tm-readout-label">Traffic</div><div class="tm-readout-value" style="color:var(--warn);">+${fmt0(delay)} <span class="tm-stat-unit">min</span></div></div>` : ""}
+      </div>
+    </div>`;
+}
+
+/**
+ * One-line charging ETA under the battery gauge — only while actively charging
+ * (charging_state "Charging"; Complete/Stopped/plugged-idle show nothing).
+ * time_to_full_charge is hours (float); charge_rate_mph deliberately stays
+ * imperial in the store (see ingest FIELD_MAP), so it's converted to km of
+ * range per hour here.
+ */
+function chargingEtaHtml(latest) {
+  if (latest?.charging_state !== "Charging") return "";
+  const hrs = latest.time_to_full_charge;
+  if (typeof hrs !== "number" || !(hrs > 0)) return "";
+  const totMin = Math.round(hrs * 60);
+  const clock = `${Math.floor(totMin / 60)}:${String(totMin % 60).padStart(2, "0")}`;
+  const doneLabel = new Date(Date.now() + hrs * 3600000).toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit", hour12: false });
+  const rateKmh = typeof latest.charge_rate_mph === "number" && latest.charge_rate_mph > 0 ? latest.charge_rate_mph * 1.609344 : null;
+  return `<div class="tm-stat-note" style="color:var(--good);">⚡ Charging — done in ${clock} (~${doneLabel})${rateKmh != null ? ` · +${fmt0(rateKmh)} km range/h` : ""}</div>`;
+}
+
 async function renderOverview() {
   if (!vin()) return setContent(emptyHtml("No vehicle connected", "Disconnect and reconnect with a VIN."));
 
@@ -1550,6 +1716,7 @@ async function renderOverview() {
   const offerSavePlace = !nearestLoc && lat != null && lon != null && states[0]?.state !== "driving";
 
   setContent(`
+    ${currentTripCardHtml(latest)}
     <div class="tm-grid-2-wide">
       <div class="tm-card tm-card-pad-lg tm-flex-col">
         ${hasLive ? `
@@ -1569,6 +1736,7 @@ async function renderOverview() {
             <div class="tm-progress-fill" style="width:${Math.max(0, Math.min(100, soc))}%;"></div>
             ${chargeLimit != null ? `<div class="tm-progress-mark" style="left:${chargeLimit}%;"></div>` : ""}
           </div>` : ""}
+          ${chargingEtaHtml(latest)}
           <div class="tm-grid-metrics" style="grid-template-columns:repeat(auto-fit,minmax(90px,1fr));gap:14px;">
             <div class="tm-readout-click" data-action="ov-goto-climate" title="See inside vs outside temperature"><div class="tm-readout-label">Inside</div><div class="tm-readout-value">${inside != null ? fmt1(inside) + " °C" : "—"}</div></div>
             <div class="tm-readout-click" data-action="ov-goto-climate" title="See inside vs outside temperature"><div class="tm-readout-label">Outside</div><div class="tm-readout-value">${outside != null ? fmt1(outside) + " °C" : "—"}</div></div>
@@ -2197,6 +2365,24 @@ async function renderDriveDetail() {
   const roster = await loadDriverRoster();
   const locName = (id) => (id == null ? "Unknown" : locations.find((l) => l.id === id)?.name || "Unknown");
 
+  // ‹ › header chevrons: chronological neighbours from the same cached list the
+  // Drives screen uses (fetched here when the detail was opened by deep link).
+  // The list is newest-first, so "previous" (older) is the NEXT index.
+  const allDrives = await safe(cached("all_drives", () => data.drives(vin(), 2000)), []);
+  const driveIdx = allDrives.findIndex((x) => x.id === d.id);
+  const olderId = driveIdx >= 0 && driveIdx + 1 < allDrives.length ? allDrives[driveIdx + 1].id : null;
+  const newerId = driveIdx > 0 ? allDrives[driveIdx - 1].id : null;
+  const chevBtn = (id, sym, label) => id != null
+    ? `<button type="button" class="tm-icon-btn" style="font-size:16px;" data-action="open-drive" data-id="${id}" title="${label}" aria-label="${label}">${sym}</button>`
+    : `<button type="button" class="tm-icon-btn" style="font-size:16px;opacity:0.35;cursor:default;" disabled aria-label="${label}">${sym}</button>`;
+
+  // Endpoint labels click through to the saved place when the drive matched one.
+  const endpointHtml = (which) => {
+    const id = d[which + "_location_id"];
+    const label = `<bdi>${esc(driveEndpoint(d, which, locations))}</bdi>`;
+    return id != null ? `<button type="button" class="tm-link-btn" data-action="open-place" data-id="${id}" title="Open this place">${label}</button>` : label;
+  };
+
   // Synthetic drives are reconstructed from an odometer jump between polls — they
   // carry no GPS route, so show a placeholder card instead of an empty map.
   const synthetic = isSyntheticDrive(d);
@@ -2273,10 +2459,12 @@ async function renderDriveDetail() {
     ${driverDatalistHtml(roster, "tm-driver-names-detail")}
     <div class="tm-flex-row" style="gap:14px;flex-wrap:wrap;">
       <button class="tm-back-btn" data-action="back-drives">← Drives</button>
-      <div style="font-size:15px;font-weight:600;"><bdi>${esc(driveEndpoint(d, "start", locations))}</bdi> <span style="color:var(--faint);">→</span> <bdi>${esc(driveEndpoint(d, "end", locations))}</bdi></div>
+      <div style="font-size:15px;font-weight:600;">${endpointHtml("start")} <span style="color:var(--faint);">→</span> ${endpointHtml("end")}</div>
       <div style="font-size:12.5px;color:var(--faint);">${fmtDateTime(d.start_ts)}</div>
       ${synthetic ? syntheticBadgeHtml() : ""}
       <div class="tm-flex-row" style="margin-left:auto;gap:6px;">
+        ${chevBtn(olderId, "&#8249;", "Previous drive (older)")}
+        ${chevBtn(newerId, "&#8250;", "Next drive (newer)")}
         <a class="tm-chip-btn" style="padding:5px 12px;" href="${esc(exportUrl("/data/export/drive.gpx", { id: d.id }))}" target="_blank" rel="noopener" download>&#11015; GPX</a>
       </div>
     </div>
@@ -3223,7 +3411,9 @@ async function renderChargeDetail() {
   setContent(`
     <div class="tm-flex-row" style="gap:14px;">
       <button class="tm-back-btn" data-action="back-charges">← Charges</button>
-      <div style="font-size:15px;font-weight:600;">${esc(chargeLocName(c, locations))}</div>
+      ${c.location_id != null
+        ? `<button type="button" class="tm-link-btn" style="font-size:15px;font-weight:600;" data-action="open-place" data-id="${c.location_id}" title="Open this place">${esc(chargeLocName(c, locations))}</button>`
+        : `<div style="font-size:15px;font-weight:600;">${esc(chargeLocName(c, locations))}</div>`}
       <span class="tm-badge ${c.charge_type === "DC" ? "tm-badge-dc" : "tm-badge-ac"}">${esc(c.charge_type || "AC")}</span>
       <div style="font-size:12.5px;color:var(--faint);">${fmtDateTime(c.start_ts)}</div>
     </div>
@@ -3496,6 +3686,8 @@ const EXPLORER_FIELDS = [
   ["inside_temp", "Inside temp", "°C", "#E4572E"],
   ["outside_temp", "Outside temp", "°C", "#8A8FA3", true],
   ["power", "Motor power", "kW", "#B5179E"],
+  ["pack_voltage", "Pack voltage", "V", "#C9A227"],
+  ["pack_current", "Pack current", "A", "#4CC9F0"],
   ["charger_power", "Charger power", "kW", "#0FA3B1"],
   ["est_range", "Est. range", "km", "#FF9F1C"],
   ["energy_remaining", "Energy left", "kWh", "#7B2D8B"],
