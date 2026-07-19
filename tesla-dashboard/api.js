@@ -187,6 +187,29 @@ export const data = {
   /** Recent alert-log entries (budget/watchdog/rule firings), newest first. Deliberately un-filtered by vin — budget alerts are account-wide and carry none. May 404 on an older worker. */
   alerts: (limit) => getJson("/data/alerts", { limit }),
   /**
+   * Web Push VAPID public key for pushManager.subscribe() — {key} (null when
+   * the worker has no VAPID secrets configured). New endpoint — may 404.
+   */
+  pushVapidKey: () => getJson("/data/push-vapid-key"),
+  /**
+   * Benign metadata write (token-gated POST) — register this browser's
+   * PushSubscription (its .toJSON(): {endpoint, keys:{p256dh, auth}}) so the
+   * worker's cron can push undelivered alerts to this device.
+   */
+  pushSubscribe: (sub) =>
+    fetch(workerOrigin() + "/data/push-subscribe?" + new URLSearchParams({ token: auth.token }), {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(sub),
+    }).then((r) => (r.ok ? r.json() : Promise.reject(new ApiError("subscribe failed", r.status)))),
+  /** Benign metadata write (token-gated POST) — drop a push subscription by its endpoint URL. */
+  pushUnsubscribe: (endpoint) =>
+    fetch(workerOrigin() + "/data/push-unsubscribe?" + new URLSearchParams({ token: auth.token }), {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ endpoint }),
+    }).then((r) => (r.ok ? r.json() : Promise.reject(new ApiError("unsubscribe failed", r.status)))),
+  /**
    * Range prediction. With no distance_km, returns {model, ready} so the screen
    * can show model quality + a form; with params, returns the prediction. New endpoint — may 404.
    */

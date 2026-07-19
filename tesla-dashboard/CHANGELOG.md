@@ -9,6 +9,33 @@ feature or screen, the **patch** version for fixes/tweaks/copy changes, and the
 configured. See `CLAUDE.md` at the repo root for the policy on keeping this file
 and `APP_VERSION` (in `app.js`) in sync.
 
+## 1.25.0 — 2026-07-20
+
+Real push notifications: worker alerts now reach the phone even with the
+dashboard closed.
+
+- **Web Push (VAPID) end to end.** The worker grew a full RFC 8291/8292
+  implementation (`webpush.ts` — aes128gcm message encryption + ES256
+  VAPID JWTs, WebCrypto only) and a cron-tick `deliverPendingAlerts`
+  pass that fans every still-undelivered alert-log entry (budget,
+  watchdog, rule errors) out to subscribed devices, additive to the
+  existing `ALERT_WEBHOOK` fallback. New token-gated routes:
+  `GET /data/push-vapid-key`, `POST /data/push-subscribe`,
+  `POST /data/push-unsubscribe` (same read-scope trust boundary as
+  assign-driver/save-location) — with matching `data.pushVapidKey()`,
+  `data.pushSubscribe()`, `data.pushUnsubscribe()` fetchers in `api.js`.
+- **"Push notifications" card on the Alerts screen**: Enable asks for
+  notification permission, subscribes via the worker's VAPID public key
+  and registers the subscription; Disable reverses both. The card states
+  its situation honestly — unsupported browser (with the iOS
+  "Add to Home Screen first" hint), permission denied, or a worker
+  without VAPID keys (with the one-time
+  `node scripts/gen-vapid-keys.mjs` setup pointer).
+- **`sw.js`**: `push` handler shows the alert as a notification (generic
+  title if the payload doesn't parse); `notificationclick` focuses an
+  already-open dashboard — navigating it to the Alerts screen — or opens
+  a fresh window there.
+
 ## 1.24.0 — 2026-07-20
 
 Alerts, live auto-refresh, a "Current trip" card, and a set of smaller

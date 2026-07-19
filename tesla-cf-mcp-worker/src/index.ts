@@ -21,6 +21,8 @@
  *   POST /mcp                     — MCP streamable HTTP endpoint (scope-aware)
  *   GET  /data/*                  — read APIs (see handleData)
  *   GET  /data/export/{drives.csv,charges.csv,drive.gpx}
+ *   GET  /data/push-vapid-key / POST /data/push-{subscribe,unsubscribe}
+ *                                 — Web Push for alert notifications (webpush.ts)
  *   GET  /geocode?q=              — GovMap→Nominatim forward geocode
  *   POST /auth/device-token?label=&vin=   (full) — mint revocable read token
  *   GET  /auth/device-token / POST /auth/revoke-device-token?id=  (full)
@@ -100,6 +102,7 @@ import {
   setLocation,
 } from "./tracking";
 import { Env } from "./types";
+import { deletePushSubscription, savePushSubscription } from "./webpush";
 
 const json = (data: unknown, status = 200): Response =>
   new Response(JSON.stringify(data, null, 2), {
@@ -492,6 +495,40 @@ export default {
           drivers,
           address,
         }));
+      }
+
+      // --- Web Push (phone notifications for the alert log — webpush.ts) --
+      // Same trust boundary as assign-driver/save-location: read scope
+      // suffices. Registering a push endpoint only ever RECEIVES alert text
+      // the same token could already read at /data/alerts, and can't touch
+      // the vehicle; the phone holding the read token is exactly the device
+      // that subscribes.
+      if (path === "/data/push-vapid-key") {
+        if (scope === null) return json({ error: "unauthorized" }, 401);
+        // key: null tells the dashboard the worker can't push yet (no VAPID
+        // secrets) — distinct from a 404, which means an older worker deploy.
+        return json({ key: env.VAPID_PUBLIC_KEY ?? null });
+      }
+      if (path === "/data/push-subscribe" && request.method === "POST") {
+        if (scope === null) return json({ error: "unauthorized" }, 401);
+        const body = (await request.json().catch(() => null)) as
+          | { endpoint?: unknown; keys?: { p256dh?: unknown; auth?: unknown } }
+          | null;
+        const endpoint = typeof body?.endpoint === "string" ? body.endpoint : "";
+        const p256dh = typeof body?.keys?.p256dh === "string" ? body.keys.p256dh : "";
+        const authKey = typeof body?.keys?.auth === "string" ? body.keys.auth : "";
+        if (!endpoint.startsWith("https://") || !p256dh || !authKey) {
+          return json({ error: "body must be a PushSubscription JSON: {endpoint, keys: {p256dh, auth}}" }, 400);
+        }
+        await savePushSubscription(env, { endpoint, p256dh, auth: authKey });
+        return json({ ok: true });
+      }
+      if (path === "/data/push-unsubscribe" && request.method === "POST") {
+        if (scope === null) return json({ error: "unauthorized" }, 401);
+        const body = (await request.json().catch(() => null)) as { endpoint?: unknown } | null;
+        const endpoint = typeof body?.endpoint === "string" ? body.endpoint : "";
+        if (!endpoint) return json({ error: "endpoint required" }, 400);
+        return json({ removed: await deletePushSubscription(env, endpoint) });
       }
 
       // --- data exports (CSV/GPX downloads; read scope) -------------------

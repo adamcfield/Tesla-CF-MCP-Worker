@@ -13,6 +13,12 @@
  *
  * skipWaiting + clients.claim + a controllerchange reload in app.js mean an
  * updated worker takes over and refreshes the page automatically.
+ *
+ * Web Push: the worker's cron fans undelivered alert-log entries out as
+ * encrypted push messages (tesla-cf-mcp-worker/src/webpush.ts); the handlers
+ * at the bottom turn them into notifications and route a tap back into the
+ * app (default: the Alerts screen). Subscribing happens in app.js via the
+ * "Push notifications" card on that screen.
  */
 
 const CACHE_NAME = "tesla-dash-shell-v4";
@@ -112,4 +118,41 @@ self.addEventListener("fetch", (event) => {
     return;
   }
   // Everything else: straight to network.
+});
+
+// --- Web Push -------------------------------------------------------------
+
+self.addEventListener("push", (event) => {
+  // Payload is {title, body, tag?, url?} JSON (see the worker's webpush.ts) —
+  // but never trust that: a malformed/empty payload still must show SOMETHING,
+  // both for the user and because browsers punish push events that don't call
+  // showNotification.
+  let data = null;
+  try {
+    data = event.data ? event.data.json() : null;
+  } catch { /* non-JSON payload — fall through to the generic notification */ }
+  event.waitUntil(
+    self.registration.showNotification(data?.title || "Tesla alert", {
+      body: data?.body || "",
+      tag: data?.tag || undefined,
+      icon: "./icons/icon-192.png",
+      badge: "./icons/icon-192.png",
+      data: { url: data?.url || "/#al" },
+    }),
+  );
+});
+
+self.addEventListener("notificationclick", (event) => {
+  event.notification.close();
+  const target = new URL(event.notification.data?.url || "/#al", self.location.href).href;
+  // Focus an already-open dashboard window (navigating it to the alert URL)
+  // rather than stacking a new one; open a fresh window only when none exists.
+  event.waitUntil(
+    self.clients.matchAll({ type: "window", includeUncontrolled: true }).then(async (wins) => {
+      const win = wins.find((w) => w.url.startsWith(self.location.origin));
+      if (!win) return self.clients.openWindow(target);
+      await win.focus().catch(() => {});
+      if (win.navigate) await win.navigate(target).catch(() => {});
+    }),
+  );
 });

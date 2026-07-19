@@ -36,6 +36,15 @@ export interface Env {
    *  for watchdog/budget alerts that have no per-rule webhook (see logAlert). */
   ALERT_WEBHOOK?: string;
   /**
+   * Web Push VAPID keypair (RFC 8292) — base64url raw P-256 keys (the public
+   * key is the 65-byte uncompressed point, the private key the 32-byte
+   * scalar). Generate once with scripts/gen-vapid-keys.mjs and set both via
+   * wrangler secret put. Unset = push delivery is silently skipped; the
+   * dashboard's "Push notifications" card explains how to enable it.
+   */
+  VAPID_PUBLIC_KEY?: string;
+  VAPID_PRIVATE_KEY?: string;
+  /**
    * Optional raw-history retention in days (wrangler.toml [vars] or secret).
    * Prunes telemetry_events and non-drive positions older than this on each
    * automation tick. Default 400 days; set "0" to keep everything forever.

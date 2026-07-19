@@ -33,6 +33,7 @@ import { createTelemetryConfig } from "./telemetry";
 import { TELEMETRY_CA, TELEMETRY_HOSTNAME, TELEMETRY_PLANS, TELEMETRY_PORT, TelemetryPlanStep } from "./telemetry-plans";
 import { closeStaleSessions, getTirePressures, getVampireDrain, recordConnectivityState } from "./tracking";
 import { Env } from "./types";
+import { listPushSubscriptions, sendWebPush } from "./webpush";
 
 // ---------------------------------------------------------------------------
 // Rule model
@@ -543,6 +544,13 @@ async function runCronTickInner(env: Env): Promise<Record<string, unknown>> {
 
   await pollWatchdog(env, summary);
   await budgetWatchdog(env, summary);
+  // Web Push fan-out sits immediately after the watchdogs — the tick's own
+  // alert writers — so a budget/watchdog page reaches the phone on the same
+  // tick that logged it, not the next one. Push must never break the tick.
+  try {
+    const pushed = await deliverPendingAlerts(env);
+    if (pushed > 0) summary.push_delivered = pushed;
+  } catch { /* push is best-effort */ }
   await manageTelemetryLadder(env, summary);
   // Generate AI coach notes for recently-closed drives that don't have one.
   try {
@@ -551,7 +559,47 @@ async function runCronTickInner(env: Env): Promise<Record<string, unknown>> {
   } catch { /* AI is best-effort */ }
   await purgeExpiredHistory(env, summary);
   await compactOldHistory(env, summary);
+  // Second pass for anything logged later in the tick (ladder steps, rule
+  // errors) — the first pass already marked its rows delivered, so this only
+  // sends what's genuinely new.
+  try {
+    const pushed = await deliverPendingAlerts(env);
+    if (pushed > 0) summary.push_delivered = (Number(summary.push_delivered) || 0) + pushed;
+  } catch { /* push is best-effort */ }
   return summary;
+}
+
+/**
+ * Web Push fan-out for undelivered alerts (exported for tests). Sends every
+ * alert_log row still delivered=0 from the last 24h (oldest first, capped at
+ * 10 per run so a backlog can't stall the tick) to every registered
+ * subscription, and marks a row delivered once ANY push service accepted it.
+ * ADDITIVE to logAlert's ALERT_WEBHOOK fallback: a webhook-delivered alert is
+ * already delivered=1 and never re-pushed. No-ops without VAPID keys or
+ * subscriptions, so unconfigured deployments pay nothing here.
+ */
+export async function deliverPendingAlerts(env: Env): Promise<number> {
+  if (!env.VAPID_PUBLIC_KEY || !env.VAPID_PRIVATE_KEY) return 0;
+  const subs = await listPushSubscriptions(env);
+  if (!subs.length) return 0;
+  const since = Math.floor(Date.now() / 1000) - 24 * 3600;
+  const rs = await env.DB.prepare(
+    `SELECT id, kind, message FROM alert_log WHERE delivered = 0 AND ts >= ?1 ORDER BY ts ASC LIMIT 10`,
+  ).bind(since).all<{ id: number; kind: string; message: string }>();
+  let delivered = 0;
+  for (const a of rs.results ?? []) {
+    let ok = false;
+    for (const sub of subs) {
+      if (await sendWebPush(env, sub, { title: `Tesla — ${a.kind}`, body: a.message, tag: `alert-${a.id}`, url: "/#al" })) {
+        ok = true;
+      }
+    }
+    if (ok) {
+      await env.DB.prepare(`UPDATE alert_log SET delivered = 1 WHERE id = ?1`).bind(a.id).run();
+      delivered++;
+    }
+  }
+  return delivered;
 }
 
 /**

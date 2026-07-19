@@ -348,6 +348,17 @@ export async function ensureSchema(env: Env): Promise<void> {
      )`,
   ).run();
 
+  // Web Push subscriptions (RFC 8291/8292 — webpush.ts): one row per browser
+  // endpoint the dashboard PWA registered. failures counts CONSECUTIVE send
+  // errors so dead endpoints age out (sendWebPush prunes at 10, and
+  // immediately on a 404/410 from the push service).
+  await env.DB.prepare(
+    `CREATE TABLE IF NOT EXISTS push_subscriptions (
+       endpoint TEXT PRIMARY KEY, p256dh TEXT, auth TEXT,
+       created_ts INTEGER, last_ok_ts INTEGER, failures INTEGER DEFAULT 0
+     )`,
+  ).run();
+
   schemaReady = true;
 }
 
