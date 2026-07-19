@@ -250,11 +250,12 @@ describe("telemetry-first: streaming suppresses billed REST reads", () => {
     expect(r.next_interval_s).toBe(10);
   });
 
-  // "power" has no streaming equivalent at all (see power_ts in ingest.ts) --
-  // while driving, the hour-long reconciliation gap left it stuck on one
-  // stale reading for a whole day. These regression-test the shorter,
-  // budget-paced reconciliation cadence used while streaming shows driving.
-  it("while driving, reconciles at the paced cadence instead of waiting the full hour", async () => {
+  // While driving, the reconciliation gap tightens from the hour-long
+  // stream-covered default to DRIVING_RECONCILE_S (600s) -- drives are where
+  // odometer drift accumulates and where an hour-long blind spot once
+  // swallowed whole drives. (Motor power itself now arrives stream-side via
+  // derivePower, so this no longer needs the old 10-60s billed burst.)
+  it("while driving, reconciles at the 10-minute driving gap instead of waiting the full hour", async () => {
     const env = makeEnv(kv);
     let vehicleDataCalls = 0;
     vi.stubGlobal("fetch", vi.fn(async (url: string) => {
@@ -271,30 +272,30 @@ describe("telemetry-first: streaming suppresses billed REST reads", () => {
     const now = Math.floor(Date.now() / 1000);
     await putAppState(env, `stream_ok_ts:${VIN}`, String(now - 5)); // stream alive
     await putAppState(env, `latest:${VIN}`, JSON.stringify({ vin: VIN, updated_at: now, gear: "D", speed: 45 }));
-    // Reconciled 30s ago -- well inside the hour-long gap, but past a fresh-budget
-    // 10s driving pace. Should still skip the billed read (30s > 10s already
-    // elapsed), but report active with a short remaining-gap interval, not 300s.
+    // Reconciled 5s ago -- inside the 600s driving gap. Should skip the billed
+    // read but report active with the remaining-gap interval, not the flat
+    // 300s INTERVAL_SLEEP that once let short drives finish unobserved.
     await putAppState(env, `billed_ts:${VIN}`, `${now - 5} 90`);
     const r = await pollOnce(env, VIN);
     expect(r.activity).toBe("stream_covered");
     expect(r.polled).toBe(false);
     expect(vehicleDataCalls).toBe(0);
     expect(r.active).toBe(true); // NOT false -- driving must keep the loop going
-    expect(r.next_interval_s).toBeLessThanOrEqual(10); // paced gap, not INTERVAL_SLEEP (300)
+    expect(r.next_interval_s).toBeLessThanOrEqual(600); // remaining driving gap, not the hour
+    expect(r.next_interval_s).toBeGreaterThanOrEqual(590);
   });
 
-  it("bills once the driving-paced reconciliation gap has actually elapsed", async () => {
+  it("bills once the driving reconciliation gap has actually elapsed", async () => {
     const env = makeEnv(kv);
     stubTesla({ state: "online", shift: "D", speed: 45 });
     const now = Math.floor(Date.now() / 1000);
     await putAppState(env, `stream_ok_ts:${VIN}`, String(now - 5)); // stream alive
     await putAppState(env, `latest:${VIN}`, JSON.stringify({ vin: VIN, updated_at: now, gear: "D", speed: 45 }));
-    // Prior billed read was itself a driving reconciliation (stamped the
-    // driving-paced interval) 15s ago -- past the fresh-budget 10s pace, and
-    // past the cross-poller dedup gap (0.8*10=8s) too.
-    await putAppState(env, `billed_ts:${VIN}`, `${now - 15} 10`);
+    // Prior driving reconciliation 610s ago -- past the 600s driving gap and
+    // past the cross-poller dedup gap too.
+    await putAppState(env, `billed_ts:${VIN}`, `${now - 610} 10`);
     const r = await pollOnce(env, VIN);
-    expect(r.polled).toBe(true); // reconciliation fired, refreshing "power"
+    expect(r.polled).toBe(true); // reconciliation fired
     expect(r.activity).toBe("driving");
   });
 
@@ -317,25 +318,26 @@ describe("telemetry-first: streaming suppresses billed REST reads", () => {
     await putAppState(env, `poll_state:${VIN}`, JSON.stringify({
       last_active_ts: now - 3 * 3600, last_probe_ts: now - 60,
     }));
-    await putAppState(env, `billed_ts:${VIN}`, `${now - 15} 10`); // clears both gap checks
+    await putAppState(env, `billed_ts:${VIN}`, `${now - 610} 10`); // clears both gap checks
     const r = await pollOnce(env, VIN);
     expect(r.polled).toBe(true);
     expect(r.activity).toBe("driving");
   });
 
-  it("a stale cross-poller interval from the last non-driving read doesn't throttle the first driving reconciliation", async () => {
+  it("a stale cross-poller interval from the last non-driving read doesn't throttle a due driving reconciliation", async () => {
+    // With DRIVING_RECONCILE_S (600s) > MAX_BILLED_GAP_S (240s), step 2b is
+    // the binding gate on this path and step 3b's driving cap is shadowed
+    // insurance -- this still locks in the end-to-end behavior: a due driving
+    // reconciliation bills regardless of what stale interval the last
+    // (non-driving) read stamped.
     const env = makeEnv(kv);
     stubTesla({ state: "online", shift: "D", speed: 45 });
     const now = Math.floor(Date.now() / 1000);
     await putAppState(env, `stream_ok_ts:${VIN}`, String(now - 5)); // stream alive
     await putAppState(env, `latest:${VIN}`, JSON.stringify({ vin: VIN, updated_at: now, gear: "D", speed: 45 }));
-    // Not suspended -- isolates the OTHER stale-interval gate (3b).
+    // Not suspended -- isolates the reconciliation + dedup gates.
     await putAppState(env, `poll_state:${VIN}`, JSON.stringify({ last_active_ts: now - 60, last_probe_ts: now - 60 }));
-    // Last billed read was an idle-cadence reconciliation stamped 90s --
-    // clears the telemetry-first driving-pace gap (20s > 10s) but, unfixed,
-    // step 3b would scale ITS gap from the stale 90s (0.8*90=72s) and
-    // throttle this for another 52s -- long enough to miss a short drive.
-    await putAppState(env, `billed_ts:${VIN}`, `${now - 20} 90`);
+    await putAppState(env, `billed_ts:${VIN}`, `${now - 650} 90`); // stale idle-era interval stamp
     const r = await pollOnce(env, VIN);
     expect(r.polled).toBe(true);
     expect(r.activity).toBe("driving");

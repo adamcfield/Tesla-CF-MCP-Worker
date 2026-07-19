@@ -64,6 +64,43 @@ describe("ingest value normalization", () => {
     expect(latest?.soc).toBe(80); // not clobbered by the invalid sample
   });
 
+  it("derives motor power from streamed PackVoltage × PackCurrent (negated: pack current is negative on discharge)", async () => {
+    // Sign verified live 2026-07-19: -80A at 375V while accelerating must
+    // read as +30 kW propulsion, matching the REST drive_state.power sign.
+    await handleIngest(req({ vin: VIN, ts: 1000, data: {
+      PackVoltage: 375, PackCurrent: -80,
+    }}), env);
+    const latest = await getLatest(env, VIN);
+    expect(latest?.power).toBe(30);
+    expect(latest?.power_ts).toBe(1000);
+  });
+
+  it("derived power reads negative during regen (positive pack current)", async () => {
+    await handleIngest(req({ vin: VIN, ts: 1000, data: {
+      PackVoltage: 370, PackCurrent: 97.6,
+    }}), env);
+    const latest = await getLatest(env, VIN);
+    expect(latest?.power).toBeCloseTo(-36.1, 1);
+  });
+
+  it("does NOT derive power while the batch shows active charging (that inflow is charger_power's job)", async () => {
+    await handleIngest(req({ vin: VIN, ts: 1000, data: {
+      PackVoltage: 375, PackCurrent: 23, ACChargingPower: 8.6,
+    }}), env);
+    const latest = await getLatest(env, VIN);
+    expect(latest?.power).toBeUndefined(); // not -8.6 smeared into motor power
+    expect(latest?.charger_power).toBe(8.6);
+  });
+
+  it("a REST-provided power in the same batch wins over the pack-derived figure", async () => {
+    await handleIngest(req({ vin: VIN, ts: 1000, data: {
+      power: 42, PackVoltage: 375, PackCurrent: -80,
+    }}), env);
+    const latest = await getLatest(env, VIN);
+    expect(latest?.power).toBe(42); // drive_state.power is the true motor figure
+    expect(latest?.power_ts).toBe(1000);
+  });
+
   it("normalizes Tesla's imperial distance/speed fields to metric", async () => {
     // Tesla returns miles/mph on both paths regardless of region; columns are km.
     await handleIngest(req({ vin: VIN, ts: 1000, data: {
