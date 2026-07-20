@@ -183,6 +183,20 @@ export async function ensureSchema(env: Env): Promise<void> {
      )`,
   ).run();
 
+  // Software version-change log. Permanent summary rows (an OTA update lands
+  // roughly monthly) — telemetry_events also carries software_version but is
+  // pruned after RETENTION_DAYS, so the long-term log needs its own home.
+  await env.DB.prepare(
+    `CREATE TABLE IF NOT EXISTS software_updates (
+       id INTEGER PRIMARY KEY AUTOINCREMENT,
+       vin TEXT NOT NULL, ts INTEGER NOT NULL,
+       from_version TEXT, to_version TEXT NOT NULL
+     )`,
+  ).run();
+  await env.DB.prepare(
+    `CREATE INDEX IF NOT EXISTS idx_sw_updates_vin_ts ON software_updates (vin, ts)`,
+  ).run();
+
   // Per-drive driver attribution + driving-behaviour metrics (insurance-style
   // scoring). Behaviour fields are derived from the drive's position samples
   // at close time; accuracy scales with polling cadence (see tracking.ts).

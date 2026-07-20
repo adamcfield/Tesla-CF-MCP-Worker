@@ -77,6 +77,7 @@ import {
   getChargeTaperCurve,
   getClimateHabits,
   getSentryLog,
+  getSoftwareUpdates,
   getDrive,
   getDriveCertificate,
   getDriverScores,
@@ -306,6 +307,8 @@ async function handleData(url: URL, env: Env): Promise<Response> {
     }
     case "/data/telemetry-fields":
       return json(await getTelemetryFieldStatus(env, vin));
+    case "/data/software-updates":
+      return json(await getSoftwareUpdates(env, vin));
     case "/data/vampire":
       return json(await getVampireDrain(env, vin, numParam("days", 30)));
     case "/data/pack-health":
