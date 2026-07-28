@@ -92,17 +92,65 @@ describe("scoring: posted limits, IMU, confidence", () => {
   });
 
   it("counts a harsh turn via heading proxy for a sample that lacks lat_accel even when the drive has IMU elsewhere", () => {
-    // Sample 1 has lon_accel (⇒ drive is 'imu'), but the sharp turn at sample 2→3
-    // has NO lat_accel; the per-sample heading proxy must still catch it.
+    // The drive has genuine (varying) IMU on both axes early on, but the sharp
+    // turn at the end has NO lat_accel sample; the per-sample heading proxy
+    // must still catch it.
     const samples = [
-      { ts: 0, speed: 40, heading: 0, lon_accel: 0.5 },
-      { ts: 10, speed: 40, heading: 0 }, // no lat_accel here
-      { ts: 20, speed: 40, heading: 90 }, // 90° in 10s = 9°/s... below 12; make it sharper
-      { ts: 25, speed: 40, heading: 180 }, // 90° in 5s = 18°/s ≥ 12 → harsh turn
+      { ts: 0, speed: 40, heading: 0, lon_accel: 0.5, lat_accel: 0.2 },
+      { ts: 10, speed: 40, heading: 0, lon_accel: 0.9, lat_accel: 0.4 },
+      { ts: 20, speed: 40, heading: 90, lon_accel: 0.3 }, // no lat_accel here
+      { ts: 25, speed: 40, heading: 180, lon_accel: 0.6 }, // 90° in 5s = 18°/s ≥ 12 → harsh turn
     ];
     const m = scoreDrive(samples, { distanceKm: 2 });
     expect(m.accel_source).toBe("imu");
     expect(m.harsh_turn_count).toBeGreaterThanOrEqual(1); // NOT silently dropped
+  });
+
+  // Regression (observed live 2026-07-28): when the budget ladder trimmed the
+  // IMU fields out of the streaming plan, mergeLatest's merge-forever kept
+  // serving the LAST value, so every sample of every drive carried the same
+  // frozen number. Deltas were all zero, so harsh events vanished and drives
+  // scored ~100 — while still claiming accel_source "imu". A 123 km/h, 148 kW
+  // drive came back with a 95 and zero flagged events.
+  it("treats a frozen (non-varying) IMU field as absent rather than as 'no acceleration'", () => {
+    const frozen = -0.02125; // one constant, repeated — the merge-forever artifact
+    const samples = [
+      { ts: 0, speed: 0, heading: 0, lon_accel: frozen, lat_accel: -0.158 },
+      { ts: 5, speed: 50, heading: 0, lon_accel: frozen, lat_accel: -0.158 },
+      { ts: 10, speed: 95, heading: 0, lon_accel: frozen, lat_accel: -0.158 },
+    ];
+    const m = scoreDrive(samples, { distanceKm: 1 });
+    // Honest about the source...
+    expect(m.accel_source).toBe("derived");
+    // ...and the Δv/Δt proxy sees what the frozen field hid: 0→50 km/h in 5s
+    // is ~2.8 m/s², past the 2.5 harsh-accel line.
+    expect(m.max_accel_ms2).toBeGreaterThan(2.5);
+    expect(m.harsh_accel_count).toBeGreaterThanOrEqual(1);
+    expect(m.behavior_score!).toBeLessThan(100); // NOT a silent perfect score
+  });
+
+  it("a frozen lat_accel re-enables the heading turn proxy instead of disabling both paths", () => {
+    // Frozen lateral g sits below the harsh threshold forever, and its mere
+    // presence used to suppress the heading proxy too — so cornering became
+    // undetectable by any path.
+    const samples = [
+      { ts: 0, speed: 40, heading: 0, lat_accel: -0.158 },
+      { ts: 5, speed: 40, heading: 90, lat_accel: -0.158 }, // 18°/s ≥ 12
+      { ts: 10, speed: 40, heading: 180, lat_accel: -0.158 },
+    ];
+    const m = scoreDrive(samples, { distanceKm: 1 });
+    expect(m.harsh_turn_count).toBeGreaterThanOrEqual(1);
+  });
+
+  it("still trusts a real IMU stream that happens to include repeated values", () => {
+    const samples = [
+      { ts: 0, speed: 10, heading: 0, lon_accel: 0.4, lat_accel: 0.1 },
+      { ts: 5, speed: 20, heading: 0, lon_accel: 0.4, lat_accel: 0.1 }, // repeat
+      { ts: 10, speed: 30, heading: 0, lon_accel: 1.7, lat_accel: 0.9 }, // varies ⇒ real
+    ];
+    const m = scoreDrive(samples, { distanceKm: 1 });
+    expect(m.accel_source).toBe("imu");
+    expect(m.max_accel_ms2).toBeCloseTo(1.7, 5); // the IMU value, not the proxy
   });
 });
 

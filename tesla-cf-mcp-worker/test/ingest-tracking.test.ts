@@ -95,6 +95,32 @@ describe("ingest value normalization", () => {
     expect(latest?.charger_power).toBe(8.6);
   });
 
+  it("does NOT derive power from a pack-only batch while the MERGED state says charging", async () => {
+    // Regression (observed live 2026-07-28): the guard only looked at the
+    // incoming batch, so a batch carrying just PackVoltage/PackCurrent during
+    // a charge leaked a charger-derived reading into latest.power — a parked,
+    // charging car showed -8.3 kW of "motor power" on the dashboard.
+    await handleIngest(req({ vin: VIN, ts: T, data: {
+      DetailedChargeState: "DetailedChargeStateCharging", ACChargingPower: 8.9, Gear: "P", VehicleSpeed: 0,
+    }}), env);
+    await handleIngest(req({ vin: VIN, ts: T + 1, data: { PackVoltage: 378.8, PackCurrent: 22 } }), env);
+    const latest = await getLatest(env, VIN);
+    expect(latest?.power).toBeUndefined(); // not -8.3
+  });
+
+  it("still derives power for a moving car even if the merged charging flag is stale", async () => {
+    // The mirror risk: charging_state is merge-forever too, so a stale
+    // "Charging" must never suppress power for a real drive.
+    await handleIngest(req({ vin: VIN, ts: T, data: {
+      DetailedChargeState: "DetailedChargeStateCharging", ACChargingPower: 8.9,
+    }}), env);
+    await handleIngest(req({ vin: VIN, ts: T + 1, data: {
+      PackVoltage: 375, PackCurrent: -80, VehicleSpeed: 60, Gear: "D",
+    }}), env);
+    const latest = await getLatest(env, VIN);
+    expect(latest?.power).toBe(30);
+  });
+
   it("a REST-provided power in the same batch wins over the pack-derived figure", async () => {
     await handleIngest(req({ vin: VIN, ts: T, data: {
       power: 42, PackVoltage: 375, PackCurrent: -80,

@@ -533,9 +533,9 @@ export async function applyIngest(env: Env, parsed: ParsedIngest): Promise<Lates
   // Fold AC/DC charging power + energy into single canonical fields, tagging the
   // charge type so charge sessions record AC vs DC.
   resolveCharging(patch);
-  derivePower(patch, parsed.ts);
 
   const prior = await getLatest(env, parsed.vin);
+  derivePower(patch, parsed.ts, prior);
   if (prior && parsed.ts < prior.updated_at - LATE_INGEST_TOLERANCE_S) {
     // Late replayed batch: history only (see LATE_INGEST_TOLERANCE_S above).
     await recordEvents(env, parsed.vin, [...events, ...posEvents]);
@@ -583,23 +583,42 @@ function resolveCharging(patch: Record<string, unknown>): void {
  * keeps flowing when billed polling is paused, which is what ended the
  * power-starvation bug family (#55/#56/#59) for good.
  *
- * Skipped while the same batch shows active charging: there the product is
- * the CHARGER's power flowing in, which already lives in charger_power, and
- * letting it land in "power" would smear large negative readings across a
- * charging session's samples. (A mid-charge batch that happens to carry
- * neither charging field can leak one such sample through — harmless, no
- * consumer reads positions.power during charges.) A REST-provided power in
- * the same batch wins: it's the true motor figure.
+ * Skipped while charging: there the product is the CHARGER's power flowing
+ * in, which already lives in charger_power, and letting it land in "power"
+ * would smear large negative readings across a charging session. The charging
+ * check falls back to the MERGED state when the batch itself carries no
+ * charging field — gating on the batch alone let a pack-only batch leak a
+ * charge-derived reading into latest.power (observed live 2026-07-28: a
+ * parked, charging car reporting −8.3 kW of "motor power" on the dashboard).
+ *
+ * That fallback is deliberately overridden while the car is moving: merged
+ * charging_state is itself merge-forever, so a stale "Charging" must never
+ * suppress power for a real drive — losing drive power is far worse than a
+ * cosmetically wrong parked reading. A REST-provided power always wins: it's
+ * the true motor figure.
  */
-function derivePower(patch: Record<string, unknown>, ts: number): void {
+function derivePower(
+  patch: Record<string, unknown>,
+  ts: number,
+  prior: LatestState | null,
+): void {
   const asNum = (v: unknown) => (typeof v === "number" && Number.isFinite(v) ? v : undefined);
   if (patch.power !== undefined) return;
   const v = asNum(patch.pack_voltage);
   const a = asNum(patch.pack_current);
   if (v === undefined || a === undefined) return;
-  const chargerPower = asNum(patch.charger_power);
-  const chargingState = typeof patch.charging_state === "string" ? patch.charging_state : "";
-  if ((chargerPower !== undefined && chargerPower > 0) || chargingState === "Charging") return;
+
+  const chargerPower = asNum(patch.charger_power) ?? asNum(prior?.charger_power);
+  const chargingState =
+    typeof patch.charging_state === "string"
+      ? patch.charging_state
+      : typeof prior?.charging_state === "string"
+        ? prior.charging_state
+        : "";
+  const charging = (chargerPower !== undefined && chargerPower > 0) || chargingState === "Charging";
+  const moving = (asNum(patch.speed) ?? asNum(prior?.speed) ?? 0) > 1;
+  if (charging && !moving) return;
+
   patch.power = Math.round((-(v * a) / 1000) * 10) / 10;
   patch.power_ts = ts;
 }

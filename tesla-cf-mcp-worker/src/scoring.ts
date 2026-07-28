@@ -91,7 +91,20 @@ export function scoreDrive(samples: BehaviorSample[], opts: ScoreOpts = {}): Beh
   if (pts.length < 2) return empty;
   const limitAt = (origI: number): number | null => opts.postedLimits?.[origI] ?? null;
 
-  const hasImu = pts.some((p) => typeof p.lon_accel === "number");
+  // A telemetry field that STOPS streaming keeps its last value forever
+  // (mergeLatest is merge-forever), so every sample of a drive carries the
+  // same frozen number. For the IMU that reads as "zero acceleration, zero
+  // cornering" and silently scores every drive ~100 with no harsh events --
+  // observed live 2026-07-28, after the budget ladder trimmed the IMU fields
+  // out of the streaming plan, on a drive that hit 123 km/h and 148 kW.
+  // Real per-sample IMU is never bit-identical across a whole drive, so
+  // require genuine variation before trusting it; without it we fall back to
+  // the speed/heading proxies a non-IMU drive has always used. lon and lat
+  // are judged separately — they stream as independent fields.
+  const varies = (vals: (number | null | undefined)[]): boolean =>
+    new Set(vals.filter((v): v is number => typeof v === "number")).size >= 2;
+  const hasImu = varies(pts.map((p) => p.lon_accel));
+  const hasLatImu = varies(pts.map((p) => p.lat_accel));
   const accelSource: "imu" | "derived" = hasImu ? "imu" : "derived";
 
   let maxAccel = 0, maxDecel = 0, maxLat = 0, maxJerk = 0;
@@ -110,7 +123,7 @@ export function scoreDrive(samples: BehaviorSample[], opts: ScoreOpts = {}): Beh
     if (excess > 0) { overCount++; overExcessSum += excess; }
     // Real lateral g (cornering) when present.
     const la = pts[k]!.lat_accel;
-    if (typeof la === "number") {
+    if (hasLatImu && typeof la === "number") {
       const mag = Math.abs(la);
       if (mag > maxLat) maxLat = mag;
       if (mag >= HARSH_LAT) harshTurn++;
@@ -144,13 +157,13 @@ export function scoreDrive(samples: BehaviorSample[], opts: ScoreOpts = {}): Beh
       if (decel > maxDecel) maxDecel = decel;
       if (decel >= HARSH_BRAKE) harshBrake++;
     }
-    // Cornering proxy whenever THIS sample lacks real lateral g — per-sample,
-    // not drive-wide. lon_accel/lat_accel stream independently, so a drive with
-    // IMU can still have per-sample lateral-g gaps; the lateral-g loop above
-    // already counts samples that DO have lat_accel, so gating here on its
-    // absence means at most one of {measured, proxy} fires per sample (no
-    // double-count, no silent gap).
-    if (typeof b.lat_accel !== "number" && typeof a.heading === "number" && typeof b.heading === "number" && (b.speed as number) >= TURN_MIN_SPEED) {
+    // Cornering proxy whenever this sample has no TRUSTED lateral g — either
+    // the field is absent here (lon/lat stream independently, so an IMU drive
+    // can still have per-sample lat gaps) or it's frozen drive-wide. The
+    // lateral-g loop above counts exactly the samples this skips, so at most
+    // one of {measured, proxy} fires per sample: no double-count, and no
+    // silent gap where a frozen field disables both.
+    if ((!hasLatImu || typeof b.lat_accel !== "number") && typeof a.heading === "number" && typeof b.heading === "number" && (b.speed as number) >= TURN_MIN_SPEED) {
       const rate = Math.abs(headingDelta(a.heading, b.heading)) / dt;
       if (rate >= HARSH_TURN_DEG_PER_S) harshTurn++;
     }
