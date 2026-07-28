@@ -154,6 +154,7 @@ export const data = {
     getJson("/data/timeline-chart", { vin, hours, fields: fields.join(","), ...(end != null ? { end } : {}) }),
   /** Live status per mapped Tesla telemetry field (canonical key, latest value, last-seen). New endpoint — may 404. */
   telemetryFields: (vin) => getJson("/data/telemetry-fields", { vin }),
+  softwareUpdates: (vin) => getJson("/data/software-updates", { vin }),
   locations: () => getJson("/data/locations"),
   locationHistory: (id, limit = 200) => getJson("/data/location-history", { id, limit }),
   locationStats: (id) => getJson("/data/location-stats", { id }),

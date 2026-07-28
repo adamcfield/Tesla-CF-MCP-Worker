@@ -5,7 +5,7 @@ import { destroyMaps, renderPointMap, renderRouteMap, renderLifetimeMap, createR
 // Bump on every change to this dashboard (UI, features, or the /data/*
 // endpoints it depends on) and add a matching entry to CHANGELOG.md — see
 // the versioning policy in the repo's CLAUDE.md. Shown in the sidebar footer.
-const APP_VERSION = "1.25.0";
+const APP_VERSION = "1.26.0";
 
 const root = document.getElementById("app");
 let shellBound = false; // guards one-time attach of the root click handler + sync timer
@@ -265,6 +265,7 @@ const TITLES = {
   bt: ["Battery timeline", "state of charge over time, with stages"],
   tc: ["Chart explorer", "overlay any signals over time — with events & car state"],
   tf: ["Telemetry fields", "every attribute Tesla can stream, and what this car is sending"],
+  sw: ["Software", "current version, update status & version history — click the Software tile on Overview to get here"],
   api: ["API usage", "Tesla Fleet API call log & cost — click the sidebar widget to get here"],
   cl: ["Changelog", "what's shipped, version by version — click the version number to get here"],
 };
@@ -1044,6 +1045,8 @@ function skeletonHtml(screen) {
       return `${metrics}${table(6)}`;
     case "api":
       return `${metrics}${table(10)}`;
+    case "sw":
+      return `<div class="tm-grid-2">${metric.repeat(2)}</div>${table(6)}`;
     case "cl": {
       const clCard = `<div class="tm-card tm-card-pad">${skel("height:16px;width:110px;")}${skel("height:11px;width:160px;margin-top:8px;")}${skel("height:12px;margin-top:16px;")}${skel("height:12px;width:85%;margin-top:8px;")}${skel("height:12px;width:70%;margin-top:8px;")}</div>`;
       return `<div class="tm-flex-col" style="gap:16px;">${clCard.repeat(4)}</div>`;
@@ -1083,6 +1086,7 @@ async function showScreen() {
       case "pr": await renderPredictions(); break;
       case "vd": await renderVampireDrain(); break;
       case "api": await renderApiUsage(); break;
+      case "sw": await renderSoftware(); break;
       case "cl": await renderChangelog(); break;
     }
     state.renderedScreen = state.screen;
@@ -1571,6 +1575,105 @@ function parseChangelog(md) {
   return versions;
 }
 
+// --- Software updates screen (issue #57) -----------------------------------
+
+const SW_STATUS_LABEL = {
+  installing: "Installing",
+  scheduled: "Scheduled",
+  available: "Update available",
+};
+
+/** "15 Mar 2026" — the version log spans years, so unlike fmtDay keep the year. */
+function fmtSwDate(ts) {
+  return ts == null ? "—" : new Date(ts * 1000).toLocaleDateString(undefined, { day: "numeric", month: "short", year: "numeric" });
+}
+
+async function renderSoftware() {
+  if (!vin()) return setContent(emptyHtml("No vehicle connected", "Disconnect and reconnect with a VIN."));
+
+  // Kept (not swallowed to null) so a stale deployed worker says WHY the
+  // screen is empty instead of rendering a blank page — same lesson as the
+  // API-usage call log.
+  const [swRes, latest] = await Promise.all([
+    data.softwareUpdates(vin()).then((v) => ({ sw: v }), (e) => ({ error: e })),
+    safe(cached("latest", () => data.latest(vin())), null),
+  ]);
+
+  if (swRes.error) {
+    const status = swRes.error?.status;
+    const fallbackVersion = latest?.software_version ?? null;
+    return setContent(`
+      ${fallbackVersion ? `
+      <div class="tm-card tm-card-pad-metric" style="max-width:340px;">
+        <div class="tm-stat-label">Current version</div>
+        <div class="tm-stat-value">${esc(fallbackVersion)}</div>
+      </div>` : ""}
+      <div class="tm-card tm-card-pad">
+        <div class="tm-empty-title" style="color:var(--warn);">${status === 404 ? "Software history not available on the deployed worker" : "Couldn't load software updates"}</div>
+        <div style="font-size:13px;color:var(--sub);margin-top:8px;line-height:1.55;">
+          ${status === 404
+            ? `This screen reads <code>/data/software-updates</code>, but the worker that's live right now answers 404 for it — the deployed worker is older than this feature. Fix: redeploy the worker — <code>cd tesla-cf-mcp-worker &amp;&amp; npm run deploy</code>. The version log starts recording from the moment the new worker is live.`
+            : `${esc(swRes.error?.message || "Unknown error")} — the request to <code>/data/software-updates</code> failed. Check the worker is reachable, then reload.`}
+        </div>
+      </div>`);
+  }
+
+  const sw = swRes.sw;
+  const cur = sw?.current ?? {};
+  const upd = sw?.update ?? null;
+  const history = sw?.history ?? [];
+
+  const updLine = (() => {
+    if (!upd) return `<div style="font-size:12.5px;color:var(--good);margin-top:6px;">&#10003; Up to date — no update pending</div>`;
+    const label = SW_STATUS_LABEL[upd.status] || upd.status;
+    const bits = [];
+    if (upd.version) bits.push(esc(upd.version));
+    if (upd.status === "installing" && upd.install_pct != null) bits.push(`${fmt0(upd.install_pct)}% installed`);
+    if (upd.status !== "installing" && upd.download_pct != null && upd.download_pct > 0 && upd.download_pct < 100) bits.push(`${fmt0(upd.download_pct)}% downloaded`);
+    if (upd.status === "scheduled" && upd.scheduled_ts != null) bits.push(`starts ${fmtDateTime(upd.scheduled_ts)}`);
+    if (upd.duration_min != null) bits.push(`~${fmtDurationMin(upd.duration_min)}`);
+    return `<div style="font-size:12.5px;color:var(--warn);margin-top:6px;">${esc(label)}${bits.length ? ` · ${bits.join(" · ")}` : ""}</div>`;
+  })();
+
+  setContent(`
+    <div class="tm-grid-2">
+      <div class="tm-card tm-card-pad-metric">
+        <div class="tm-stat-label">Current version</div>
+        <div class="tm-stat-value">${esc(cur.version || latest?.software_version || "—")}</div>
+        ${updLine}
+      </div>
+      ${upd && upd.status === "installing" ? `
+      <div class="tm-card tm-card-pad-metric">
+        <div class="tm-stat-label">Install progress</div>
+        <div class="tm-stat-value">${upd.install_pct != null ? fmt0(upd.install_pct) : "—"}<span class="tm-stat-unit">%</span></div>
+        <div style="height:6px;border-radius:999px;background:var(--line2);margin-top:10px;overflow:hidden;">
+          <div style="height:100%;width:${Math.max(0, Math.min(100, upd.install_pct ?? 0))}%;background:var(--accent);border-radius:999px;"></div>
+        </div>
+      </div>` : `
+      <div class="tm-card tm-card-pad-metric">
+        <div class="tm-stat-label">Updates seen on this car</div>
+        <div class="tm-stat-value">${history.filter((h) => h.from_version != null).length}</div>
+        <div style="font-size:12.5px;color:var(--faint);margin-top:6px;">since tracking began</div>
+      </div>`}
+    </div>
+
+    <div class="tm-card tm-table-wrap">
+      <div style="padding:16px 22px 0;font-size:14px;font-weight:600;">Version history</div>
+      ${history.length ? `
+      <div style="margin-top:12px;">
+        <div class="tm-table-head" style="grid-template-columns:150px 1fr 1fr;">
+          <div>Date</div><div>Version</div><div>Replaced</div>
+        </div>
+        ${history.map((h) => `
+          <div class="tm-table-row no-click" style="grid-template-columns:150px 1fr 1fr;">
+            <div>${esc(fmtSwDate(h.ts))}</div>
+            <div style="font-weight:600;">${esc(h.to_version)}${h.from_version == null ? ` <span style="font-weight:400;color:var(--faint);">(first seen)</span>` : ""}</div>
+            <div style="color:var(--sub);">${h.from_version != null ? esc(h.from_version) : "—"}</div>
+          </div>`).join("")}
+      </div>` : miniEmptyHtml("No versions logged yet — this fills in as the car reports its software version.")}
+    </div>`);
+}
+
 async function renderChangelog() {
   let md;
   try {
@@ -1895,7 +1998,7 @@ async function renderOverview() {
         <div class="tm-stat-label">Odometer</div>
         <div class="tm-stat-value">${odometer != null ? fmt0(odometer) : "—"} <span class="tm-stat-unit">km</span></div>
       </div>
-      <div class="tm-card tm-card-pad-metric">
+      <div class="tm-card tm-card-pad-metric tm-card-hover" data-action="nav" data-screen="sw" title="Software updates & version history">
         <div class="tm-stat-label">Software</div>
         <div class="tm-stat-value">${esc(swVersion || "—")}</div>
       </div>
