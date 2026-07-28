@@ -805,11 +805,15 @@ export function nextTelemetryPlanStep(
 ): TelemetryPlanStep | null {
   const [m, stored] = (storedRaw ?? "").split(" ");
   const current = m === month ? (stored as TelemetryPlanStep) : null;
-  let target: TelemetryPlanStep = current ?? "permanent";
-  if (pct >= 90) target = "minimal";
-  else if (pct >= 75 && current !== "minimal") target = "lean";
-  if (current === "minimal") target = "minimal"; // never upgrade mid-month
-  else if (current === "lean" && target === "permanent") target = "lean";
+  const RANK: Record<TelemetryPlanStep, number> = { permanent: 0, lean: 1, minimal: 2, ultra: 3 };
+  let target: TelemetryPlanStep = "permanent";
+  if (pct >= 98) target = "ultra";
+  else if (pct >= 90) target = "minimal";
+  else if (pct >= 75) target = "lean";
+  // Never upgrade mid-month: spend is monotonic, so a lower target can only
+  // mean the cap moved, and re-pushing configs would flap. Only the month
+  // rollover (current === null) restores fidelity.
+  if (current && RANK[target] < RANK[current]) target = current;
   return target !== current ? target : null;
 }
 

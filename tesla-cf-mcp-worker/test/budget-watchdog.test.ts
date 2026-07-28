@@ -84,6 +84,10 @@ describe("budgetWatchdog", () => {
   });
 
   it("predictive alert needs two consecutive projecting ticks (hysteresis) and fires once", async () => {
+    // Pinned mid-month: the projection only lands before month-end while
+    // enough days remain, so a real end-of-month run would otherwise flake.
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date(Date.UTC(2026, 6, 10, 12, 0, 0)));
     const env = makeEnv();
     // Seed a daily-spend series whose OLS slope projects exhaustion well
     // before month-end: three straight days at ~$1.5/day against a $9.5 cap.
@@ -110,6 +114,7 @@ describe("budgetWatchdog", () => {
 
     await budgetWatchdog(env, {}); // tick 3: already fired this streak — silent
     expect((await alertRows(env)).filter((r) => r.message.includes("runs out in"))).toHaveLength(1);
+    vi.useRealTimers();
   });
 
   it("never fires when no budget is configured (defaults are sane)", async () => {
@@ -159,11 +164,24 @@ describe("nextTelemetryPlanStep — the pure ladder decision", () => {
     expect(nextTelemetryPlanStep(M, null, 96)).toBe("minimal");
     expect(nextTelemetryPlanStep(M, null, 80)).toBe("lean");
   });
+  it("steps to ultra at 98% — minimal's own ~$0.04/day can still cross Tesla's $10 line", () => {
+    expect(nextTelemetryPlanStep(M, `${M} minimal`, 99)).toBe("ultra");
+    expect(nextTelemetryPlanStep(M, `${M} permanent`, 101)).toBe("ultra");
+    expect(nextTelemetryPlanStep(M, null, 99)).toBe("ultra");
+  });
+
   it("never upgrades mid-month and no-ops when already at the right step", () => {
     expect(nextTelemetryPlanStep(M, `${M} lean`, 80)).toBeNull();
     expect(nextTelemetryPlanStep(M, `${M} lean`, 50)).toBeNull(); // no upgrade despite low pct
-    expect(nextTelemetryPlanStep(M, `${M} minimal`, 99)).toBeNull();
+    expect(nextTelemetryPlanStep(M, `${M} minimal`, 95)).toBeNull();
     expect(nextTelemetryPlanStep(M, `${M} minimal`, 10)).toBeNull();
+    expect(nextTelemetryPlanStep(M, `${M} ultra`, 99)).toBeNull();
+    expect(nextTelemetryPlanStep(M, `${M} ultra`, 10)).toBeNull(); // floor holds all month
     expect(nextTelemetryPlanStep(M, `${M} permanent`, 30)).toBeNull();
+  });
+
+  it("the month rollover restores the permanent plan from any rung", () => {
+    expect(nextTelemetryPlanStep(M, "2026-06 ultra", 3)).toBe("permanent");
+    expect(nextTelemetryPlanStep(M, "2026-06 minimal", 3)).toBe("permanent");
   });
 });

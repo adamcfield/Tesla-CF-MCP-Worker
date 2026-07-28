@@ -12,13 +12,20 @@
  *   minimal   — survival mode near budget exhaustion: location, drive/charge
  *               state, SoC, pack V/I (keeps derived power alive), TPMS,
  *               temps. ~$0.02/day.
+ *   ultra     — last resort with the Tesla $10 line in sight: five fields at
+ *               10 min. ~$0.005/day, ~8x cheaper than minimal, enough to keep
+ *               position/SoC/charge state and let odometer-jump synthesis
+ *               still reconstruct drives. Added 2026-07-28, when minimal's
+ *               own ~$0.04/day would have crossed $10 with 3 days to go —
+ *               the ladder had no rung below minimal and slow terminal creep
+ *               could still trip Tesla's suspend (which WIPES the config).
  *
  * Generated from the live vehicle config snapshots in
  * fleet-telemetry-bridge/telemetry-plan-*.json -- keep hostname/CA in sync
  * with the bridge (RUNBOOK.md).
  */
 
-export type TelemetryPlanStep = "permanent" | "lean" | "minimal";
+export type TelemetryPlanStep = "permanent" | "lean" | "minimal" | "ultra";
 
 export const TELEMETRY_HOSTNAME = "telemetry.rightcraft.io";
 export const TELEMETRY_PORT = 443;
@@ -1204,8 +1211,27 @@ const MINIMAL_FIELDS: FieldPlan = {
   }
 };
 
+const ULTRA_FIELDS: FieldPlan = {
+  "DetailedChargeState": {
+    "interval_seconds": 600
+  },
+  "Gear": {
+    "interval_seconds": 600
+  },
+  "Location": {
+    "interval_seconds": 600
+  },
+  "Odometer": {
+    "interval_seconds": 600
+  },
+  "Soc": {
+    "interval_seconds": 600
+  }
+};
+
 export const TELEMETRY_PLANS: Record<TelemetryPlanStep, FieldPlan> = {
   permanent: PERMANENT_FIELDS,
   lean: LEAN_FIELDS,
   minimal: MINIMAL_FIELDS,
+  ultra: ULTRA_FIELDS,
 };
