@@ -860,8 +860,29 @@ export async function manageTelemetryLadder(env: Env, summary: Record<string, un
           : "Fidelity reduced to keep the stream alive inside the $10 credit; restores automatically on the 1st."),
       delivered: false,
     });
-  } catch {
-    /* ladder must never break the tick; retried next tick */
+  } catch (e) {
+    // The ladder must never break the tick, but it must not fail INVISIBLY
+    // either: a step that silently no-ops while spend climbs is exactly the
+    // blind spot the ladder exists to close (and the same path performs the
+    // month-rollover restore). Surface it on the tick summary and as a
+    // rule_error alert, deduped by message so a persistent failure doesn't
+    // flood the log every 15 minutes. Still retried next tick.
+    const msg = e instanceof Error ? e.message : String(e);
+    summary.telemetry_ladder_error = msg;
+    try {
+      const key = "telemetry_ladder_error";
+      if ((await getAppState(env, key).catch(() => null)) !== msg) {
+        await putAppState(env, key, msg);
+        await logAlert(env, {
+          ruleId: "telemetry_ladder",
+          kind: "rule_error",
+          message: `Telemetry plan ladder could not apply a step: ${msg}`,
+          delivered: false,
+        });
+      }
+    } catch {
+      /* alerting about the failure must not itself break the tick */
+    }
   }
 }
 
