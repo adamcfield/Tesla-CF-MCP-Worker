@@ -55,18 +55,25 @@ describe("budgetWatchdog", () => {
 
   it("fires each graduated threshold exactly once as spend climbs", async () => {
     const env = makeEnv();
+    // Only the CROSSING alerts are under test here. The predictive
+    // "runs out in ~N days" alert shares the same log and fires on its own
+    // 2-tick hysteresis, so on an early-month run (spend/day extrapolated
+    // over a nearly full month projects exhaustion) it would land in these
+    // rows too and make the assertions calendar-dependent.
+    const crossings = async () => (await alertRows(env)).filter((r) => r.message.includes("crossed"));
+
     await recordSpend(env, "wake", 260); // $5.20 ≈ 55%
     await budgetWatchdog(env, {});
-    let rows = await alertRows(env);
+    let rows = await crossings();
     expect(rows).toHaveLength(1);
     expect(rows[0].message).toContain("crossed 50%");
 
     await budgetWatchdog(env, {}); // same spend — no re-fire
-    expect(await alertRows(env)).toHaveLength(1);
+    expect(await crossings()).toHaveLength(1);
 
     await recordSpend(env, "wake", 130); // +$2.60 → $7.80 ≈ 82%
     await budgetWatchdog(env, {});
-    rows = await alertRows(env);
+    rows = await crossings();
     expect(rows).toHaveLength(2);
     expect(rows[1].message).toContain("crossed 75%");
   });

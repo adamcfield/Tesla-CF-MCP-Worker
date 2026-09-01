@@ -9,6 +9,37 @@ feature or screen, the **patch** version for fixes/tweaks/copy changes, and the
 configured. See `CLAUDE.md` at the repo root for the policy on keeping this file
 and `APP_VERSION` (in `app.js`) in sync.
 
+## 1.25.1 — 2026-09-01
+
+Stops the dashboard from taking the whole database offline. On 1 September the
+account crossed Cloudflare D1's free-tier ceiling of 5,000,000 rows read per
+day (6.31M read against just 69k written), and D1 then refuses every read until
+the next UTC midnight — so the dashboard, the poller, telemetry ingest and the
+automation tick all failed together.
+
+- **The 45-second live auto-refresh now only re-renders screens whose data
+  actually moves** (Overview, Timeline, Drives, Charges, Battery timeline).
+  Everything else is long-window analysis that cannot change in 45 s, and
+  re-running it is not the free repaint it was assumed to be. Worst cases: the
+  lifetime **Map** re-fetched up to 2,000 drives *plus 300 full routes*, and
+  **Statistics** re-fetched 2,000 drives + 2,000 charge sessions + four
+  multi-month aggregates — either one, left open during a charge, re-ran ~80
+  times an hour and could exhaust the day's entire read budget on its own.
+- The sidebar (spend, connection status, alerts badge) still refreshes every
+  tick on every screen — those are small indexed reads — and now invalidates
+  only its own cache keys instead of the whole screen cache.
+- **Telemetry fields** screen: the worker query behind it no longer groups over
+  every stored telemetry event for the vehicle (millions of rows for one screen
+  open); it seeks the last timestamp per mapped field instead. Same numbers,
+  ~1 row read per field.
+- Worker-side, in the same change: the automation tick's retention purge and
+  history compaction dropped from every 15 minutes to once a day (both work
+  against ~year-old cutoffs, so the old cadence found nothing while
+  full-scanning the two largest tables), the purge is now an index range
+  instead of a table scan, `/health`'s per-vehicle liveness probe is an index
+  seek instead of a group-by over every stored sample, and `alert_log` — which
+  had no index at all — is now indexed.
+
 ## 1.25.0 — 2026-07-20
 
 Real push notifications: worker alerts now reach the phone even with the

@@ -738,19 +738,40 @@ export async function applyVehicleData(
  * canonical key it lands under, the latest merged value (null = never seen),
  * and when it was last recorded. The dashboard joins this against the vendored
  * fleet_streaming_fields.csv so the user can scroll every attribute Tesla can
- * stream and see what's actually coming in. EAV last-seen comes from one
- * indexed GROUP BY; position-column fields share the latest positions row's
- * timestamp (they're sampled together into that row).
+ * stream and see what's actually coming in. Position-column fields share the
+ * latest positions row's timestamp (they're sampled together into that row).
+ *
+ * EAV last-seen is one indexed SEEK PER FIELD, batched — deliberately not the
+ * `GROUP BY field` it used to be. telemetry_events is keyed (vin, field, ts),
+ * and SQLite has no loose index scan: grouping walks EVERY stored event row
+ * for the vin, so opening this one dashboard screen read millions of rows and
+ * could exhaust D1's 5M/day free-tier cap on its own. Seeking the last ts of
+ * each mapped field reads ~one row per field instead, and is exactly
+ * equivalent — the response only ever reports FIELD_MAP's canonical keys, so
+ * fields outside it were fetched and discarded anyway.
  */
+/** D1 statements per batch — keeps a single round-trip from getting unwieldy. */
+const FIELD_STATUS_BATCH = 50;
+
 export async function getTelemetryFieldStatus(env: Env, vin: string): Promise<unknown> {
   const latest = ((await getLatest(env, vin)) ?? {}) as Record<string, unknown>;
-  const rs = await env.DB.prepare(
-    `SELECT field, MAX(ts) AS last_ts FROM telemetry_events WHERE vin = ?1 GROUP BY field`,
-  )
-    .bind(vin)
-    .all<{ field: string; last_ts: number }>();
-  const lastSeen = new Map((rs.results ?? []).map((r) => [r.field, r.last_ts]));
-  const pos = await env.DB.prepare(`SELECT MAX(ts) AS last_ts FROM positions WHERE vin = ?1`)
+  const canonicals = [...new Set(Object.values(FIELD_MAP))];
+  const lastSeen = new Map<string, number>();
+  for (let i = 0; i < canonicals.length; i += FIELD_STATUS_BATCH) {
+    const chunk = canonicals.slice(i, i + FIELD_STATUS_BATCH);
+    const rows = await env.DB.batch<{ ts: number }>(
+      chunk.map((field) =>
+        env.DB.prepare(
+          `SELECT ts FROM telemetry_events WHERE vin = ?1 AND field = ?2 ORDER BY ts DESC LIMIT 1`,
+        ).bind(vin, field),
+      ),
+    );
+    chunk.forEach((field, j) => {
+      const ts = rows[j]?.results?.[0]?.ts;
+      if (typeof ts === "number") lastSeen.set(field, ts);
+    });
+  }
+  const pos = await env.DB.prepare(`SELECT ts AS last_ts FROM positions WHERE vin = ?1 ORDER BY ts DESC LIMIT 1`)
     .bind(vin)
     .first<{ last_ts: number | null }>();
 
