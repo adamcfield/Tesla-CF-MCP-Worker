@@ -28,7 +28,7 @@ import { getVehicle, getVehicleData } from "./api";
 import { getBudgetCallLog, getBudgetForecast, getBudgetStatus } from "./budget";
 import * as cmd from "./commands";
 import { applyVehicleData } from "./ingest";
-import { getAppState, getLatest, LatestState, logAlert, putAppState, tzOffsetMinutes } from "./store";
+import { getAppState, getLatest, knownVins, LatestState, logAlert, putAppState, tzOffsetMinutes } from "./store";
 import { createTelemetryConfig } from "./telemetry";
 import { TELEMETRY_CA, TELEMETRY_HOSTNAME, TELEMETRY_PLANS, TELEMETRY_PORT, TelemetryPlanStep } from "./telemetry-plans";
 import { closeStaleSessions, getTirePressures, getVampireDrain, recordConnectivityState } from "./tracking";
@@ -557,8 +557,10 @@ async function runCronTickInner(env: Env): Promise<Record<string, unknown>> {
     const n = await backfillCoachNotes(env);
     if (n > 0) summary.coach_notes = n;
   } catch { /* AI is best-effort */ }
-  await purgeExpiredHistory(env, summary);
-  await compactOldHistory(env, summary);
+  // Housekeeping (retention purge + compaction) is DAILY, not per-tick — see
+  // runMaintenanceIfDue. Both work against ~year-old cutoffs, so a 15-minute
+  // cadence bought nothing and cost the D1 rows_read budget every time.
+  await runMaintenanceIfDue(env, summary);
   // Second pass for anything logged later in the tick (ladder steps, rule
   // errors) — the first pass already marked its rows delivered, so this only
   // sends what's genuinely new.
@@ -895,6 +897,15 @@ export async function manageTelemetryLadder(env: Env, summary: Record<string, un
  * long-term value (degradation trends need years) and grow far slower than
  * raw samples. The default keeps D1 well under its 5 GB free cap even at
  * burst/streaming cadence.
+ *
+ * SCOPED BY VIN, deliberately. `DELETE ... WHERE ts < ?` looks cheap but has
+ * no usable index: the only indexes on these tables lead with `vin`
+ * (idx_events_vin_ts, idx_positions_vin_ts, and telemetry_events' own
+ * (vin, field, ts) primary key), so a bare `ts` predicate FULL-SCANS the two
+ * largest tables in the database. Adding a plain `ts` index instead would put
+ * an extra index write on the hot ingest path and push rows_written toward
+ * its own free-tier cap, so the query is scoped to (vin, ts) — an index range
+ * that reads only rows actually old enough to delete, i.e. normally zero.
  */
 async function purgeExpiredHistory(env: Env, summary: Record<string, unknown>): Promise<void> {
   const raw = env.RETENTION_DAYS;
@@ -902,15 +913,51 @@ async function purgeExpiredHistory(env: Env, summary: Record<string, unknown>): 
   if (!Number.isFinite(days) || days <= 0) return;
   const cutoff = Math.floor(Date.now() / 1000) - Math.round(days * 86400);
   try {
-    const events = await env.DB.prepare(`DELETE FROM telemetry_events WHERE ts < ?1`).bind(cutoff).run();
-    const positions = await env.DB.prepare(
-      `DELETE FROM positions WHERE ts < ?1 AND drive_id IS NULL`,
-    ).bind(cutoff).run();
-    const purged = (events.meta.changes ?? 0) + (positions.meta.changes ?? 0);
+    let purged = 0;
+    for (const vin of await knownVins(env)) {
+      const events = await env.DB.prepare(
+        `DELETE FROM telemetry_events WHERE vin = ?1 AND ts < ?2`,
+      ).bind(vin, cutoff).run();
+      const positions = await env.DB.prepare(
+        `DELETE FROM positions WHERE vin = ?1 AND ts < ?2 AND drive_id IS NULL`,
+      ).bind(vin, cutoff).run();
+      purged += (events.meta.changes ?? 0) + (positions.meta.changes ?? 0);
+    }
     if (purged > 0) summary.purged_rows = purged;
   } catch (e) {
     summary.purge_error = e instanceof Error ? e.message : String(e);
   }
+}
+
+/**
+ * How often the housekeeping sweeps (retention purge + history compaction)
+ * actually run, regardless of how often the tick fires.
+ *
+ * Both sweeps work against multi-HUNDRED-day cutoffs (RETENTION_DAYS 400,
+ * COMPACT_AFTER_DAYS 365), so there is nothing a 15-minute cadence can find
+ * that a daily one won't — but each pass costs real D1 rows_read whether or
+ * not it matches anything. Running them on every tick was the single largest
+ * consumer of the free tier's 5M rows_read/day, and on a database younger
+ * than the cutoffs it deleted and compacted exactly nothing every time.
+ */
+const MAINTENANCE_INTERVAL_S = 24 * 3600;
+const MAINTENANCE_TS_KEY = "maintenance_ts";
+
+/**
+ * Runs the housekeeping sweeps at most once per MAINTENANCE_INTERVAL_S.
+ * The stamp is written BEFORE the sweeps so a sweep that throws still can't
+ * turn into a per-tick retry loop; both sweeps swallow their own errors into
+ * `summary` anyway. Exported for tests.
+ */
+export async function runMaintenanceIfDue(env: Env, summary: Record<string, unknown>): Promise<boolean> {
+  const now = Math.floor(Date.now() / 1000);
+  const last = Number((await getAppState(env, MAINTENANCE_TS_KEY).catch(() => "0")) ?? "0");
+  if (last && now - last < MAINTENANCE_INTERVAL_S) return false;
+  await putAppState(env, MAINTENANCE_TS_KEY, String(now)).catch(() => {});
+  await purgeExpiredHistory(env, summary);
+  await compactOldHistory(env, summary);
+  summary.maintenance = "ran";
+  return true;
 }
 
 /** How many not-yet-compacted drives/sessions to process per tick — bounds a single cron invocation's D1 round-trips. */

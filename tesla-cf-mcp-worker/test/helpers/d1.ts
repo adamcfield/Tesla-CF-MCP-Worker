@@ -46,7 +46,15 @@ class FakeStatement {
   async all<T = Record<string, unknown>>(): Promise<{ results: T[]; success: true; meta: Record<string, unknown> }> {
     const stmt = this.db.prepare(this.sql);
     const rows = stmt.all(...this.normalize(this.params)) as T[];
-    return { results: rows, success: true, meta: {} };
+    return { results: rows, success: true, meta: this.meta() };
+  }
+
+  /** changes()/last_insert_rowid() after the statement just executed. */
+  private meta(): { changes: number; last_row_id: number } {
+    const row = this.db
+      .prepare(`SELECT changes() AS changes, last_insert_rowid() AS last_row_id`)
+      .get() as { changes: number | bigint; last_row_id: number | bigint };
+    return { changes: Number(row.changes), last_row_id: Number(row.last_row_id) };
   }
 }
 
@@ -58,9 +66,16 @@ export class FakeD1 {
   prepare(sql: string): FakeStatement {
     return new FakeStatement(this.db, sql);
   }
+  /**
+   * D1's batch resolves to D1Result objects that carry BOTH `results` (the
+   * rows each statement returned) and `meta` — a batch of SELECTs is a
+   * supported way to issue many indexed seeks in one round-trip (see
+   * getTelemetryFieldStatus). Running them through `run()` here would drop
+   * the rows and let a broken query pass its test.
+   */
   async batch(statements: FakeStatement[]): Promise<unknown[]> {
     const out: unknown[] = [];
-    for (const s of statements) out.push(await s.run());
+    for (const s of statements) out.push(await s.all());
     return out;
   }
   async exec(sql: string): Promise<{ count: number }> {

@@ -64,7 +64,7 @@ import { pollOnce } from "./poll";
 import { loadCommandKey } from "./protocol";
 import { runCronTick } from "./rules";
 import { ensureSchedulerArmed, PollScheduler } from "./scheduler";
-import { getAppState, getLatest, listAlerts, putAppState, querySeries } from "./store";
+import { getAppState, getLatest, knownVins, listAlerts, putAppState, querySeries } from "./store";
 import {
   backfillChargeAddresses,
   backfillChargeHistory,
@@ -163,21 +163,35 @@ async function handleHealth(request: Request, url: URL, env: Env): Promise<Respo
     body.owner_grant = (await ownerGrantPresent(env).catch(() => false)) ? "present" : "missing";
     body.budget = await getBudgetStatus(env).catch(() => "unavailable");
     const now = Math.floor(Date.now() / 1000);
-    // Cheap, always-on: per-vehicle liveness (indexed MAX(ts) + one app_state
-    // read) — this is what the 15-min watchdog polls, so it must stay light.
+    // Cheap, always-on: per-vehicle liveness — this is what the 15-min
+    // watchdog polls, so it must stay light.
+    //
+    // It previously ran `SELECT vin, MAX(ts) FROM positions GROUP BY vin`,
+    // which is NOT the "indexed MAX" it looks like: with no WHERE clause
+    // SQLite walks the ENTIRE idx_positions_vin_ts index to build the groups,
+    // so every watchdog call read one row per stored position sample. At a few
+    // hundred thousand samples that single query, fired on a 15-minute
+    // schedule, was a large fraction of D1's 5M rows_read/day free cap.
+    //
+    // Per-vin `ORDER BY ts DESC LIMIT 1` is a single index seek (1 row read).
+    // The vin list comes from knownVins(), which prefers POLL_VINS and only
+    // falls back to a scan of the small `drives` table.
     try {
-      const rs = await env.DB.prepare(
-        `SELECT vin, MAX(ts) AS last_ts FROM positions GROUP BY vin`,
-      ).all<{ vin: string; last_ts: number }>();
+      const vins = await knownVins(env);
       body.vehicles = await Promise.all(
-        (rs.results ?? []).map(async (r) => {
+        vins.map(async (vin) => {
+          const last = await env.DB.prepare(
+            `SELECT ts FROM positions WHERE vin = ?1 ORDER BY ts DESC LIMIT 1`,
+          )
+            .bind(vin)
+            .first<{ ts: number }>();
           // poll_ok_ts is stamped on EVERY pollOnce (even free cycles): its age
           // is the pipeline-liveness signal the tick watchdog alerts on —
           // independent of whether the car is asleep.
-          const pollOk = Number((await getAppState(env, `poll_ok_ts:${r.vin}`).catch(() => "0")) ?? "0");
+          const pollOk = Number((await getAppState(env, `poll_ok_ts:${vin}`).catch(() => "0")) ?? "0");
           return {
-            vin_suffix: r.vin.slice(-6),
-            last_sample_age_s: now - r.last_ts,
+            vin_suffix: vin.slice(-6),
+            last_sample_age_s: last ? now - last.ts : null,
             poll_age_s: pollOk > 0 ? now - pollOk : null,
           };
         }),

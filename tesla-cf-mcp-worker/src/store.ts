@@ -29,6 +29,40 @@ let schemaReady = false;
 /** Test-only: clears the ensureSchema guard so a fresh test DB re-provisions. */
 export function resetSchemaCacheForTests(): void {
   schemaReady = false;
+  vinCache = null;
+}
+
+// Per-isolate cache for knownVins. A Worker isolate serves many requests, and
+// the fallback query is the only reason to touch D1 at all here.
+let vinCache: { vins: string[]; at: number } | null = null;
+const VIN_CACHE_TTL_MS = 10 * 60_000;
+
+/**
+ * Every VIN this deployment has data for. Used wherever a query would
+ * otherwise have to derive the vin set by scanning a hot table — a bare
+ * `GROUP BY vin` / `DISTINCT vin` over `positions` or `telemetry_events`
+ * walks one index entry per stored sample, which at a few hundred thousand
+ * samples is enough on its own to exhaust D1's free-tier daily rows_read.
+ *
+ * POLL_VINS is the cheap source; `drives` (small, and one row per drive
+ * rather than per sample) is unioned in so a vehicle that was dropped from
+ * POLL_VINS still gets its history swept. Cached per isolate.
+ */
+export async function knownVins(env: Env): Promise<string[]> {
+  if (vinCache && Date.now() - vinCache.at < VIN_CACHE_TTL_MS) return vinCache.vins;
+  const set = new Set(
+    (env.POLL_VINS ?? "").split(/[,\s]+/).map((v) => v.trim()).filter(Boolean),
+  );
+  try {
+    await ensureSchema(env);
+    const rs = await env.DB.prepare(`SELECT DISTINCT vin FROM drives`).all<{ vin: string }>();
+    for (const r of rs.results ?? []) if (r.vin) set.add(r.vin);
+  } catch {
+    /* the configured list alone is enough to keep liveness/maintenance working */
+  }
+  const vins = [...set];
+  vinCache = { vins, at: Date.now() };
+  return vins;
 }
 
 /**
@@ -358,6 +392,51 @@ export async function ensureSchema(env: Env): Promise<void> {
        created_ts INTEGER, last_ok_ts INTEGER, failures INTEGER DEFAULT 0
      )`,
   ).run();
+
+  // --- read-amplification indexes ---------------------------------------
+  // Every index below backs a query that previously FULL-SCANNED its table on
+  // a fixed schedule (the automation tick) or on every dashboard refresh.
+  // Together with the maintenance gating in rules.ts they are the fix for
+  // blowing D1's free-tier 5M rows_read/day, which took the whole worker
+  // offline (every D1 read errors once the cap is hit).
+  //
+  // All are on LOW-WRITE tables (alert_log, drives, charge_sessions) or are
+  // PARTIAL indexes over a near-empty subset, so they cost almost nothing
+  // against the 100k rows_written/day cap. Deliberately NOT added: a bare
+  // `ts` index on positions/telemetry_events — those are the hot insert path
+  // and an extra index write per sample would push writes toward the cap.
+  // Their scans are fixed by scoping the query to (vin, ts) instead.
+  await env.DB.batch([
+    // alert_log had NO index at all. Scanned by the tick's undelivered sweep
+    // (twice per tick) and by the dashboard's bell badge (every 45s while the
+    // car is active).
+    env.DB.prepare(`CREATE INDEX IF NOT EXISTS idx_alert_log_ts ON alert_log (ts)`),
+    env.DB.prepare(`CREATE INDEX IF NOT EXISTS idx_alert_log_vin_ts ON alert_log (vin, ts)`),
+    env.DB.prepare(
+      `CREATE INDEX IF NOT EXISTS idx_alert_log_pending ON alert_log (ts) WHERE delivered = 0`,
+    ),
+    // backfillCoachNotes runs every tick and almost always matches nothing —
+    // the partial index makes "nothing to do" cost ~0 rows instead of a scan
+    // plus a sort of the whole drives table.
+    env.DB.prepare(
+      `CREATE INDEX IF NOT EXISTS idx_drives_coach_pending ON drives (end_ts) WHERE coach_note IS NULL`,
+    ),
+    // compactOldHistory's backlog scans (both tables, every tick).
+    env.DB.prepare(
+      `CREATE INDEX IF NOT EXISTS idx_drives_compact ON drives (start_ts)
+       WHERE status = 'complete' AND (positions_compacted IS NULL OR positions_compacted = 0)`,
+    ),
+    env.DB.prepare(
+      `CREATE INDEX IF NOT EXISTS idx_charge_sessions_compact ON charge_sessions (start_ts)
+       WHERE status = 'complete' AND (curve_compacted IS NULL OR curve_compacted = 0)`,
+    ),
+    // getTrackingSummary's charge roll-up: /data/summary is the dashboard's
+    // most-called endpoint (sidebar budget + connection status on every
+    // render) and charge_sessions had no (vin, status) index.
+    env.DB.prepare(
+      `CREATE INDEX IF NOT EXISTS idx_charge_sessions_vin_status ON charge_sessions (vin, status)`,
+    ),
+  ]);
 
   schemaReady = true;
 }

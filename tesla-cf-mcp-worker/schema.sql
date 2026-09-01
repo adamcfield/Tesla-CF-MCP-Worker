@@ -102,5 +102,27 @@ CREATE TABLE IF NOT EXISTS alert_log (
   message TEXT, payload TEXT, delivered INTEGER DEFAULT 0
 );
 
+-- ── read-amplification indexes ──────────────────────────────────────────
+-- Each of these backs a query that otherwise full-scans its table on a fixed
+-- schedule (the automation tick) or on every dashboard refresh. Together they
+-- are the fix for exceeding D1's free-tier 5M rows_read/day, which takes the
+-- whole worker offline until the next UTC midnight. All sit on low-write
+-- tables or cover a near-empty subset, so they cost ~nothing against the
+-- 100k rows_written/day cap.
+--
+-- Deliberately absent: a bare `ts` index on positions / telemetry_events.
+-- Those are the hot insert path; the retention sweep scopes its DELETE to
+-- (vin, ts) and uses the indexes above instead. See test/read-amplification
+-- .test.ts, which pins these plans with EXPLAIN QUERY PLAN.
+CREATE INDEX IF NOT EXISTS idx_alert_log_ts ON alert_log (ts);
+CREATE INDEX IF NOT EXISTS idx_alert_log_vin_ts ON alert_log (vin, ts);
+CREATE INDEX IF NOT EXISTS idx_alert_log_pending ON alert_log (ts) WHERE delivered = 0;
+CREATE INDEX IF NOT EXISTS idx_drives_coach_pending ON drives (end_ts) WHERE coach_note IS NULL;
+CREATE INDEX IF NOT EXISTS idx_drives_compact ON drives (start_ts)
+  WHERE status = 'complete' AND (positions_compacted IS NULL OR positions_compacted = 0);
+CREATE INDEX IF NOT EXISTS idx_charge_sessions_compact ON charge_sessions (start_ts)
+  WHERE status = 'complete' AND (curve_compacted IS NULL OR curve_compacted = 0);
+CREATE INDEX IF NOT EXISTS idx_charge_sessions_vin_status ON charge_sessions (vin, status);
+
 -- Degradation and vampire drain are DERIVED by query (tracking.ts) over
 -- charge_sessions / positions — no dedicated tables, so they stay always-fresh.

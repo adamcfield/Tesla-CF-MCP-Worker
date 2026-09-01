@@ -5,7 +5,7 @@ import { destroyMaps, renderPointMap, renderRouteMap, renderLifetimeMap, createR
 // Bump on every change to this dashboard (UI, features, or the /data/*
 // endpoints it depends on) and add a matching entry to CHANGELOG.md — see
 // the versioning policy in the repo's CLAUDE.md. Shown in the sidebar footer.
-const APP_VERSION = "1.25.0";
+const APP_VERSION = "1.25.1";
 
 const root = document.getElementById("app");
 let shellBound = false; // guards one-time attach of the root click handler + sync timer
@@ -535,13 +535,40 @@ function tickSyncLabel() {
 }
 
 /**
+ * Screens whose content genuinely changes minute-to-minute, and are therefore
+ * worth re-rendering on the live auto-refresh tick.
+ *
+ * Everything else is long-window analysis — lifetime totals, 30/90-day
+ * aggregates, the lifetime map — that cannot meaningfully change in 45 s, and
+ * re-running it is not free the way a repaint is. `/data/*` costs the worker
+ * D1 rows_read, and Cloudflare's free tier stops serving the WHOLE database
+ * for the rest of the UTC day once 5M/day is crossed (it happened on
+ * 2026-09-01). The worst offenders were exactly the screens left out here:
+ * the lifetime map re-fetches up to 2,000 drives plus 300 full routes, and
+ * Statistics re-fetches 2,000 drives + 2,000 charge sessions + four
+ * multi-month aggregates. Left open during a charge, either one re-ran ~80
+ * times an hour and could exhaust the day's budget on its own.
+ *
+ * The sidebar (budget / connection / alerts badge) still refreshes on every
+ * tick regardless of screen — those are small indexed reads.
+ */
+const LIVE_SCREENS = new Set([
+  "ov", // Overview — current state
+  "tl", // Timeline — recent activity
+  "dr", // Drives — an in-progress drive grows
+  "ch", // Charges — an in-progress session grows
+  "bt", // Battery timeline — SoC moves while charging
+]);
+
+/**
  * Live auto-refresh: while the car is actually doing something (driving or
- * charging), re-render the current screen every 45 s — /data/* reads are free,
- * so this only costs a repaint; a parked/asleep car doesn't churn the DOM.
- * The activity probe reads whatever the last render already cached; on screens
- * that never load states/latest it fetches the small states row itself, under
- * the same cache key Overview uses so the two never double-fetch. Idle while
- * the tab is hidden, and never overlaps an in-flight sync.
+ * charging), re-render the current screen every 45 s — provided that screen is
+ * one whose data actually moves (see LIVE_SCREENS); a parked/asleep car
+ * doesn't churn the DOM. The activity probe reads whatever the last render
+ * already cached; on screens that never load states/latest it fetches the
+ * small states row itself, under the same cache key Overview uses so the two
+ * never double-fetch. Idle while the tab is hidden, and never overlaps an
+ * in-flight sync.
  */
 let autoRefreshBusy = false;
 async function autoRefreshTick() {
@@ -556,11 +583,17 @@ async function autoRefreshTick() {
     const active = states?.[0]?.state === "driving" || states?.[0]?.state === "charging"
       || state.cache.latest?.charging_state === "Charging";
     if (!active) return;
-    state.cache = {};
-    await showScreen();
+    // The sidebar tracks the car on every screen, so drop just its two cache
+    // keys — a blanket `state.cache = {}` here would force the (possibly
+    // expensive) current screen to refetch even when we're about to skip it.
+    delete state.cache.summary;
+    delete state.cache.alerts;
     refreshSideBudget();
     refreshConnStatus();
     refreshAlertsBadge();
+    if (!LIVE_SCREENS.has(state.screen)) return;
+    state.cache = {};
+    await showScreen();
   } finally {
     autoRefreshBusy = false;
   }
