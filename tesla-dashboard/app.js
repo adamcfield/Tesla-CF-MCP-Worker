@@ -5,7 +5,7 @@ import { destroyMaps, renderPointMap, renderRouteMap, renderLifetimeMap, createR
 // Bump on every change to this dashboard (UI, features, or the /data/*
 // endpoints it depends on) and add a matching entry to CHANGELOG.md — see
 // the versioning policy in the repo's CLAUDE.md. Shown in the sidebar footer.
-const APP_VERSION = "1.25.1";
+const APP_VERSION = "1.25.2";
 
 const root = document.getElementById("app");
 let shellBound = false; // guards one-time attach of the root click handler + sync timer
@@ -552,6 +552,33 @@ function tickSyncLabel() {
  * The sidebar (budget / connection / alerts badge) still refreshes on every
  * tick regardless of screen — those are small indexed reads.
  */
+/**
+ * Cache keys the live auto-refresh must NOT drop: long-window aggregates that
+ * cannot meaningfully change between two 45-second ticks. They are still
+ * fetched on first paint, on a manual refresh (which clears the whole cache),
+ * and on a screen change — just not eighty times an hour.
+ *
+ * Prefixes, because some keys carry a window suffix (`tires_90`, `ov_tl_*`).
+ * The worker memoises these routes as well (see DATA_CACHE_TTL_S in
+ * index.ts); belt and braces, because the browser cache cannot be relied on to
+ * protect a shared database from every client.
+ */
+const SLOW_CACHE_KEYS = [
+  "tires",          // 30/90-day tyre-pressure trend
+  "degradation",    // all-time pack degradation
+  "locations",      // geofences — edited by hand, essentially static
+  "all_drives",     // full drive list (up to 2,000 rows)
+  "all_charges",    // full charge-session list
+  "eff_temp",       // efficiency vs ambient temperature
+  "monthly",        // 12-month report
+  "safety_features",
+  "climate_habits",
+  "vampire",
+  "sentry_log",
+  "media",
+  "drivers",
+];
+
 const LIVE_SCREENS = new Set([
   "ov", // Overview — current state
   "tl", // Timeline — recent activity
@@ -592,7 +619,16 @@ async function autoRefreshTick() {
     refreshConnStatus();
     refreshAlertsBadge();
     if (!LIVE_SCREENS.has(state.screen)) return;
-    state.cache = {};
+    // Drop only the cache keys whose data actually moved. A blanket reset made
+    // every live tick re-fetch the whole screen, and a "live" screen is not
+    // uniformly live: Overview is mostly current state, but it also carries a
+    // 30-day tyre trend and an all-time degradation curve. Those were being
+    // recomputed eighty times an hour — 1.25.1 stopped the Map and Statistics
+    // screens doing it and missed this, which is what blew the database read
+    // budget a second time on 2026-09-02.
+    for (const key of Object.keys(state.cache)) {
+      if (!SLOW_CACHE_KEYS.some((prefix) => key.startsWith(prefix))) delete state.cache[key];
+    }
     await showScreen();
   } finally {
     autoRefreshBusy = false;

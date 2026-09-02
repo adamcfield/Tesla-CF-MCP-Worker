@@ -51,6 +51,13 @@ export interface Env {
    */
   RETENTION_DAYS?: string;
   /**
+   * Rows-read-per-UTC-day threshold past which the expensive analytical
+   * /data/* endpoints stop recomputing and serve their last cached answer
+   * (see d1meter.ts). Default 3,500,000 — 70% of D1's free-tier 5M ceiling,
+   * leaving headroom for ingest, polling and the automation tick.
+   */
+  D1_READ_SOFT_LIMIT?: string;
+  /**
    * Optional age (days) past which a completed drive's route positions and a
    * completed charge session's curve samples are THINNED, not deleted — the
    * drive/charge_session summary row (distance, energy, cost, behavior score,

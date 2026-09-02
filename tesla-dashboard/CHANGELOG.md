@@ -9,6 +9,38 @@ feature or screen, the **patch** version for fixes/tweaks/copy changes, and the
 configured. See `CLAUDE.md` at the repo root for the policy on keeping this file
 and `APP_VERSION` (in `app.js`) in sync.
 
+## 1.25.2 — 2026-09-02
+
+The database hit Cloudflare's free-tier read ceiling again, the day after
+1.25.1 shipped, so this is the follow-up that actually finds the multiplier —
+plus the accounting that should have been there the first time.
+
+- **1.25.1 fixed the wrong screens.** It stopped the Map and Statistics screens
+  auto-refreshing, but left **Overview** — the default screen — in the live set.
+  Overview is not uniformly live: alongside current state it pulls a **30-day
+  tyre-pressure trend**, an **all-time degradation curve** and two timeline
+  charts. Those were being recomputed every 45 seconds during any drive or
+  charge. The evidence: the worker reported a healthy database at 11:38 UTC and
+  was cut off before 13:20 — about five million rows in under two hours, which
+  is request-driven, not the scheduled work 1.25.1 targeted.
+- **The live tick now drops only the cache keys whose data actually moved.**
+  Long-window aggregates survive the tick and are re-fetched on first paint, on
+  a manual refresh, and on a screen change — not eighty times an hour.
+- Worker-side, in the same change:
+  - **Every expensive `/data/*` route is memoised** (15 min for 30/90-day
+    aggregates, 60s for the recent-window series, 30s for the summary), so a
+    repeated identical poll costs one row instead of a full scan — whatever the
+    client does. Responses carry an `x-cache: fresh|cache|stale` header.
+  - **A daily read budget with a guard.** Every D1 statement's `rows_read` is
+    now counted into a per-UTC-day total. Past a soft threshold (default 3.5M of
+    the 5M ceiling) the analytical endpoints serve their last cached answer
+    instead of rescanning — so a runaway caller costs a few hours of stale
+    analytics rather than taking the dashboard, the poller and the telemetry
+    sink down together.
+  - **The budget is visible** on `/health` as `d1_reads`. Both outages had to be
+    diagnosed by reading source code, because nothing recorded what was actually
+    being read; that is the underlying defect this closes.
+
 ## 1.25.1 — 2026-09-01
 
 Stops the dashboard from taking the whole database offline. On 1 September the
