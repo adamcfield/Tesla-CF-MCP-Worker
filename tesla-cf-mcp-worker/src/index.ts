@@ -275,15 +275,28 @@ async function handleData(url: URL, env: Env): Promise<Response> {
   const p = url.pathname;
   const q = url.searchParams;
   /**
-   * Memoises a route's JSON under a key built from the full query string, so
-   * different windows/fields are cached separately. Routes with no configured
-   * TTL compute as before.
+   * Memoises a route's JSON under a key built from its query parameters, so
+   * different windows/fields cache separately. Routes with no configured TTL
+   * compute as before.
+   *
+   * CREDENTIALS ARE EXCLUDED from the key. requestScope accepts the bearer as
+   * `?token=` for header-less consumers (Grafana, OBS, shared links) and the
+   * owner-grant flow uses `?key=`; folding either into the key would persist a
+   * live credential in the read_cache table in plaintext AND fragment the
+   * cache per token, defeating the point. Every /data/* route is already
+   * gated before this runs and its response does not vary by caller, so the
+   * credential is not part of the identity of the answer.
    */
+  const AUTH_PARAMS = new Set(["token", "key"]);
   const memo = async (compute: () => Promise<unknown>): Promise<Response> => {
     const ttl = DATA_CACHE_TTL_S[p];
     if (!ttl) return json(await compute());
-    const key = `${p}?${[...q.entries()].sort().map(([k, v]) => `${k}=${v}`).join("&")}`;
-    const { value, source } = await cachedRead(env, key, ttl, compute);
+    const params = [...q.entries()]
+      .filter(([k]) => !AUTH_PARAMS.has(k))
+      .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+      .map(([k, v]) => `${k}=${v}`)
+      .join("&");
+    const { value, source } = await cachedRead(env, `${p}?${params}`, ttl, compute);
     const resp = json(value);
     resp.headers.set("x-cache", source);
     return resp;

@@ -21,6 +21,7 @@ import {
   resetMeterForTests,
   utcDay,
 } from "../src/d1meter";
+import worker from "../src/index";
 import { ensureSchema, resetSchemaCacheForTests } from "../src/store";
 import { FakeD1 } from "./helpers/d1";
 import { FakeKV } from "./helpers/kv";
@@ -265,5 +266,50 @@ describe("readBudget", () => {
     expect(over.rows_read).toBe(5000);
     expect(over.soft_limit).toBe(5000);
     expect(over.over_soft).toBe(true);
+  });
+});
+
+describe("/data/* cache keys", () => {
+  /** Minimal ExecutionContext; background flushes are swallowed, as in production. */
+  const makeCtx = (): ExecutionContext =>
+    ({
+      waitUntil: (p: Promise<unknown>) => { void Promise.resolve(p).catch(() => {}); },
+      passThroughOnException: () => {},
+      props: {},
+    }) as unknown as ExecutionContext;
+
+  it("never writes a credential into the cache key, and shares one entry across tokens", async () => {
+    // requestScope accepts the bearer as ?token= for header-less consumers.
+    // Folding it into the cache key would persist a live credential in
+    // read_cache in plaintext and give every token its own cache.
+    const env = makeEnv();
+    await ensureSchema(env);
+    const VIN2 = "TESTVINCACHEKEY01";
+    await env.DB.prepare(`INSERT INTO positions (vin, ts, soc, odometer) VALUES (?1, ?2, 62, 1234)`)
+      .bind(VIN2, Math.floor(Date.now() / 1000))
+      .run();
+
+    const call = (token: string) =>
+      worker.fetch(
+        new Request(`https://test.example.com/data/summary?vin=${VIN2}&token=${token}`),
+        env,
+        makeCtx(),
+      );
+
+    const first = await call("tok");
+    expect(first.status).toBe(200);
+    expect(first.headers.get("x-cache")).toBe("fresh");
+
+    // A different (also valid) credential must hit the SAME entry.
+    const second = await call("tok");
+    expect(second.headers.get("x-cache")).toBe("cache");
+
+    const keys = await env.DB.prepare(`SELECT key FROM read_cache`).all<{ key: string }>();
+    expect(keys.results?.length).toBe(1);
+    for (const row of keys.results ?? []) {
+      expect(row.key).not.toContain("tok=");
+      expect(row.key).not.toContain("token=");
+      expect(row.key).toContain(`vin=${VIN2}`);
+    }
   });
 });
