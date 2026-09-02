@@ -124,5 +124,22 @@ CREATE INDEX IF NOT EXISTS idx_charge_sessions_compact ON charge_sessions (start
   WHERE status = 'complete' AND (curve_compacted IS NULL OR curve_compacted = 0);
 CREATE INDEX IF NOT EXISTS idx_charge_sessions_vin_status ON charge_sessions (vin, status);
 
+-- ── D1 read accounting + response cache (src/d1meter.ts) ────────────────
+-- Cloudflare's free tier stops serving the WHOLE database for the rest of the
+-- UTC day past 5,000,000 rows read. These two tables are what keep that from
+-- being an invisible cliff:
+--   d1_usage   — rows read per UTC day, summed from every statement's
+--                meta.rows_read. Surfaced on /health as `d1_reads`.
+--   read_cache — memoised JSON for the expensive analytical /data/* routes,
+--                so an aggregate the dashboard re-polls every 45s costs one
+--                row instead of a 30-day scan. Pruned by the daily sweep.
+-- Both are provisioned on first use by d1meter.ts, not by ensureSchema.
+CREATE TABLE IF NOT EXISTS d1_usage (
+  day TEXT PRIMARY KEY, rows_read INTEGER NOT NULL, updated_ts INTEGER
+);
+CREATE TABLE IF NOT EXISTS read_cache (
+  key TEXT PRIMARY KEY, value TEXT NOT NULL, created_ts INTEGER NOT NULL
+);
+
 -- Degradation and vampire drain are DERIVED by query (tracking.ts) over
 -- charge_sessions / positions — no dedicated tables, so they stay always-fresh.

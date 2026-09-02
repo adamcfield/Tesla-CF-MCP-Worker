@@ -64,6 +64,7 @@ import { pollOnce } from "./poll";
 import { loadCommandKey } from "./protocol";
 import { runCronTick } from "./rules";
 import { ensureSchedulerArmed, PollScheduler } from "./scheduler";
+import { cachedRead, flushMeter, meterD1, readBudget } from "./d1meter";
 import { getAppState, getLatest, knownVins, listAlerts, putAppState, querySeries } from "./store";
 import {
   backfillChargeAddresses,
@@ -162,6 +163,11 @@ async function handleHealth(request: Request, url: URL, env: Env): Promise<Respo
   if ((await requestScope(request, url, env)) !== null) {
     body.owner_grant = (await ownerGrantPresent(env).catch(() => false)) ? "present" : "missing";
     body.budget = await getBudgetStatus(env).catch(() => "unavailable");
+    // D1 rows-read budget for the current UTC day. This is the signal that was
+    // missing when the free-tier ceiling took the whole database down on
+    // 2026-09-01 and 2026-09-02 — both times it had to be inferred from the
+    // source rather than read off the running system.
+    body.d1_reads = await readBudget(env).catch(() => "unavailable");
     const now = Math.floor(Date.now() / 1000);
     // Cheap, always-on: per-vehicle liveness — this is what the 15-min
     // watchdog polls, so it must stay light.
@@ -233,9 +239,68 @@ async function handleHealth(request: Request, url: URL, env: Env): Promise<Respo
  *   /data/states?vin=&hours=     /data/battery-timeline?vin=&hours=
  *   /data/locations              /data/location-stats?id=
  */
+/**
+ * TTLs for the memoised /data/* reads, in seconds. Chosen against how fast the
+ * underlying number can actually move, not how fast the dashboard asks:
+ * the live auto-refresh polls every 45s while the car is active, and a 30-day
+ * tyre-pressure trend or an all-time degradation curve is identical across
+ * eighty consecutive polls. See d1meter.ts for why this matters — an
+ * unmemoised 30-day scan repeated at that rate is what took D1 offline twice.
+ */
+const DATA_CACHE_TTL_S: Record<string, number> = {
+  // Long-window aggregates: minutes-stale is invisible to the reader.
+  "/data/tires": 900,
+  "/data/degradation": 900,
+  "/data/vampire": 900,
+  "/data/pack-health": 900,
+  "/data/monthly": 900,
+  "/data/efficiency-by-temp": 900,
+  "/data/media": 900,
+  "/data/media-by-driver": 900,
+  "/data/safety-features": 900,
+  "/data/climate-habits": 900,
+  "/data/charge-taper": 900,
+  "/data/sentry-log": 900,
+  "/data/driver-scores": 900,
+  "/data/suggested-locations": 900,
+  // Recent-window series the live screens actually watch — short, but still
+  // enough to collapse a burst of identical polls into one scan.
+  "/data/timeline-chart": 60,
+  "/data/battery-timeline": 60,
+  "/data/states": 60,
+  "/data/summary": 30,
+};
+
 async function handleData(url: URL, env: Env): Promise<Response> {
   const p = url.pathname;
   const q = url.searchParams;
+  /**
+   * Memoises a route's JSON under a key built from its query parameters, so
+   * different windows/fields cache separately. Routes with no configured TTL
+   * compute as before.
+   *
+   * CREDENTIALS ARE EXCLUDED from the key. requestScope accepts the bearer as
+   * `?token=` for header-less consumers (Grafana, OBS, shared links) and the
+   * owner-grant flow uses `?key=`; folding either into the key would persist a
+   * live credential in the read_cache table in plaintext AND fragment the
+   * cache per token, defeating the point. Every /data/* route is already
+   * gated before this runs and its response does not vary by caller, so the
+   * credential is not part of the identity of the answer.
+   */
+  const AUTH_PARAMS = new Set(["token", "key"]);
+  const memo = async (compute: () => Promise<unknown>): Promise<Response> => {
+    const ttl = DATA_CACHE_TTL_S[p];
+    if (!ttl) return json(await compute());
+    const params = [...q.entries()]
+      .filter(([k]) => !AUTH_PARAMS.has(k))
+      .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+      .map(([k, v]) => `${k}=${v}`)
+      .join("&");
+    const { value, source } = await cachedRead(env, `${p}?${params}`, ttl, compute);
+    const resp = json(value);
+    resp.headers.set("x-cache", source);
+    return resp;
+  };
   const numParam = (name: string, def: number): number => {
     const raw = q.get(name);
     if (raw === null || raw === "") return def;
@@ -293,7 +358,7 @@ async function handleData(url: URL, env: Env): Promise<Response> {
     case "/data/latest":
       return json((await getLatest(env, vin)) ?? { vin, note: "no data ingested yet" });
     case "/data/summary":
-      return json(await getTrackingSummary(env, vin));
+      return memo(() => getTrackingSummary(env, vin));
     case "/data/series": {
       const field = q.get("field");
       if (!field) return json({ error: "field query param required" }, 400);
@@ -302,13 +367,13 @@ async function handleData(url: URL, env: Env): Promise<Response> {
     case "/data/drives":
       return json(await getDrives(env, vin, numParam("limit", 50)));
     case "/data/driver-scores":
-      return json(await getDriverScores(env, vin));
+      return memo(() => getDriverScores(env, vin));
     case "/data/charge-sessions":
       return json(await getChargeSessions(env, vin, numParam("limit", 50)));
     case "/data/degradation":
-      return json(await getBatteryDegradation(env, vin));
+      return memo(() => getBatteryDegradation(env, vin));
     case "/data/battery-timeline":
-      return json(await getBatteryTimeline(env, vin, numParam("hours", 24)));
+      return memo(() => getBatteryTimeline(env, vin, numParam("hours", 24)));
     case "/data/timeline-chart": {
       const fields = (q.get("fields") ?? "speed,soc,inside_temp,outside_temp")
         .split(",").map((s) => s.trim()).filter(Boolean);
@@ -316,36 +381,36 @@ async function handleData(url: URL, env: Env): Promise<Response> {
       // lets the Chart explorer pan back through history stock-chart style.
       const endRaw = q.get("end");
       const end = endRaw != null && endRaw !== "" && Number.isFinite(Number(endRaw)) ? Number(endRaw) : undefined;
-      return json(await getTimelineChart(env, vin, numParam("hours", 24), fields, end));
+      return memo(() => getTimelineChart(env, vin, numParam("hours", 24), fields, end));
     }
     case "/data/telemetry-fields":
       return json(await getTelemetryFieldStatus(env, vin));
     case "/data/vampire":
-      return json(await getVampireDrain(env, vin, numParam("days", 30)));
+      return memo(() => getVampireDrain(env, vin, numParam("days", 30)));
     case "/data/pack-health":
-      return json(await getPackHealth(env, vin, numParam("days", 30)));
+      return memo(() => getPackHealth(env, vin, numParam("days", 30)));
     case "/data/states":
-      return json(await getStateTimeline(env, vin, numParam("hours", 168)));
+      return memo(() => getStateTimeline(env, vin, numParam("hours", 168)));
     case "/data/efficiency-by-temp":
-      return json(await getEfficiencyByTemp(env, vin));
+      return memo(() => getEfficiencyByTemp(env, vin));
     case "/data/tires":
-      return json(await getTirePressures(env, vin, numParam("days", 30)));
+      return memo(() => getTirePressures(env, vin, numParam("days", 30)));
     case "/data/monthly":
-      return json(await getMonthlyReport(env, vin, numParam("months", 12)));
+      return memo(() => getMonthlyReport(env, vin, numParam("months", 12)));
     case "/data/suggested-locations":
-      return json(await getSuggestedLocations(env, vin));
+      return memo(() => getSuggestedLocations(env, vin));
     case "/data/media":
-      return json(await getMediaStats(env, vin, numParam("days", 90)));
+      return memo(() => getMediaStats(env, vin, numParam("days", 90)));
     case "/data/charge-taper":
-      return json(await getChargeTaperCurve(env, vin));
+      return memo(() => getChargeTaperCurve(env, vin));
     case "/data/safety-features":
-      return json(await getSafetyFeatureStats(env, vin, numParam("days", 90)));
+      return memo(() => getSafetyFeatureStats(env, vin, numParam("days", 90)));
     case "/data/climate-habits":
-      return json(await getClimateHabits(env, vin, numParam("days", 90)));
+      return memo(() => getClimateHabits(env, vin, numParam("days", 90)));
     case "/data/media-by-driver":
-      return json(await getMediaStatsByDriver(env, vin, numParam("days", 90)));
+      return memo(() => getMediaStatsByDriver(env, vin, numParam("days", 90)));
     case "/data/sentry-log":
-      return json(await getSentryLog(env, vin, numParam("days", 30)));
+      return memo(() => getSentryLog(env, vin, numParam("days", 30)));
     case "/data/similar-drives": {
       const nOpt = (name: string): number | undefined => {
         const raw = q.get(name);
@@ -381,6 +446,17 @@ async function handleData(url: URL, env: Env): Promise<Response> {
 
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+    // Meter every D1 statement for the rest of this request (see d1meter.ts).
+    // Installed here, at the single entrypoint, so no query anywhere in the
+    // worker can escape the accounting.
+    //
+    // The flush runs in waitUntil and writes whatever PREVIOUS requests in this
+    // isolate accumulated — it deliberately does not wait for this request's
+    // own rows, so accounting never sits in the latency path. Whatever is still
+    // unflushed is added in-memory by readBudget, so the guard sees it either
+    // way, and flushMeter throttles itself to keep the write cost trivial.
+    env = { ...env, DB: meterD1(env.DB) };
+    ctx.waitUntil(flushMeter(env).catch(() => {}));
     const url = new URL(request.url);
     const path = url.pathname;
 
@@ -663,6 +739,7 @@ export default {
   },
 
   async scheduled(controller: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
+    env = { ...env, DB: meterD1(env.DB) };
     // If POLL_VINS is set, each cron fire also polls those vehicles — a
     // Cloudflare-native, reliable alternative/complement to the GitHub poll
     // loop (Cloudflare cron fires on time; GitHub throttles the schedule). One
@@ -686,7 +763,11 @@ export default {
         }
       })(),
     );
-    ctx.waitUntil(Promise.allSettled(jobs).then(() => undefined));
+    ctx.waitUntil(
+      Promise.allSettled(jobs)
+        .then(() => flushMeter(env, true).catch(() => {}))
+        .then(() => undefined),
+    );
   },
 } satisfies ExportedHandler<Env>;
 

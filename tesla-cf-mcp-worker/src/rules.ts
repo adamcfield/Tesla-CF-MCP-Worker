@@ -26,6 +26,7 @@
 import { generateBrief, generateCoachNote } from "./ai";
 import { getVehicle, getVehicleData } from "./api";
 import { getBudgetCallLog, getBudgetForecast, getBudgetStatus } from "./budget";
+import { pruneReadCache } from "./d1meter";
 import * as cmd from "./commands";
 import { applyVehicleData } from "./ingest";
 import { getAppState, getLatest, knownVins, LatestState, logAlert, putAppState, tzOffsetMinutes } from "./store";
@@ -956,6 +957,8 @@ export async function runMaintenanceIfDue(env: Env, summary: Record<string, unkn
   await putAppState(env, MAINTENANCE_TS_KEY, String(now)).catch(() => {});
   await purgeExpiredHistory(env, summary);
   await compactOldHistory(env, summary);
+  const cacheRows = await pruneReadCache(env);
+  if (cacheRows > 0) summary.read_cache_pruned = cacheRows;
   summary.maintenance = "ran";
   return true;
 }
