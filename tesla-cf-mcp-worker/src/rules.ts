@@ -26,7 +26,7 @@
 import { generateBrief, generateCoachNote } from "./ai";
 import { getVehicle, getVehicleData } from "./api";
 import { getBudgetCallLog, getBudgetForecast, getBudgetStatus } from "./budget";
-import { pruneReadCache } from "./d1meter";
+import { cachedRead, pruneReadCache } from "./d1meter";
 import * as cmd from "./commands";
 import { applyVehicleData } from "./ingest";
 import { getAppState, getLatest, knownVins, LatestState, logAlert, putAppState, tzOffsetMinutes } from "./store";
@@ -625,6 +625,14 @@ async function evalAiBrief(env: Env, rule: AutomationRule): Promise<boolean> {
 }
 
 /**
+ * How long the sentinel's trend inputs (30-day TPMS series, 21-day drain
+ * windows) are memoised. Both are week-scale trend detectors with daily
+ * alert cooldowns, so 12h staleness changes nothing they can observe while
+ * cutting their rows_read from 96 recomputes/day to ~2.
+ */
+const SENTINEL_CACHE_TTL_S = 12 * 3600;
+
+/**
  * sentinel rule: statistical-process-control alerts over signals we already
  * compute but never acted on — a slow tyre leak, a phantom-drain regression,
  * abnormal awake-idle drain. Fires through the existing alert/webhook path,
@@ -633,8 +641,20 @@ async function evalAiBrief(env: Env, rule: AutomationRule): Promise<boolean> {
 async function evalSentinel(env: Env, rule: AutomationRule): Promise<boolean> {
   let fired = false;
   // Tyre slow-leak: any wheel losing pressure faster than the threshold/week.
+  // These two derivations read EVERY raw sample in a 21-30 day window (TPMS
+  // sits in the EAV telemetry_events table; drain scans positions) — at stream
+  // cadence that is hundreds of thousands of rows_read per call, and the tick
+  // used to pay it 96 times a day: the 2026-09-01/02 free-tier outages (5M
+  // rows_read/day takes the WHOLE database offline until UTC midnight) were
+  // this loop, not traffic. Both are multi-week trend detectors — a slow tyre
+  // leak and a drain regression move over days — so a 12h-memoised answer
+  // loses nothing, and past the soft read budget cachedRead serves the stale
+  // entry rather than recomputing (stale sentinel beats an offline database).
+  // Recomputes now happen ~2x/day instead of 96x/day.
   const leakBar = asNum(rule.leak_bar_per_week) ?? 0.15;
-  const tires = (await getTirePressures(env, rule.vin, 30).catch(() => null)) as
+  const tires = ((await cachedRead(env, `sentinel:tires:${rule.vin}:30`, SENTINEL_CACHE_TTL_S, () =>
+    getTirePressures(env, rule.vin, 30),
+  ).catch(() => null))?.value ?? null) as
     | { trend_bar_per_week?: Record<string, number> | null; latest?: Record<string, number> | null }
     | null;
   const trend = tires?.trend_bar_per_week;
@@ -649,7 +669,9 @@ async function evalSentinel(env: Env, rule: AutomationRule): Promise<boolean> {
     }
   }
   // Phantom-drain regression: awake-idle drain far above the sleep baseline.
-  const vamp = (await getVampireDrain(env, rule.vin, 21).catch(() => null)) as
+  const vamp = ((await cachedRead(env, `sentinel:vampire:${rule.vin}:21`, SENTINEL_CACHE_TTL_S, () =>
+    getVampireDrain(env, rule.vin, 21),
+  ).catch(() => null))?.value ?? null) as
     | { awake?: { pct_per_day?: number | null } | null; sleep?: { pct_per_day?: number | null } | null }
     | null;
   const awake = vamp?.awake?.pct_per_day;
