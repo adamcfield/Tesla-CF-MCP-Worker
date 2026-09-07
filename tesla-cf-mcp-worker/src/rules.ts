@@ -32,7 +32,7 @@ import { applyVehicleData } from "./ingest";
 import { getAppState, getLatest, knownVins, LatestState, logAlert, putAppState, tzOffsetMinutes } from "./store";
 import { createTelemetryConfig } from "./telemetry";
 import { TELEMETRY_CA, TELEMETRY_HOSTNAME, TELEMETRY_PLANS, TELEMETRY_PORT, TelemetryPlanStep } from "./telemetry-plans";
-import { closeStaleSessions, getTirePressures, getVampireDrain, recordConnectivityState } from "./tracking";
+import { closeStaleSessions, deriveActivity, getTirePressures, getVampireDrain, recordConnectivityState } from "./tracking";
 import { Env } from "./types";
 import { listPushSubscriptions, sendWebPush } from "./webpush";
 
@@ -224,7 +224,7 @@ async function dispatchWebhooks(
   data: unknown,
 ): Promise<void> {
   const urls = rule.notify ?? [];
-  let delivered = urls.length === 0;
+  let webhookOk = false;
   for (const url of urls) {
     try {
       const resp = await fetch(url, {
@@ -235,12 +235,52 @@ async function dispatchWebhooks(
         },
         body: JSON.stringify({ rule_id: rule.id, kind, vin: rule.vin, message, data, ts: Math.floor(Date.now() / 1000) }),
       });
-      delivered = delivered || resp.ok;
+      webhookOk = webhookOk || resp.ok;
     } catch {
       // logged below as undelivered
     }
   }
-  await logAlert(env, { vin: rule.vin, ruleId: rule.id, kind, message, payload: data, delivered });
+
+  // Web Push, at FIRE time. Two defects used to make rule alerts unreachable
+  // in the app:
+  //   1. `delivered` was set to `urls.length === 0`, so a rule with no webhook
+  //      URLs was logged as already-delivered — and deliverPendingAlerts only
+  //      ever pushes rows with delivered = 0. Rule alerts therefore produced
+  //      no push at all, only budget/watchdog/rule_error ones did.
+  //   2. Even when a row was pending, the fan-out ran on the automation tick.
+  //      The dashboard advertises "~15 min"; GitHub throttles that schedule to
+  //      5-12 runs a day, so a "car started driving" alert could land hours
+  //      later. Useless for anything event-shaped.
+  // Pushing here makes the ingest path the delivery path: an alert reaches the
+  // phone in the same request that detected it. The tick's pass stays as the
+  // retry for anything still undelivered.
+  let pushOk = false;
+  let hadSubscriptions = false;
+  try {
+    if (env.VAPID_PUBLIC_KEY && env.VAPID_PRIVATE_KEY) {
+      const subs = await listPushSubscriptions(env);
+      hadSubscriptions = subs.length > 0;
+      for (const sub of subs) {
+        if (await sendWebPush(env, sub, { title: `Tesla — ${kind}`, body: message, tag: `${rule.id}:${kind}`, url: "/#al" })) {
+          pushOk = true;
+        }
+      }
+    }
+  } catch {
+    /* push is best-effort; the alert is still logged below */
+  }
+
+  // delivered = it actually reached the user somewhere. When NEITHER channel
+  // is configured the row is marked delivered anyway: leaving it pending would
+  // build a backlog the tick retries forever with nowhere to send it.
+  await logAlert(env, {
+    vin: rule.vin,
+    ruleId: rule.id,
+    kind,
+    message,
+    payload: data,
+    delivered: webhookOk || pushOk || (urls.length === 0 && !hadSubscriptions),
+  });
 }
 
 async function fire(
@@ -434,6 +474,63 @@ async function evalAlert(
     if (await underCooldown(env, rule, 120)) return;
     await fire(env, rule, "alert", `${rule.vin} charge port has been open ${openMinutes}+ min without a cable`, {
       since: Number(sinceRaw),
+    }, rule.actions as Action[] | undefined);
+    return;
+  }
+
+  // --- Drive lifecycle -------------------------------------------------
+  // Edge-triggered off the SAME activity derivation the tracking engine uses
+  // (gear D/R, or speed > 1), so an alert can never disagree with the drive
+  // the dashboard shows. Both sides come from the merged latest-state doc, so
+  // this costs no extra D1 reads.
+  if (when === "drive_started" || when === "drive_ended") {
+    const before = deriveActivity(previous);
+    const after = deriveActivity(current);
+    const started = before !== "driving" && after === "driving";
+    // "ended" is deliberately not "activity === idle": a drive that ends on a
+    // charger goes driving -> charging, and that is still parking.
+    const ended = before === "driving" && after !== "driving";
+    if (when === "drive_started" && started) {
+      if (await underCooldown(env, rule, 2)) return;
+      await fire(env, rule, "alert", `${rule.vin} started driving`, {
+        lat: asNum(current.lat), lon: asNum(current.lon),
+        odometer: asNum(current.odometer), soc: asNum(current.soc),
+      }, rule.actions as Action[] | undefined);
+    } else if (when === "drive_ended" && ended) {
+      if (await underCooldown(env, rule, 2)) return;
+      const dest = typeof current.nav_destination_name === "string" ? current.nav_destination_name : null;
+      await fire(env, rule, "alert", `${rule.vin} parked${dest ? ` at ${dest}` : ""}`, {
+        lat: asNum(current.lat), lon: asNum(current.lon),
+        odometer: asNum(current.odometer), soc: asNum(current.soc),
+        destination: dest, charging: after === "charging",
+      }, rule.actions as Action[] | undefined);
+    }
+    return;
+  }
+
+  // --- Approaching the navigation destination ---------------------------
+  // Uses the car's OWN ETA (MinutesToArrival, already ingested) rather than a
+  // radius around a saved place: it accounts for traffic, and it works for
+  // one-off destinations that were never saved as a geofence. A saved place
+  // you always go to is better served by a `geofence` rule.
+  //
+  // Edge-triggered on the downward crossing so it fires once per approach and
+  // not on every sample inside the window; the cooldown is only a backstop for
+  // an ETA that oscillates across the threshold in traffic.
+  if (when === "approaching_destination") {
+    const minutes = asNum(rule.minutes_before) ?? 5;
+    const before = asNum(previous.nav_minutes_to_arrival);
+    const after = asNum(current.nav_minutes_to_arrival);
+    if (before === undefined || after === undefined) return;
+    if (!(before > minutes && after <= minutes)) return;
+    // A cleared route reports 0; only alert while a route is genuinely active.
+    if (after <= 0 && deriveActivity(current) !== "driving") return;
+    if (await underCooldown(env, rule, 15)) return;
+    const dest = typeof current.nav_destination_name === "string" ? current.nav_destination_name : null;
+    await fire(env, rule, "alert", `${rule.vin} is ~${Math.round(after)} min from ${dest ?? "its destination"}`, {
+      minutes_to_arrival: after, destination: dest,
+      miles_to_arrival: asNum(current.nav_miles_to_arrival),
+      traffic_delay_min: asNum(current.nav_traffic_delay_min),
     }, rule.actions as Action[] | undefined);
     return;
   }
