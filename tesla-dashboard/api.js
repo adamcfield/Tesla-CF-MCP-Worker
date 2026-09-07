@@ -187,6 +187,29 @@ export const data = {
   /** Recent alert-log entries (budget/watchdog/rule firings), newest first. Deliberately un-filtered by vin — budget alerts are account-wide and carry none. May 404 on an older worker. */
   alerts: (limit) => getJson("/data/alerts", { limit }),
   /**
+   * Automation rules (the Automations screen). FULL-scope only on the worker:
+   * a rule can actuate the car, and notify[] URLs usually carry a token, so a
+   * read-scope device token gets 403 on all three verbs — the screen tells the
+   * user that rather than showing an empty list. New endpoints — may 404.
+   */
+  automations: () => getJson("/data/automations"),
+  saveAutomation: (rule) =>
+    fetch(workerOrigin() + "/data/automations?" + new URLSearchParams({ token: auth.token }), {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(rule),
+    }).then(async (r) => {
+      if (r.ok) return r.json();
+      // Surface the worker's own message (e.g. the command-payload refusal)
+      // instead of a bare status — that's the difference between a
+      // diagnosable failure and "Failed".
+      const msg = await r.json().then((b) => b?.error).catch(() => null);
+      throw new ApiError(msg || "save failed", r.status);
+    }),
+  deleteAutomation: (id) =>
+    fetch(workerOrigin() + "/data/automations?" + new URLSearchParams({ id, token: auth.token }), { method: "DELETE" })
+      .then((r) => (r.ok ? r.json() : Promise.reject(new ApiError("delete failed", r.status)))),
+  /**
    * Web Push VAPID public key for pushManager.subscribe() — {key} (null when
    * the worker has no VAPID secrets configured). New endpoint — may 404.
    */

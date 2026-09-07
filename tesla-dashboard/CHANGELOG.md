@@ -9,6 +9,40 @@ feature or screen, the **patch** version for fixes/tweaks/copy changes, and the
 configured. See `CLAUDE.md` at the repo root for the policy on keeping this file
 and `APP_VERSION` (in `app.js`) in sync.
 
+## 1.26.0 — 2026-09-07
+
+New **Automations** screen: set alerts for what the car does, from the app.
+
+- **New screen** (sidebar → Automation): list, create, edit, enable/disable and
+  delete notification rules. Triggers offered: car starts driving, car parks,
+  approaching the navigation destination, charging starts/stops, battery below
+  a level, Sentry triggered, unlocked away from home, tyre pressure drop,
+  charge port left open.
+- **"Approaching destination" uses the car's own ETA**, not a radius — so it
+  accounts for traffic and works for one-off destinations you never saved as a
+  place. For somewhere you always go, a geofence rule is still the better fit.
+- **"Car parks" counts a drive that ends on a charger.** Testing for "idle"
+  would have missed the most common case of all — arriving home and plugging in.
+- Optional webhook URLs per rule (ntfy, Pushover, Home Assistant) alongside the
+  push notification, and an optional cooldown.
+- Rules that **act** on the car (unlock, climate, charging) are deliberately not
+  authorable here — the worker refuses command payloads on this route. Those
+  stay with the MCP tool, where the full-access token is used deliberately.
+- The screen requires the **full-access token**: rules can actuate the car and
+  their webhook URLs carry credentials, so a read-only device token gets a clear
+  explanation instead of an empty list.
+
+Worker-side, in the same change:
+
+- **Push notifications for automation rules actually work now.** They never had:
+  the alert log marked a rule with no webhook URLs as already-delivered, and the
+  push fan-out only ever sends *un*delivered rows — so rule alerts produced no
+  push at all.
+- **Alerts are pushed the moment they fire**, in the same request that detected
+  the event, instead of waiting for the automation tick. This screen's old copy
+  said that took "~15 min"; the tick actually runs every 2–5 hours, which would
+  have made "the car started driving" useless.
+
 ## 1.25.2 — 2026-09-02
 
 The database hit Cloudflare's free-tier read ceiling again, the day after
