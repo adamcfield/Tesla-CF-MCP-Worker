@@ -9,6 +9,7 @@
 import { describe, it, expect, beforeEach } from "vitest";
 import { compressOldHistory } from "../src/rules";
 import { ensureSchema, resetSchemaCacheForTests } from "../src/store";
+import { backfillSyntheticDrives, getVampireDrain } from "../src/tracking";
 import { resetMeterForTests } from "../src/d1meter";
 import { FIELD_GROUPS } from "../src/compress";
 import { FakeD1 } from "./helpers/d1";
@@ -177,5 +178,192 @@ describe("compressOldHistory", () => {
     await seed(env, "some_unmapped_field", OLD_DAY, () => 1);
     await compressOldHistory(env, {});
     expect(await count(env, "some_unmapped_field")).toBe(300);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// positions
+// ---------------------------------------------------------------------------
+
+interface PosRow {
+  ts: number;
+  soc: number;
+  odometer: number;
+  activity: string;
+  charging_state: string | null;
+  drive_id?: number | null;
+}
+
+async function seedPositions(env: Env, rows: PosRow[]): Promise<void> {
+  for (const r of rows) {
+    await env.DB.prepare(
+      `INSERT OR IGNORE INTO positions (vin, ts, soc, odometer, activity, charging_state, drive_id, lat, lon)
+       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 32.1, 34.8)`,
+    )
+      .bind(VIN, r.ts, r.soc, r.odometer, r.activity, r.charging_state, r.drive_id ?? null)
+      .run();
+  }
+}
+
+async function positionCount(env: Env): Promise<number> {
+  return (
+    (await env.DB.prepare(`SELECT COUNT(*) AS n FROM positions WHERE vin = ?1`).bind(VIN).first<{ n: number }>())
+      ?.n ?? 0
+  );
+}
+
+/** A parked day: SoC drifting down slowly, odometer flat. */
+function parkedDay(dayStart: number, odometer = 1000): PosRow[] {
+  const rows: PosRow[] = [];
+  for (let i = 0; i < 288; i++) {
+    rows.push({
+      ts: dayStart + i * 300,
+      soc: Number((70 - i * 0.005).toFixed(3)),
+      odometer,
+      activity: "idle",
+      charging_state: "Disconnected",
+    });
+  }
+  return rows;
+}
+
+describe("compressOldHistory — positions", () => {
+  let env: Env;
+  beforeEach(async () => {
+    env = makeEnv();
+    await ensureSchema(env);
+  });
+
+  it("thins parked rows", async () => {
+    await seedPositions(env, parkedDay(OLD_DAY));
+    await compressOldHistory(env, {});
+    const left = await positionCount(env);
+    expect(left).toBeLessThan(288);
+    expect(left).toBeGreaterThan(0);
+  });
+
+  it("never touches rows attached to a drive", async () => {
+    await env.DB.prepare(
+      `INSERT INTO drives (vin, start_ts, end_ts, status) VALUES (?1, ?2, ?3, 'complete')`,
+    ).bind(VIN, OLD_DAY + 3600, OLD_DAY + 5400).run();
+    const driveId = (
+      await env.DB.prepare(`SELECT id FROM drives WHERE vin = ?1`).bind(VIN).first<{ id: number }>()
+    )!.id;
+
+    const rows: PosRow[] = [];
+    for (let i = 0; i < 60; i++) {
+      rows.push({
+        ts: OLD_DAY + 3600 + i * 30,
+        soc: 70,
+        odometer: 1000 + i * 0.2,
+        activity: "driving",
+        charging_state: null,
+        drive_id: driveId,
+      });
+    }
+    await seedPositions(env, rows);
+    await seedPositions(env, parkedDay(OLD_DAY + 2 * DAY));
+
+    await compressOldHistory(env, {});
+    const inDrive = (
+      await env.DB.prepare(`SELECT COUNT(*) AS n FROM positions WHERE vin = ?1 AND drive_id IS NOT NULL`)
+        .bind(VIN)
+        .first<{ n: number }>()
+    )?.n;
+    expect(inDrive).toBe(60);
+  });
+
+  it("keeps every activity transition, so stage boundaries are unchanged", async () => {
+    const rows: PosRow[] = [];
+    for (let i = 0; i < 100; i++) {
+      rows.push({ ts: OLD_DAY + i * 300, soc: 70, odometer: 1000, activity: "idle", charging_state: "Disconnected" });
+    }
+    rows.push({ ts: OLD_DAY + 100 * 300, soc: 70, odometer: 1000, activity: "charging", charging_state: "Charging" });
+    for (let i = 101; i < 150; i++) {
+      rows.push({ ts: OLD_DAY + i * 300, soc: 75, odometer: 1000, activity: "charging", charging_state: "Charging" });
+    }
+    await seedPositions(env, rows);
+    await compressOldHistory(env, {});
+
+    const rs = await env.DB.prepare(
+      `SELECT ts FROM positions WHERE vin = ?1 AND activity = 'charging' ORDER BY ts LIMIT 1`,
+    ).bind(VIN).first<{ ts: number }>();
+    expect(rs?.ts).toBe(OLD_DAY + 100 * 300);
+  });
+
+  it("recovers the same synthetic drives after thinning as before", async () => {
+    // THE hazard: backfillSyntheticDrives fabricates a drive from an odometer
+    // jump between two ADJACENT rows. Deleting rows makes distant rows
+    // adjacent, so a careless thinning could invent or lose drives outright —
+    // and it WRITES to the drives table, so the damage would persist.
+    // odometer is a counter, whose run endpoints are always retained, which is
+    // what keeps the same pairs adjacent across the same gaps.
+    const build = (): PosRow[] => {
+      const rows = parkedDay(OLD_DAY, 1000);
+      // Car driven away and back during a six-hour telemetry gap: a 40 km jump.
+      // The gap has to be long enough that the implied speed stays under the
+      // 160 km/h sanity ceiling, or no drive is synthesised at all.
+      for (let i = 0; i < 288; i++) {
+        rows.push({
+          ts: OLD_DAY + DAY + 6 * 3600 + i * 300,
+          soc: Number((60 - i * 0.005).toFixed(3)),
+          odometer: 1040,
+          activity: "idle",
+          charging_state: "Disconnected",
+        });
+      }
+      return rows;
+    };
+
+    const dense = makeEnv();
+    await ensureSchema(dense);
+    await seedPositions(dense, build());
+    const denseRes = (await backfillSyntheticDrives(dense, VIN)) as { drives_recovered: number };
+
+    const thin = makeEnv();
+    await ensureSchema(thin);
+    await seedPositions(thin, build());
+    await compressOldHistory(thin, {});
+    const thinRes = (await backfillSyntheticDrives(thin, VIN)) as { drives_recovered: number };
+
+    expect(denseRes.drives_recovered).toBe(1);
+    expect(thinRes.drives_recovered).toBe(denseRes.drives_recovered);
+
+    const distanceOf = async (e: Env): Promise<number | null> =>
+      (
+        await e.DB.prepare(`SELECT distance_km FROM drives WHERE vin = ?1 AND synthetic = 1`)
+          .bind(VIN)
+          .first<{ distance_km: number }>()
+      )?.distance_km ?? null;
+    expect(await distanceOf(thin)).toBeCloseTo((await distanceOf(dense))!, 3);
+  });
+
+  it("reports the same vampire drain after thinning", async () => {
+    const build = (): PosRow[] => {
+      const rows: PosRow[] = [];
+      for (let i = 0; i <= 120; i++) {
+        rows.push({
+          ts: OLD_DAY + i * 300,
+          soc: Number((70 - i * 0.02).toFixed(3)),
+          odometer: 1000,
+          activity: "idle",
+          charging_state: "Disconnected",
+        });
+      }
+      return rows;
+    };
+    const dense = makeEnv();
+    await ensureSchema(dense);
+    await seedPositions(dense, build());
+    const before = (await getVampireDrain(dense, VIN, 30)) as { total_soc_lost_pct: number };
+
+    const thin = makeEnv();
+    await ensureSchema(thin);
+    await seedPositions(thin, build());
+    await compressOldHistory(thin, {});
+    const after = (await getVampireDrain(thin, VIN, 30)) as { total_soc_lost_pct: number };
+
+    expect(before.total_soc_lost_pct).toBeCloseTo(2.4, 1);
+    expect(after.total_soc_lost_pct).toBeCloseTo(before.total_soc_lost_pct, 1);
   });
 });

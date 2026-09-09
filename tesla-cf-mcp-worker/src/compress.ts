@@ -290,6 +290,7 @@ const ANALOG_FIELDS: Record<string, number> = {
   rated_range: 1,
   ideal_range: 1,
   // Charging telemetry.
+  charger_power: 0.1,
   charger_voltage: 2,
   charger_current: 0.5,
   charge_current_request: 0.5,
@@ -448,11 +449,18 @@ function swingingDoorIndices(points: Point[], epsilon: number): Set<number> {
     const pv = numeric(p.value);
 
     if (av === null || pv === null) {
-      keep.add(i - 1);
-      keep.add(i);
-      anchorIdx = i;
-      upper = Infinity;
-      lower = -Infinity;
+      // No slope is defined across a non-numeric sample, so fall back to step
+      // semantics for this pair. Crucially, a run of NULLs is NOT a run of
+      // transitions: a column that is null all day (a charger field on a parked
+      // car) must collapse like any other unchanging value, or the row-level
+      // door over `positions` would retain every row on its account alone.
+      if (anchor.value !== p.value) {
+        keep.add(i - 1);
+        keep.add(i);
+        anchorIdx = i;
+        upper = Infinity;
+        lower = -Infinity;
+      }
       continue;
     }
 

@@ -26,7 +26,7 @@
 import { generateBrief, generateCoachNote } from "./ai";
 import { getVehicle, getVehicleData } from "./api";
 import { getBudgetCallLog, getBudgetForecast, getBudgetStatus } from "./budget";
-import { compressSeries, FIELD_GROUPS, Point, registeredFields, ruleFor } from "./compress";
+import { compressSeries, DEFAULT_MAX_GAP_S, FIELD_GROUPS, FieldRule, Point, registeredFields, ruleFor } from "./compress";
 import { cachedRead, pruneReadCache, readBudget } from "./d1meter";
 import * as cmd from "./commands";
 import { applyVehicleData } from "./ingest";
@@ -1212,14 +1212,105 @@ async function compressFieldDay(
   return removed;
 }
 
-/** Oldest stored sample for a VIN, or null. Seeks idx_events_vin_ts. */
-async function oldestSampleTs(env: Env, vin: string): Promise<number | null> {
-  const row = await env.DB.prepare(
-    `SELECT ts FROM telemetry_events WHERE vin = ?1 ORDER BY ts ASC LIMIT 1`,
+/**
+ * Columns the `positions` row door considers.
+ *
+ * `heading` is left out on purpose: it is circular, so 359 -> 0 is a one-degree
+ * change that any linear cone reads as 359 and would force every row to be kept.
+ * It is constant while parked anyway, which is the only time this runs.
+ */
+const POSITION_DOOR_COLUMNS = [
+  "lat", "lon", "elevation", "speed", "power", "odometer", "soc", "usable_soc",
+  "energy_remaining", "rated_range", "est_range", "ideal_range", "inside_temp",
+  "outside_temp", "charging_state", "charger_power", "charger_voltage",
+  "charger_current", "charge_energy_added", "lon_accel", "lat_accel", "brake_pedal",
+];
+
+/** `activity` is derived rather than a telemetry field, so it needs its own rule. */
+const ACTIVITY_RULE: FieldRule = { rule: { kind: "step" }, maxGapS: DEFAULT_MAX_GAP_S };
+
+/** Process positions in sub-day windows so the keeper list stays small. */
+const POSITION_WINDOW_S = 6 * 3600;
+
+/**
+ * Thin one window of PARKED `positions` rows.
+ *
+ * Unlike telemetry_events, the 23 position columns share a row keyed (vin, ts),
+ * so a column cannot be dropped on its own — nulling one saves bytes, and D1
+ * bills rows. This is therefore a multivariate door: every compressible column
+ * is run separately and the row survives if ANY of them still needs it.
+ *
+ * `odometer` is what makes this safe for drive recovery. As a counter it is flat
+ * while parked, so retaining both endpoints of every odometer run preserves the
+ * exact adjacent pairs backfillSyntheticDrives inspects — it still sees the same
+ * jumps across the same gaps and can neither fabricate nor lose a drive.
+ * `activity` and `charging_state` are step columns, so every stage transition
+ * survives and the battery-timeline segments stay exact.
+ */
+async function compressPositionsWindow(
+  env: Env,
+  vin: string,
+  from: number,
+  to: number,
+  drives: DriveWindow[],
+): Promise<number> {
+  const rs = await env.DB.prepare(
+    `SELECT ts, activity, ${POSITION_DOOR_COLUMNS.join(", ")} FROM positions
+     WHERE vin = ?1 AND ts >= ?2 AND ts < ?3 AND drive_id IS NULL ORDER BY ts ASC`,
   )
-    .bind(vin)
-    .first<{ ts: number }>();
-  return row?.ts ?? null;
+    .bind(vin, from, to)
+    .all<Record<string, unknown> & { ts: number }>();
+  const rows = rs.results ?? [];
+  if (rows.length < 3) return 0;
+
+  const keep = new Set<number>([rows[0]!.ts, rows[rows.length - 1]!.ts]);
+  // drive_id already excludes tagged rows, but a synthetic drive has no
+  // positions at all, so an untagged row can still sit inside a drive window.
+  for (const r of rows) if (insideDrive(r.ts, drives)) keep.add(r.ts);
+
+  for (const col of ["activity", ...POSITION_DOOR_COLUMNS]) {
+    const rule = col === "activity" ? ACTIVITY_RULE : ruleFor(col);
+    if (rule.rule.kind === "never") continue;
+    const pts: Point[] = rows.map((r) => ({
+      ts: r.ts,
+      value: (r[col] ?? null) as number | string | null,
+    }));
+    for (const run of parkedRuns(pts, drives)) {
+      for (const p of compressSeries(run, rule).keep) keep.add(p.ts);
+    }
+  }
+
+  if (keep.size >= rows.length) return 0;
+  if (keep.size > MAX_KEEPERS_PER_STATEMENT) return 0;
+  const list = [...keep].sort((a, b) => a - b).join(",");
+  const res = await env.DB.prepare(
+    `DELETE FROM positions
+     WHERE vin = ?1 AND ts >= ?2 AND ts < ?3 AND drive_id IS NULL AND ts NOT IN (${list})`,
+  )
+    .bind(vin, from, to)
+    .run();
+  return res.meta.changes ?? 0;
+}
+
+/**
+ * Oldest stored sample for a VIN across BOTH thinnable tables, or null.
+ *
+ * Both tables matter: a VIN can have `positions` and no EAV rows at all (every
+ * field it streams is a structured column), and seeding the cursor from
+ * telemetry_events alone would skip that vehicle's positions forever. Each side
+ * is an index seek — idx_events_vin_ts and idx_positions_vin_ts.
+ */
+async function oldestSampleTs(env: Env, vin: string): Promise<number | null> {
+  const [ev, pos] = await Promise.all([
+    env.DB.prepare(`SELECT ts FROM telemetry_events WHERE vin = ?1 ORDER BY ts ASC LIMIT 1`)
+      .bind(vin)
+      .first<{ ts: number }>(),
+    env.DB.prepare(`SELECT ts FROM positions WHERE vin = ?1 ORDER BY ts ASC LIMIT 1`)
+      .bind(vin)
+      .first<{ ts: number }>(),
+  ]);
+  const found = [ev?.ts, pos?.ts].filter((t): t is number => typeof t === "number");
+  return found.length > 0 ? Math.min(...found) : null;
 }
 
 /** The units of work for one day: each field group whole, then the singletons. */
@@ -1296,6 +1387,11 @@ export async function compressOldHistory(env: Env, summary: Record<string, unkno
 
         for (const fields of units) {
           removed += await compressFieldDay(env, vin, fields, from, to, drives);
+        }
+        // The structured per-sample table too, in sub-day windows so the
+        // keeper list of one DELETE stays small.
+        for (let w = from; w < to; w += POSITION_WINDOW_S) {
+          removed += await compressPositionsWindow(env, vin, w, Math.min(w + POSITION_WINDOW_S, to), drives);
         }
         days++;
         cursor = to;

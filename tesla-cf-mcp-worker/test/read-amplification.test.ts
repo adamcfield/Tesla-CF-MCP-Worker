@@ -94,6 +94,21 @@ describe("hot-path query plans (D1 rows_read)", () => {
     );
     expect(fullScans(oldest, "telemetry_events")).toBe(false);
 
+    const oldestPos = await plan(
+      env,
+      `SELECT ts FROM positions WHERE vin = ?1 ORDER BY ts ASC LIMIT 1`,
+      [VIN],
+    );
+    expect(fullScans(oldestPos, "positions")).toBe(false);
+
+    const posWindow = await plan(
+      env,
+      `SELECT ts, activity, soc, odometer FROM positions
+       WHERE vin = ?1 AND ts >= ?2 AND ts < ?3 AND drive_id IS NULL ORDER BY ts ASC`,
+      [VIN, NOW - DAY, NOW],
+    );
+    expect(fullScans(posWindow, "positions")).toBe(false);
+
     const windows = await plan(
       env,
       `SELECT start_ts, COALESCE(end_ts, start_ts) AS end_ts FROM drives
