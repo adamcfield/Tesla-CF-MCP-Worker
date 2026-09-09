@@ -26,7 +26,7 @@
 import { generateBrief, generateCoachNote } from "./ai";
 import { getVehicle, getVehicleData } from "./api";
 import { getBudgetCallLog, getBudgetForecast, getBudgetStatus } from "./budget";
-import { compressSeries, DEFAULT_MAX_GAP_S, FIELD_GROUPS, FieldRule, Point, registeredFields, ruleFor } from "./compress";
+import { compressSeries, DEFAULT_MAX_GAP_S, FIELD_GROUPS, FieldRule, Point, registeredFields, ruleFor, ruleForTier, Tier, TIER_COLD_AFTER_DAYS, TIER_WARM_AFTER_DAYS } from "./compress";
 import { cachedRead, pruneReadCache, readBudget } from "./d1meter";
 import * as cmd from "./commands";
 import { applyVehicleData } from "./ingest";
@@ -1091,11 +1091,25 @@ export async function runMaintenanceIfDue(env: Env, summary: Record<string, unkn
 /** Its own cadence, not the daily maintenance one — see runCompressionIfDue. */
 const COMPRESS_INTERVAL_S = 6 * 3600;
 const COMPRESS_TS_KEY = "compress_ts";
-const compressCursorKey = (vin: string): string => `compress_cursor:${vin}`;
-/** Rows this sweep may delete per run. Deletes count against rows_written. */
-const COMPRESS_DEFAULT_ROWS_PER_RUN = 20_000;
 /** Leave the newest days alone: still being written, and already write-filtered. */
 const COMPRESS_LAG_DAYS = 2;
+const compressCursorKey = (vin: string, tier: Tier): string => `compress_cursor:${vin}:${tier}`;
+
+/**
+ * Each tier gets its own cursor, and every day is swept once per tier as it
+ * ages past that tier's threshold: hot when it is first eligible, again as warm
+ * at 7 days, again as cold at 90. A single monotonic cursor could not do this —
+ * it passes a day once and never returns, so the day would keep whatever
+ * precision it had when it was new, forever.
+ */
+const TIER_LAG_DAYS: Record<Tier, number> = {
+  hot: COMPRESS_LAG_DAYS,
+  warm: TIER_WARM_AFTER_DAYS,
+  cold: TIER_COLD_AFTER_DAYS,
+};
+const TIER_ORDER: Tier[] = ["cold", "warm", "hot"];
+/** Rows this sweep may delete per run. Deletes count against rows_written. */
+const COMPRESS_DEFAULT_ROWS_PER_RUN = 20_000;
 /** Skip a field-day whose keeper list is too long to express as one NOT IN. */
 const MAX_KEEPERS_PER_STATEMENT = 400;
 const DAY_S = 86400;
@@ -1160,6 +1174,7 @@ async function compressFieldDay(
   from: number,
   to: number,
   drives: DriveWindow[],
+  tier: Tier,
 ): Promise<number> {
   const series = new Map<string, Point[]>();
   for (const field of fields) {
@@ -1175,7 +1190,7 @@ async function compressFieldDay(
   let grouped = false;
 
   for (const [field, pts] of series) {
-    const rule = ruleFor(field);
+    const rule = ruleForTier(field, tier);
     const keep = new Set<number>();
     for (const p of pts) if (insideDrive(p.ts, drives)) keep.add(p.ts);
     for (const run of parkedRuns(pts, drives)) {
@@ -1253,6 +1268,7 @@ async function compressPositionsWindow(
   from: number,
   to: number,
   drives: DriveWindow[],
+  tier: Tier,
 ): Promise<number> {
   const rs = await env.DB.prepare(
     `SELECT ts, activity, ${POSITION_DOOR_COLUMNS.join(", ")} FROM positions
@@ -1269,7 +1285,7 @@ async function compressPositionsWindow(
   for (const r of rows) if (insideDrive(r.ts, drives)) keep.add(r.ts);
 
   for (const col of ["activity", ...POSITION_DOOR_COLUMNS]) {
-    const rule = col === "activity" ? ACTIVITY_RULE : ruleFor(col);
+    const rule = col === "activity" ? ACTIVITY_RULE : ruleForTier(col, tier);
     if (rule.rule.kind === "never") continue;
     const pts: Point[] = rows.map((r) => ({
       ts: r.ts,
@@ -1356,55 +1372,64 @@ export async function compressOldHistory(env: Env, summary: Record<string, unkno
   }
 
   const nowTs = Math.floor(Date.now() / 1000);
-  const stopAfter = Math.floor(nowTs / DAY_S) * DAY_S - COMPRESS_LAG_DAYS * DAY_S;
+  const today = Math.floor(nowTs / DAY_S) * DAY_S;
   const units = compressionUnits();
   let removed = 0;
-  let days = 0;
+  const daysByTier: Record<string, number> = {};
 
   try {
-    for (const vin of await knownVins(env)) {
+    // Coldest first: those days are the cheapest to shrink and the least likely
+    // to be looked at, so when a run's budget is short they are what it should
+    // spend it on.
+    for (const tier of TIER_ORDER) {
       if (removed >= rowBudget) break;
-      const stored = Number((await getAppState(env, compressCursorKey(vin)).catch(() => null)) ?? "0");
-      let cursor: number;
-      if (Number.isFinite(stored) && stored > 0) {
-        cursor = stored;
-      } else {
-        const oldest = await oldestSampleTs(env, vin);
-        if (oldest === null) continue; // nothing stored for this VIN yet
-        cursor = Math.floor(oldest / DAY_S) * DAY_S;
-      }
+      const stopAfter = today - TIER_LAG_DAYS[tier] * DAY_S;
 
-      while (cursor < stopAfter && removed < rowBudget) {
-        const from = cursor;
-        const to = cursor + DAY_S;
-        const driveRs = await env.DB.prepare(
-          `SELECT start_ts, COALESCE(end_ts, start_ts) AS end_ts FROM drives
-           WHERE vin = ?1 AND start_ts < ?2 AND COALESCE(end_ts, start_ts) >= ?3`,
-        )
-          .bind(vin, to, from)
-          .all<DriveWindow>();
-        const drives = driveRs.results ?? [];
-
-        for (const fields of units) {
-          removed += await compressFieldDay(env, vin, fields, from, to, drives);
+      for (const vin of await knownVins(env)) {
+        if (removed >= rowBudget) break;
+        const stored = Number((await getAppState(env, compressCursorKey(vin, tier)).catch(() => null)) ?? "0");
+        let cursor: number;
+        if (Number.isFinite(stored) && stored > 0) {
+          cursor = stored;
+        } else {
+          const oldest = await oldestSampleTs(env, vin);
+          if (oldest === null) continue; // nothing stored for this VIN yet
+          cursor = Math.floor(oldest / DAY_S) * DAY_S;
         }
-        // The structured per-sample table too, in sub-day windows so the
-        // keeper list of one DELETE stays small.
-        for (let w = from; w < to; w += POSITION_WINDOW_S) {
-          removed += await compressPositionsWindow(env, vin, w, Math.min(w + POSITION_WINDOW_S, to), drives);
-        }
-        days++;
-        cursor = to;
-        await putAppState(env, compressCursorKey(vin), String(cursor)).catch(() => {});
 
-        const budget = await readBudget(env).catch(() => null);
-        if (budget?.over_soft) {
-          summary.compress_stopped = "read_budget";
-          break;
+        while (cursor < stopAfter && removed < rowBudget) {
+          const from = cursor;
+          const to = cursor + DAY_S;
+          const driveRs = await env.DB.prepare(
+            `SELECT start_ts, COALESCE(end_ts, start_ts) AS end_ts FROM drives
+             WHERE vin = ?1 AND start_ts < ?2 AND COALESCE(end_ts, start_ts) >= ?3`,
+          )
+            .bind(vin, to, from)
+            .all<DriveWindow>();
+          const drives = driveRs.results ?? [];
+
+          for (const fields of units) {
+            removed += await compressFieldDay(env, vin, fields, from, to, drives, tier);
+          }
+          // The structured per-sample table too, in sub-day windows so the
+          // keeper list of one DELETE stays small.
+          for (let w = from; w < to; w += POSITION_WINDOW_S) {
+            removed += await compressPositionsWindow(env, vin, w, Math.min(w + POSITION_WINDOW_S, to), drives, tier);
+          }
+          daysByTier[tier] = (daysByTier[tier] ?? 0) + 1;
+          cursor = to;
+          await putAppState(env, compressCursorKey(vin, tier), String(cursor)).catch(() => {});
+
+          const budget = await readBudget(env).catch(() => null);
+          if (budget?.over_soft) {
+            summary.compress_stopped = "read_budget";
+            return;
+          }
         }
       }
     }
-    if (days > 0 || removed > 0) summary.compressed = { days, rows_removed: removed };
+    const days = Object.values(daysByTier).reduce((a, b) => a + b, 0);
+    if (days > 0 || removed > 0) summary.compressed = { days, by_tier: daysByTier, rows_removed: removed };
   } catch (e) {
     summary.compress_error = String(e);
   }

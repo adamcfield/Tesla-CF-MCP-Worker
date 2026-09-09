@@ -86,8 +86,14 @@ export interface Point {
 export type Rule =
   /** Booleans, enums and strings. Keep both endpoints of every run. */
   | { kind: "step" }
-  /** Continuous signals. Swinging door; linear reconstruction. */
-  | { kind: "analog"; epsilon: number }
+  /**
+   * Continuous signals. Swinging door; linear reconstruction.
+   *
+   * `maxEpsilon` caps what age-tiered scaling may widen the band to. It is set
+   * only where a hard threshold exists downstream — the largest band that still
+   * cannot flip a decision this field feeds.
+   */
+  | { kind: "analog"; epsilon: number; maxEpsilon?: number }
   /** Monotonic counters. Retention is identical to `step`; the kind records
    *  intent, and that a change point must never be merged away. */
   | { kind: "counter" }
@@ -116,12 +122,21 @@ export interface CompressResult {
 // ---------------------------------------------------------------------------
 
 /**
- * Default anchor interval. One hour sits comfortably under every gap-based
- * threshold in the codebase — the nearest is the dashboard's 6h "stale" cutoff.
+ * Default anchor interval.
+ *
+ * THE ANCHORS ARE THE FLOOR, not the epsilons. With 163 parked-relevant fields,
+ * an hourly anchor costs 163 x 24 = ~3,900 rows/day on its own, which is more
+ * than everything else in the compressed table put together. Widening this is
+ * the single highest-leverage knob in the module.
+ *
+ * Four hours is the widest value that still sits under the tightest gap-based
+ * threshold in the codebase — the dashboard's STALE_AFTER_S of 6h, past which a
+ * vehicle reads as "likely actually broken, not just parked". Everything else
+ * has far more room: MAX_GAP_S_SYNTH is 24h and vampire drain tolerates 3 days.
  */
-export const DEFAULT_MAX_GAP_S = 3600;
+export const DEFAULT_MAX_GAP_S = 4 * 3600;
 /** Fields nobody analyses at rest, and the hourly config tier. */
-export const LONG_MAX_GAP_S = 6 * 3600;
+export const LONG_MAX_GAP_S = 12 * 3600;
 
 /**
  * Groups whose members must share retained timestamps, because a consumer joins
@@ -248,23 +263,23 @@ const STATIC_FIELDS = [
 const ANALOG_FIELDS: Record<string, number> = {
   // Cell voltages feed a brick SPREAD reported in millivolts; healthy spreads
   // are 10-30 mV, so the tolerance has to be a small fraction of that.
-  brick_v_max: 0.002,
-  brick_v_min: 0.002,
+  brick_v_max: 0.003,
+  brick_v_min: 0.003,
   // Filtered against a rest-current threshold, so the band must not blur the
   // boundary between "at rest" and "under load".
   pack_current: 0.5,
   pack_voltage: 0.5,
   // Module temperature spread, also a difference of two signals.
-  module_temp_max: 0.2,
-  module_temp_min: 0.2,
+  module_temp_max: 0.5,
+  module_temp_min: 0.5,
   // Trended first-week vs last-week in kOhm; readings run to the hundreds.
-  isolation_resistance: 5,
+  isolation_resistance: 25,
   // The slow-leak alert fires at 0.15 bar/week fitted over 30 days, i.e. a total
   // excursion of ~0.6 bar. 0.02 bar cannot manufacture or mask that.
-  tpms_fl: 0.02,
-  tpms_fr: 0.02,
-  tpms_rl: 0.02,
-  tpms_rr: 0.02,
+  tpms_fl: 0.05,
+  tpms_fr: 0.05,
+  tpms_rl: 0.05,
+  tpms_rr: 0.05,
   // Cabin/ambient, in degrees C.
   inside_temp: 0.5,
   outside_temp: 0.5,
@@ -341,6 +356,30 @@ const ANALOG_FIELDS: Record<string, number> = {
  */
 const NEVER_FIELDS = ["heading", "location"] as const;
 
+/**
+ * Ceilings on age-tiered epsilon widening.
+ *
+ * Only for signals with a hard threshold downstream, where a wider band could
+ * flip a decision rather than merely blur a chart. Each value is the largest
+ * band that still cannot do that:
+ *
+ *   soc          drain is compared against an 8%/day alert; +/-2 leaves room
+ *   tpms_*       the slow-leak alert needs 0.15 bar/week over a 30-day fit
+ *   brick_v_*    a healthy brick SPREAD is only 10-30 mV
+ *   pack_current pack health filters "at rest" at |I| < 2 A
+ *
+ * Everything absent from this map scales freely with age — for most fields a
+ * coarse three-month-old reading is simply not worth a row.
+ */
+const ANALOG_MAX_EPSILON: Record<string, number> = {
+  soc: 2,
+  usable_soc: 2,
+  tpms_fl: 0.1, tpms_fr: 0.1, tpms_rl: 0.1, tpms_rr: 0.1,
+  brick_v_max: 0.008,
+  brick_v_min: 0.008,
+  pack_current: 1,
+};
+
 const REGISTRY: Map<string, FieldRule> = (() => {
   const m = new Map<string, FieldRule>();
   const groupOfField = new Map<string, string>();
@@ -355,7 +394,10 @@ const REGISTRY: Map<string, FieldRule> = (() => {
   for (const f of REST_IDLE_FIELDS) put(f, STEP, LONG_MAX_GAP_S);
   for (const f of COUNTER_FIELDS) put(f, COUNTER, DEFAULT_MAX_GAP_S);
   for (const f of STATIC_FIELDS) put(f, STATIC, LONG_MAX_GAP_S);
-  for (const [f, epsilon] of Object.entries(ANALOG_FIELDS)) put(f, analog(epsilon), DEFAULT_MAX_GAP_S);
+  for (const [f, epsilon] of Object.entries(ANALOG_FIELDS)) {
+    const cap = ANALOG_MAX_EPSILON[f];
+    put(f, cap === undefined ? analog(epsilon) : { kind: "analog", epsilon, maxEpsilon: cap }, DEFAULT_MAX_GAP_S);
+  }
   for (const f of NEVER_FIELDS) put(f, NEVER, DEFAULT_MAX_GAP_S);
   return m;
 })();
@@ -383,6 +425,70 @@ export function groupOf(field: string): string | undefined {
 /** Every field with an explicit rule. Exported for tests and diagnostics. */
 export function registeredFields(): string[] {
   return [...REGISTRY.keys()].sort();
+}
+
+// ---------------------------------------------------------------------------
+// Age tiers
+// ---------------------------------------------------------------------------
+
+/**
+ * How aggressively a day may be thinned, by how old it is.
+ *
+ * Nobody trends three-month-old telemetry at one-minute resolution, but the
+ * anchors that make yesterday legible cost exactly as much on every day of the
+ * backlog. Tiering spends precision where it is actually read and reclaims it
+ * everywhere else — the same principle the repo already applies with
+ * COMPACT_AFTER_DAYS, where a year-old route keeps its shape and loses its
+ * samples.
+ *
+ * What tiering does NOT touch is transitions. Every state change and every
+ * door point is retained at any age; only the redundant steady-state anchors
+ * between them get thinner. Cold history still answers "when did it happen",
+ * just not "what was it doing every four hours in between".
+ */
+export type Tier = "hot" | "warm" | "cold";
+
+export const TIER_WARM_AFTER_DAYS = 7;
+export const TIER_COLD_AFTER_DAYS = 90;
+
+/**
+ * Per tier: how much the epsilon may widen, and the anchor floor.
+ *
+ * The cold anchor stops at 20h rather than a full day so it stays under
+ * MAX_GAP_S_SYNTH (24h), the window in which an odometer jump is still read as
+ * one recoverable drive rather than an outage.
+ */
+const TIER_SCALE: Record<Tier, { epsilon: number; maxGapS: number }> = {
+  hot: { epsilon: 1, maxGapS: DEFAULT_MAX_GAP_S },
+  warm: { epsilon: 3, maxGapS: 12 * 3600 },
+  cold: { epsilon: 8, maxGapS: 20 * 3600 },
+};
+
+/** Which tier a sample of this age belongs to. */
+export function tierForAge(ageS: number): Tier {
+  if (ageS >= TIER_COLD_AFTER_DAYS * 86400) return "cold";
+  if (ageS >= TIER_WARM_AFTER_DAYS * 86400) return "warm";
+  return "hot";
+}
+
+/**
+ * The rule for a field at a given age.
+ *
+ * The anchor takes the WIDER of the field's own interval and the tier floor, so
+ * a field that already anchors loosely (the hourly config tier) is never
+ * tightened by being recent. The epsilon scales up but never past the field's
+ * `maxEpsilon`, which is what stops "aggressive" from meaning "meaningless" on
+ * the handful of signals with a real threshold underneath them.
+ */
+export function ruleForTier(field: string, tier: Tier): FieldRule {
+  const base = ruleFor(field);
+  if (tier === "hot") return base;
+  const scale = TIER_SCALE[tier];
+  const maxGapS = Math.max(base.maxGapS, scale.maxGapS);
+  if (base.rule.kind !== "analog") return { ...base, maxGapS };
+  const widened = base.rule.epsilon * scale.epsilon;
+  const epsilon = base.rule.maxEpsilon !== undefined ? Math.min(widened, base.rule.maxEpsilon) : widened;
+  return { ...base, maxGapS, rule: { ...base.rule, epsilon } };
 }
 
 // ---------------------------------------------------------------------------

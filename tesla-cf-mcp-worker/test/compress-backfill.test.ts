@@ -174,6 +174,32 @@ describe("compressOldHistory", () => {
     expect(await count(env, "locked")).toBe(300);
   });
 
+  it("thins a three-month-old day harder than a ten-day-old one", async () => {
+    // Age tiering: the same shape of day should cost fewer rows the older it
+    // gets, because nobody trends month-old telemetry at four-hour resolution.
+    const COLD_DAY = Math.floor((NOW - 200 * DAY) / DAY) * DAY;
+    await seed(env, "locked", OLD_DAY, () => 1, 1440);
+    await seed(env, "locked", COLD_DAY, () => 1, 1440);
+    await compressOldHistory(env, {});
+
+    const gaps = async (from: number): Promise<number[]> => {
+      const rs = await env.DB.prepare(
+        `SELECT ts FROM telemetry_events WHERE vin = ?1 AND field = 'locked' AND ts >= ?2 AND ts < ?3 ORDER BY ts`,
+      ).bind(VIN, from, from + DAY).all<{ ts: number }>();
+      const ts = (rs.results ?? []).map((r) => r.ts);
+      return ts.slice(1).map((t, i) => t - ts[i]!);
+    };
+    const warm = await gaps(OLD_DAY);
+    const cold = await gaps(COLD_DAY);
+
+    // Both collapse from 1440 rows to a handful; what the tier changes is how
+    // far apart the survivors are allowed to be.
+    expect(warm.length + 1).toBeLessThan(10);
+    expect(cold.length + 1).toBeLessThan(10);
+    expect(Math.max(...cold)).toBeGreaterThan(Math.max(...warm));
+    expect(cold.length).toBeGreaterThan(0); // still legible, just coarser
+  });
+
   it("leaves an unclassified field untouched", async () => {
     await seed(env, "some_unmapped_field", OLD_DAY, () => 1);
     await compressOldHistory(env, {});

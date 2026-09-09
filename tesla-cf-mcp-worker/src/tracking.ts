@@ -1882,10 +1882,19 @@ export async function getVampireDrain(env: Env, vin: string, days = 30): Promise
  *
  * The last sample before a multi-day telemetry outage must not claim to
  * represent those days — that would let a single reading dominate a 90-day
- * average. Two hours comfortably covers the hourly compression anchor plus
- * slack, and truncates anything longer to "we stopped knowing".
+ * average.
+ *
+ * THIS MUST STAY LARGER THAN THE WIDEST COMPRESSION ANCHOR (compress.ts, 20h at
+ * the cold tier). A gap between two anchored samples is real elapsed time during
+ * which the value genuinely held; capping below the anchor interval truncates
+ * every one of them and silently under-weights exactly the samples compression
+ * chose to keep. Setting the cap under the anchor cost four percentage points on
+ * a boolean that was true 96% of the day, which is how this coupling was found.
+ *
+ * 26h therefore clears the widest anchor with room to spare, while still
+ * truncating a genuine multi-day outage to "we stopped knowing".
  */
-const DWELL_CAP_S = 2 * 3600;
+const DWELL_CAP_S = 26 * 3600;
 
 /** Dwell for a series with a single sample — nothing to infer a cadence from. */
 const DWELL_LONE_SAMPLE_S = 60;

@@ -16,6 +16,8 @@ import {
   reconstructSeries,
   registeredFields,
   ruleFor,
+  ruleForTier,
+  tierForAge,
   valueAt,
 } from "../src/compress";
 import type { FieldRule } from "../src/compress";
@@ -144,9 +146,11 @@ describe("gap anchors", () => {
     for (let i = 1; i < keep.length; i++) {
       expect(keep[i]!.ts - keep[i - 1]!.ts).toBeLessThanOrEqual(DEFAULT_MAX_GAP_S + 60);
     }
-    // ~24 anchors, not 1440 rows.
-    expect(keep.length).toBeLessThanOrEqual(26);
-    expect(keep.length).toBeGreaterThanOrEqual(24);
+    // One anchor per DEFAULT_MAX_GAP_S, not 1440 rows. The anchors are the
+    // floor on a compressed table, so this count is the thing worth pinning.
+    const expected = Math.floor(86400 / DEFAULT_MAX_GAP_S);
+    expect(keep.length).toBeLessThanOrEqual(expected + 2);
+    expect(keep.length).toBeGreaterThanOrEqual(expected);
   });
 
   it("does not invent samples across a real data gap", () => {
@@ -255,5 +259,65 @@ describe("reconstruction", () => {
     expect(valueAt(pts, -10, stepRule())).toBe(50);
     expect(valueAt(pts, 999, stepRule())).toBe(60);
     expect(valueAt([], 0, stepRule())).toBeNull();
+  });
+});
+
+describe("age tiers", () => {
+  it("widens the anchor and the band as a day gets older", () => {
+    const hot = ruleForTier("isolation_resistance", "hot");
+    const warm = ruleForTier("isolation_resistance", "warm");
+    const cold = ruleForTier("isolation_resistance", "cold");
+    expect(hot.maxGapS).toBeLessThan(warm.maxGapS);
+    expect(warm.maxGapS).toBeLessThan(cold.maxGapS);
+    const eps = (r: FieldRule) => (r.rule.kind === "analog" ? r.rule.epsilon : 0);
+    expect(eps(hot)).toBeLessThan(eps(warm));
+    expect(eps(warm)).toBeLessThan(eps(cold));
+  });
+
+  it("never widens a band past the threshold it feeds", () => {
+    // The slow-leak alert fits 0.15 bar/week; TPMS must stay well inside that
+    // however old the day is. Same for SoC against the 8%/day drain alert.
+    for (const tier of ["hot", "warm", "cold"] as const) {
+      const t = ruleForTier("tpms_fl", tier);
+      if (t.rule.kind === "analog") expect(t.rule.epsilon).toBeLessThanOrEqual(0.1);
+      const s = ruleForTier("soc", tier);
+      if (s.rule.kind === "analog") expect(s.rule.epsilon).toBeLessThanOrEqual(2);
+    }
+  });
+
+  it("never tightens a field that already anchors loosely", () => {
+    // The config tier streams hourly and anchors at 12h; being recent must not
+    // shorten that to the 4h default.
+    expect(ruleForTier("trim", "hot").maxGapS).toBe(ruleFor("trim").maxGapS);
+    expect(ruleForTier("trim", "cold").maxGapS).toBeGreaterThanOrEqual(ruleFor("trim").maxGapS);
+  });
+
+  it("keeps every cold anchor under the 24h drive-recovery window", () => {
+    // MAX_GAP_S_SYNTH is 24h: a longer anchor gap would let an odometer jump
+    // read as an outage instead of a recoverable drive.
+    for (const field of registeredFields()) {
+      expect(ruleForTier(field, "cold").maxGapS).toBeLessThan(24 * 3600);
+    }
+  });
+
+  it("maps ages onto tiers at the documented boundaries", () => {
+    expect(tierForAge(0)).toBe("hot");
+    expect(tierForAge(6 * 86400)).toBe("hot");
+    expect(tierForAge(7 * 86400)).toBe("warm");
+    expect(tierForAge(89 * 86400)).toBe("warm");
+    expect(tierForAge(90 * 86400)).toBe("cold");
+  });
+
+  it("keeps every transition at every tier — only steady state gets thinner", () => {
+    // The aggression is entirely in the anchors. A day of state changes must
+    // survive being three months old.
+    // Long runs, so the anchor interval is what actually differs between tiers.
+    const pts: Point[] = [];
+    for (let i = 0; i < 1440; i++) pts.push({ ts: i * 60, value: i < 720 ? "armed" : "off" });
+    const hot = compressSeries(pts, ruleForTier("sentry", "hot")).keep;
+    const cold = compressSeries(pts, ruleForTier("sentry", "cold")).keep;
+    const transitions = (ps: Point[]) => ps.filter((p, i) => i > 0 && ps[i - 1]!.value !== p.value).length;
+    expect(transitions(cold)).toBe(transitions(hot));
+    expect(cold.length).toBeLessThan(hot.length);
   });
 });
