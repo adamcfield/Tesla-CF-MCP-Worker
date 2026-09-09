@@ -13,6 +13,7 @@
  * in the `positions` table (written by tracking.ts) — querySeries prefers it.
  */
 
+import { filterForWrite, pruneWriteState, WriteState } from "./compress";
 import { Env } from "./types";
 
 export interface LatestState {
@@ -560,25 +561,79 @@ export interface TelemetryEvent {
   ts: number; // unix seconds
 }
 
-export async function recordEvents(env: Env, vin: string, events: TelemetryEvent[]): Promise<void> {
+/** `app_state` key holding the per-VIN write-gate state. */
+const compressStateKey = (vin: string): string => `compress:${vin}`;
+
+/** Off only if explicitly disabled — the whole point is to stop writing by default. */
+function compressionEnabled(env: Env): boolean {
+  return env.COMPRESS_ENABLED !== "0" && env.COMPRESS_ENABLED !== "false";
+}
+
+async function loadWriteState(env: Env, vin: string): Promise<WriteState> {
+  try {
+    const raw = await getAppState(env, compressStateKey(vin));
+    if (!raw) return {};
+    const parsed: unknown = JSON.parse(raw);
+    return parsed && typeof parsed === "object" ? (parsed as WriteState) : {};
+  } catch {
+    return {}; // unreadable state just means this ingest writes everything
+  }
+}
+
+/**
+ * Store telemetry samples, optionally dropping the ones that carry nothing new.
+ *
+ * `compress` gates the filter and is passed false while the car is DRIVING —
+ * full fidelity is the whole point of a drive, and the parked hours are where
+ * the volume actually is. It is also false for the late-replay path, which has
+ * no ordering guarantee and so cannot be judged against a running last-value.
+ *
+ * The filter costs one extra app_state read and one write per ingest to carry
+ * the last-written value per field, against roughly thirty rows saved on a
+ * parked sample. Two concurrent ingests for one VIN can clobber each other's
+ * state; the loser's next sample then looks like a first sighting and is
+ * written, so a lost update costs one redundant row and never a missing one.
+ */
+export async function recordEvents(
+  env: Env,
+  vin: string,
+  events: TelemetryEvent[],
+  opts: { compress?: boolean } = {},
+): Promise<void> {
   if (!events.length) return;
   await ensureSchema(env);
-  const stmt = env.DB.prepare(
-    `INSERT OR REPLACE INTO telemetry_events (vin, ts, field, value_num, value_text)
-     VALUES (?1, ?2, ?3, ?4, ?5)`,
-  );
-  await env.DB.batch(
-    events.map((e) => {
-      const num =
-        typeof e.value === "number" && Number.isFinite(e.value)
-          ? e.value
-          : typeof e.value === "boolean"
-            ? e.value ? 1 : 0
-            : null;
-      const text = num === null ? stringifyValue(e.value) : null;
-      return stmt.bind(vin, e.ts, e.field, num, text);
-    }),
-  );
+
+  // Normalise first, so the "has this changed" comparison is made against the
+  // representation that will actually be stored rather than the raw input.
+  let rows = events.map((e) => {
+    const num =
+      typeof e.value === "number" && Number.isFinite(e.value)
+        ? e.value
+        : typeof e.value === "boolean"
+          ? e.value ? 1 : 0
+          : null;
+    const text = num === null ? stringifyValue(e.value) : null;
+    return { field: e.field, ts: e.ts, num, text, value: num !== null ? num : text };
+  });
+
+  let state: WriteState | null = null;
+  if (opts.compress && compressionEnabled(env)) {
+    state = await loadWriteState(env, vin);
+    rows = filterForWrite(state, rows);
+  }
+
+  if (rows.length) {
+    const stmt = env.DB.prepare(
+      `INSERT OR REPLACE INTO telemetry_events (vin, ts, field, value_num, value_text)
+       VALUES (?1, ?2, ?3, ?4, ?5)`,
+    );
+    await env.DB.batch(rows.map((r) => stmt.bind(vin, r.ts, r.field, r.num, r.text)));
+  }
+
+  if (state) {
+    pruneWriteState(state, Math.floor(Date.now() / 1000));
+    await putAppState(env, compressStateKey(vin), JSON.stringify(state)).catch(() => {});
+  }
 }
 
 /** Objects/arrays are JSON-encoded (not "[object Object]"); null/undefined drop to null. */

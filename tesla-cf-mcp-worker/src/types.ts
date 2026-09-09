@@ -51,6 +51,13 @@ export interface Env {
    */
   RETENTION_DAYS?: string;
   /**
+   * Per-field telemetry compression at ingest. Any value other than "0"/"false"
+   * leaves it ON — the default has to be on, since it exists to stop the write
+   * volume that took D1 offline. Set "0" to store every sample again.
+   */
+  COMPRESS_ENABLED?: string;
+
+  /**
    * Rows-read-per-UTC-day threshold past which the expensive analytical
    * /data/* endpoints stop recomputing and serve their last cached answer
    * (see d1meter.ts). Default 3,500,000 — 70% of D1's free-tier 5M ceiling,

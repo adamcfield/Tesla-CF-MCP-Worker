@@ -673,6 +673,104 @@ export function reconstructSeries(points: Point[], fieldRule: FieldRule): Point[
   return out;
 }
 
+// ---------------------------------------------------------------------------
+// Write-side gate
+// ---------------------------------------------------------------------------
+
+/** Last value written per field, carried between ingests in `app_state`. */
+export type WriteState = Record<string, { ts: number; v: number | string | null }>;
+
+/** Forget fields that have not reported in this long, so the doc stays small. */
+export const WRITE_STATE_TTL_S = 7 * 86400;
+
+export interface WriteCandidate {
+  field: string;
+  ts: number;
+  /** The value as it will be STORED, so "unchanged" is judged the way SQL will. */
+  value: number | string | null;
+}
+
+/**
+ * Should this sample be written at all, given the last one that was?
+ *
+ * This is a plain deadband — "record on significant change" — NOT the swinging
+ * door. The door has to emit the point BEFORE the one that closed it, which
+ * means buffering a sample and writing it a beat late; at ingest time that
+ * complexity buys little, because the retroactive grinder re-runs the real door
+ * over the same history later and collapses whatever this pass left behind.
+ *
+ * The division of labour is deliberate: this is the cheap gate that stops the
+ * bleeding on every ingest, and the grinder is the optimiser that runs once a
+ * day with a budget check in front of it. A deadband keeps a point every epsilon
+ * along a ramp where the door would keep only its two ends — more rows than
+ * necessary, never fewer, and never outside the tolerance.
+ */
+function retainOnWrite(
+  prev: WriteState[string] | undefined,
+  e: WriteCandidate,
+  fieldRule: FieldRule,
+): boolean {
+  if (fieldRule.rule.kind === "never") return true;
+  if (!prev) return true; // first sight of this field
+  if (e.ts <= prev.ts) return true; // out of order — store it, don't judge it
+  if (e.ts - prev.ts >= fieldRule.maxGapS) return true; // anchor
+  if (fieldRule.rule.kind === "analog") {
+    const a = numeric(prev.v);
+    const b = numeric(e.value);
+    if (a === null || b === null) return true;
+    return Math.abs(b - a) > fieldRule.rule.epsilon;
+  }
+  return prev.v !== e.value;
+}
+
+/**
+ * Filter one ingest's worth of events, updating `state` in place for whatever
+ * survives.
+ *
+ * A group is written whole or not at all. Every member arrives in the same
+ * batch under one timestamp, so honouring that here is just a second pass — and
+ * it is what keeps the pack-health and tyre-balance joins (which pair fields ON
+ * equal ts) finding matches.
+ */
+export function filterForWrite<T extends WriteCandidate>(
+  state: WriteState,
+  events: T[],
+  ruleLookup: (field: string) => FieldRule = ruleFor,
+): T[] {
+  const keep = new Set<number>();
+  const liveGroups = new Set<string>();
+
+  events.forEach((e, i) => {
+    const fieldRule = ruleLookup(e.field);
+    if (retainOnWrite(state[e.field], e, fieldRule)) {
+      keep.add(i);
+      if (fieldRule.group) liveGroups.add(fieldRule.group);
+    }
+  });
+
+  if (liveGroups.size > 0) {
+    events.forEach((e, i) => {
+      const group = ruleLookup(e.field).group;
+      if (group !== undefined && liveGroups.has(group)) keep.add(i);
+    });
+  }
+
+  const out: T[] = [];
+  events.forEach((e, i) => {
+    if (!keep.has(i)) return;
+    out.push(e);
+    state[e.field] = { ts: e.ts, v: e.value };
+  });
+  return out;
+}
+
+/** Drop fields that stopped reporting, so the carried state cannot grow forever. */
+export function pruneWriteState(state: WriteState, nowTs: number, ttlS = WRITE_STATE_TTL_S): void {
+  for (const [field, last] of Object.entries(state)) {
+    if (nowTs - last.ts > ttlS) delete state[field];
+  }
+}
+
 /**
  * The value a compressed series implies at `ts` — the last sample at or before
  * it, with analog series interpolated linearly between their neighbours.
