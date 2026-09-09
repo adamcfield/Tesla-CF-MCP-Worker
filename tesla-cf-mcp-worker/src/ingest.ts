@@ -793,5 +793,12 @@ export async function getTelemetryFieldStatus(env: Env, vin: string): Promise<un
         : null);
     return { tesla, canonical, value, last_seen: seen ?? null };
   });
-  return { vin, fields };
+  // `last_seen` now means "when this value last CHANGED", not "when the stream
+  // last carried it" — compression stores a field only when it moves, and
+  // liveness is witnessed once per vehicle by `positions` rather than by
+  // re-storing 163 fields on a timer. Without this companion stamp a field that
+  // has simply been steady for a month is indistinguishable from telemetry
+  // having died, and the Fields screen would read as broken when it is working
+  // exactly as intended.
+  return { vin, fields, stream_last_ts: pos?.last_ts ?? null };
 }

@@ -16,6 +16,7 @@ import {
   reconstructSeries,
   registeredFields,
   ruleFor,
+  POSITION_HEARTBEAT_S,
   ruleForTier,
   tierForAge,
   valueAt,
@@ -136,21 +137,39 @@ describe("run endpoints", () => {
   });
 });
 
-describe("gap anchors", () => {
-  it("bounds the gap between kept points even when nothing changes", () => {
-    // 24h of a constant value at one sample a minute.
+describe("no per-field anchors", () => {
+  it("reduces a whole unchanging day to its opening sample", () => {
+    // 24h of a constant value at one sample a minute. There is no per-field
+    // anchor any more — liveness is witnessed once per vehicle by `positions` —
+    // so a day in which nothing happened costs one row, not one per interval.
     const pts: Point[] = [];
     for (let i = 0; i < 1440; i++) pts.push({ ts: i * 60, value: 1 });
-
     const { keep } = compressSeries(pts, { rule: { kind: "step" }, maxGapS: DEFAULT_MAX_GAP_S });
-    for (let i = 1; i < keep.length; i++) {
-      expect(keep[i]!.ts - keep[i - 1]!.ts).toBeLessThanOrEqual(DEFAULT_MAX_GAP_S + 60);
-    }
-    // One anchor per DEFAULT_MAX_GAP_S, not 1440 rows. The anchors are the
-    // floor on a compressed table, so this count is the thing worth pinning.
-    const expected = Math.floor(86400 / DEFAULT_MAX_GAP_S);
-    expect(keep.length).toBeLessThanOrEqual(expected + 2);
-    expect(keep.length).toBeGreaterThanOrEqual(expected);
+    expect(keep.length).toBe(2); // opening sample + the window's closing one
+  });
+
+  it("costs nothing at all when the previous window already stored the value", () => {
+    // Given what came before, a day that changed nothing is entirely redundant.
+    const pts: Point[] = [];
+    for (let i = 0; i < 1440; i++) pts.push({ ts: 86400 + i * 60, value: 1 });
+    const { keep, dropTs } = compressSeries(pts, ruleFor("locked"), {
+      previous: { ts: 0, value: 1 },
+      openEnd: true,
+    });
+    expect(keep).toEqual([]);
+    expect(dropTs.length).toBe(1440);
+  });
+
+  it("still records the change when one finally happens", () => {
+    const pts: Point[] = [];
+    for (let i = 0; i < 720; i++) pts.push({ ts: 86400 + i * 60, value: 1 });
+    pts.push({ ts: 86400 + 720 * 60, value: 0 });
+    const { keep } = compressSeries(pts, ruleFor("locked"), {
+      previous: { ts: 0, value: 1 },
+      openEnd: true,
+    });
+    expect(keep.map((p) => p.value)).toEqual([1, 0]);
+    expect(keep[1]!.ts).toBe(86400 + 720 * 60);
   });
 
   it("does not invent samples across a real data gap", () => {
@@ -263,12 +282,10 @@ describe("reconstruction", () => {
 });
 
 describe("age tiers", () => {
-  it("widens the anchor and the band as a day gets older", () => {
+  it("widens the band as a day gets older", () => {
     const hot = ruleForTier("isolation_resistance", "hot");
     const warm = ruleForTier("isolation_resistance", "warm");
     const cold = ruleForTier("isolation_resistance", "cold");
-    expect(hot.maxGapS).toBeLessThan(warm.maxGapS);
-    expect(warm.maxGapS).toBeLessThan(cold.maxGapS);
     const eps = (r: FieldRule) => (r.rule.kind === "analog" ? r.rule.epsilon : 0);
     expect(eps(hot)).toBeLessThan(eps(warm));
     expect(eps(warm)).toBeLessThan(eps(cold));
@@ -285,19 +302,20 @@ describe("age tiers", () => {
     }
   });
 
-  it("never tightens a field that already anchors loosely", () => {
-    // The config tier streams hourly and anchors at 12h; being recent must not
-    // shorten that to the 4h default.
-    expect(ruleForTier("trim", "hot").maxGapS).toBe(ruleFor("trim").maxGapS);
-    expect(ruleForTier("trim", "cold").maxGapS).toBeGreaterThanOrEqual(ruleFor("trim").maxGapS);
+  it("carries no per-field anchor at any tier", () => {
+    // Liveness is witnessed once per vehicle by `positions`, never per field.
+    // A stray anchor would silently reintroduce a per-field-per-interval floor.
+    for (const field of registeredFields()) {
+      for (const tier of ["hot", "warm", "cold"] as const) {
+        expect(ruleForTier(field, tier).maxGapS).toBe(0);
+      }
+    }
   });
 
-  it("keeps every cold anchor under the 24h drive-recovery window", () => {
-    // MAX_GAP_S_SYNTH is 24h: a longer anchor gap would let an odometer jump
-    // read as an outage instead of a recoverable drive.
-    for (const field of registeredFields()) {
-      expect(ruleForTier(field, "cold").maxGapS).toBeLessThan(24 * 3600);
-    }
+  it("keeps the positions heartbeat under the 24h drive-recovery window", () => {
+    // MAX_GAP_S_SYNTH is 24h: a longer witness interval would let an odometer
+    // jump read as an outage instead of a recoverable drive.
+    expect(POSITION_HEARTBEAT_S).toBeLessThan(24 * 3600);
   });
 
   it("maps ages onto tiers at the documented boundaries", () => {
@@ -318,6 +336,6 @@ describe("age tiers", () => {
     const cold = compressSeries(pts, ruleForTier("sentry", "cold")).keep;
     const transitions = (ps: Point[]) => ps.filter((p, i) => i > 0 && ps[i - 1]!.value !== p.value).length;
     expect(transitions(cold)).toBe(transitions(hot));
-    expect(cold.length).toBeLessThan(hot.length);
+    expect(transitions(cold)).toBe(1);
   });
 });

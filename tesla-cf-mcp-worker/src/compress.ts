@@ -110,6 +110,30 @@ export interface FieldRule {
   group?: string;
 }
 
+export interface CompressOptions {
+  /**
+   * The last sample retained BEFORE this window, when one exists.
+   *
+   * The sweep works a day at a time, but a signal does not stop at midnight.
+   * Without this the first sample of every window is retained unconditionally,
+   * which costs one row per field per day forever — the exact floor that stops a
+   * static day from being free. Given the previous value, an opening sample that
+   * changed nothing is dropped like any other.
+   */
+  previous?: Point;
+  /**
+   * True when a later window continues this series, so the final sample need not
+   * be retained merely because this window ends.
+   *
+   * Caveat worth stating: within a window, interpolation between kept points is
+   * within epsilon of every dropped point. Across a window boundary the tail this
+   * drops is no longer checked by anything, so the bound there is nearer 2*epsilon
+   * for analog fields. Step fields are exact either way — zero-order hold does not
+   * interpolate.
+   */
+  openEnd?: boolean;
+}
+
 export interface CompressResult {
   /** The points to retain, in ascending `ts`. */
   keep: Point[];
@@ -122,21 +146,35 @@ export interface CompressResult {
 // ---------------------------------------------------------------------------
 
 /**
- * Default anchor interval.
+ * Per-field anchors are OFF (0 = no anchor).
  *
- * THE ANCHORS ARE THE FLOOR, not the epsilons. With 163 parked-relevant fields,
- * an hourly anchor costs 163 x 24 = ~3,900 rows/day on its own, which is more
- * than everything else in the compressed table put together. Widening this is
- * the single highest-leverage knob in the module.
+ * An anchor existed to answer one question: does the absence of a row mean the
+ * value was unchanged, or that telemetry was down? Paying it per field made that
+ * answer cost 163 rows every interval — for a car sitting in an underground car
+ * park, plugged in and full, that was the entire content of the day.
  *
- * Four hours is the widest value that still sits under the tightest gap-based
- * threshold in the codebase — the dashboard's STALE_AFTER_S of 6h, past which a
- * vehicle reads as "likely actually broken, not just parked". Everything else
- * has far more room: MAX_GAP_S_SYNTH is 24h and vampire drain tolerates 3 days.
+ * The question is now answered ONCE per vehicle instead of once per field, by
+ * `positions`: tracking.ts writes a row there on every single ingest, and the
+ * sweep keeps at least one per POSITION_HEARTBEAT_S. So a positions row inside a
+ * window proves telemetry was flowing through it, and any field with no row in
+ * that window simply did not change. No row for the window at all means no data.
+ *
+ * The consequence, stated plainly: a genuinely unchanging field is stored ONCE,
+ * at the first sample that showed the value, and then not again until it moves.
+ * A completely static day costs zero rows in telemetry_events and one or two in
+ * positions.
  */
-export const DEFAULT_MAX_GAP_S = 4 * 3600;
-/** Fields nobody analyses at rest, and the hourly config tier. */
-export const LONG_MAX_GAP_S = 12 * 3600;
+export const DEFAULT_MAX_GAP_S = 0;
+/** Also unanchored; kept as a distinct name for fields nobody reads at rest. */
+export const LONG_MAX_GAP_S = 0;
+
+/**
+ * How often `positions` must retain a row while parked — the liveness witness
+ * for everything above. 20h stays under MAX_GAP_S_SYNTH (24h), the window in
+ * which an odometer jump still reads as one recoverable drive rather than an
+ * outage.
+ */
+export const POSITION_HEARTBEAT_S = 20 * 3600;
 
 /**
  * Groups whose members must share retained timestamps, because a consumer joins
@@ -458,10 +496,10 @@ export const TIER_COLD_AFTER_DAYS = 90;
  * MAX_GAP_S_SYNTH (24h), the window in which an odometer jump is still read as
  * one recoverable drive rather than an outage.
  */
-const TIER_SCALE: Record<Tier, { epsilon: number; maxGapS: number }> = {
-  hot: { epsilon: 1, maxGapS: DEFAULT_MAX_GAP_S },
-  warm: { epsilon: 3, maxGapS: 12 * 3600 },
-  cold: { epsilon: 8, maxGapS: 20 * 3600 },
+const TIER_SCALE: Record<Tier, { epsilon: number }> = {
+  hot: { epsilon: 1 },
+  warm: { epsilon: 3 },
+  cold: { epsilon: 8 },
 };
 
 /** Which tier a sample of this age belongs to. */
@@ -474,21 +512,18 @@ export function tierForAge(ageS: number): Tier {
 /**
  * The rule for a field at a given age.
  *
- * The anchor takes the WIDER of the field's own interval and the tier floor, so
- * a field that already anchors loosely (the hourly config tier) is never
- * tightened by being recent. The epsilon scales up but never past the field's
- * `maxEpsilon`, which is what stops "aggressive" from meaning "meaningless" on
- * the handful of signals with a real threshold underneath them.
+ * Only the epsilon scales — there are no per-field anchors left to widen. It
+ * never grows past the field's `maxEpsilon`, which is what stops "aggressive"
+ * from meaning "meaningless" on the handful of signals with a real threshold
+ * underneath them.
  */
 export function ruleForTier(field: string, tier: Tier): FieldRule {
   const base = ruleFor(field);
   if (tier === "hot") return base;
-  const scale = TIER_SCALE[tier];
-  const maxGapS = Math.max(base.maxGapS, scale.maxGapS);
-  if (base.rule.kind !== "analog") return { ...base, maxGapS };
-  const widened = base.rule.epsilon * scale.epsilon;
+  if (base.rule.kind !== "analog") return base;
+  const widened = base.rule.epsilon * TIER_SCALE[tier].epsilon;
   const epsilon = base.rule.maxEpsilon !== undefined ? Math.min(widened, base.rule.maxEpsilon) : widened;
-  return { ...base, maxGapS, rule: { ...base.rule, epsilon } };
+  return { ...base, rule: { ...base.rule, epsilon } };
 }
 
 // ---------------------------------------------------------------------------
@@ -507,8 +542,8 @@ function numeric(v: Point["value"]): number | null {
  * leave "locked at 19:04, unlocked at 07:20" indistinguishable from a night with
  * no data at all.
  */
-function runEndpointIndices(points: Point[]): Set<number> {
-  const keep = new Set<number>([0, points.length - 1]);
+function runEndpointIndices(points: Point[], seedLast: boolean): Set<number> {
+  const keep = new Set<number>(seedLast ? [0, points.length - 1] : [0]);
   for (let i = 1; i < points.length; i++) {
     if (points[i - 1]!.value !== points[i]!.value) {
       keep.add(i - 1);
@@ -528,8 +563,8 @@ function runEndpointIndices(points: Point[]): Set<number> {
  * number was expected) cannot participate in the cone, so they are treated as
  * hard transitions: both sides are kept and the door restarts.
  */
-function swingingDoorIndices(points: Point[], epsilon: number): Set<number> {
-  const keep = new Set<number>([0, points.length - 1]);
+function swingingDoorIndices(points: Point[], epsilon: number, seedLast: boolean): Set<number> {
+  const keep = new Set<number>(seedLast ? [0, points.length - 1] : [0]);
   let anchorIdx = 0;
   let upper = Infinity;
   let lower = -Infinity;
@@ -692,20 +727,60 @@ function indicesToResult(points: Point[], keep: Set<number>): CompressResult {
 }
 
 /** The retained indices for one series under one rule, before grouping. */
-function retainedIndices(points: Point[], fieldRule: FieldRule): Set<number> {
+function retainedIndices(points: Point[], fieldRule: FieldRule, seedLast = true): Set<number> {
   const { rule, maxGapS } = fieldRule;
   if (rule.kind === "never") {
     return new Set(points.map((_, i) => i));
   }
   let keep: Set<number>;
   if (rule.kind === "analog") {
-    keep = swingingDoorIndices(points, rule.epsilon);
+    keep = swingingDoorIndices(points, rule.epsilon, seedLast);
     enforceEpsilon(points, keep, rule.epsilon);
   } else {
-    keep = runEndpointIndices(points);
+    keep = runEndpointIndices(points, seedLast);
   }
+  if (!seedLast) keepTailIfInformative(points, keep, rule);
   applyGapAnchors(points, keep, maxGapS);
   return keep;
+}
+
+/**
+ * With an open end the closing sample is not retained just for being last — but
+ * it must still be retained if it says something.
+ *
+ * A steady ramp is the case that matters. The door never closes on a straight
+ * line, so with nothing seeding the end, a ten-hour run of SoC sliding 70 -> 68
+ * collapsed to its opening sample alone and the entire 2% of drain vanished.
+ * Reconstruction from what survived has to land within epsilon of the final
+ * value, exactly as it must for every sample in the middle; when it does not,
+ * the closing sample stays.
+ */
+function keepTailIfInformative(points: Point[], keep: Set<number>, rule: Rule): void {
+  const lastIdx = points.length - 1;
+  if (keep.has(lastIdx)) return;
+  let prevKept = -1;
+  for (const i of keep) if (i > prevKept && i < lastIdx) prevKept = i;
+  if (prevKept < 0) {
+    keep.add(lastIdx);
+    return;
+  }
+  const last = points[lastIdx]!;
+  const ref = points[prevKept]!;
+  if (rule.kind === "analog") {
+    const a = numeric(ref.value);
+    const b = numeric(last.value);
+    if (a === null || b === null) {
+      // No band applies across a non-numeric value, so fall back to equality —
+      // the same rule the door itself uses. Treating "not comparable" as
+      // "informative" would retain the closing row of every all-null column,
+      // which on `positions` is most of them for a parked car.
+      if (ref.value !== last.value) keep.add(lastIdx);
+      return;
+    }
+    if (Math.abs(b - a) > rule.epsilon) keep.add(lastIdx);
+    return;
+  }
+  if (ref.value !== last.value) keep.add(lastIdx);
 }
 
 /**
@@ -714,9 +789,26 @@ function retainedIndices(points: Point[], fieldRule: FieldRule): Set<number> {
  * `points` must be sorted ascending by `ts`. Series of fewer than three points
  * are returned untouched — there is nothing between the endpoints to drop.
  */
-export function compressSeries(points: Point[], fieldRule: FieldRule): CompressResult {
-  if (points.length < 3) return { keep: [...points], dropTs: [] };
-  return indicesToResult(points, retainedIndices(points, fieldRule));
+export function compressSeries(
+  points: Point[],
+  fieldRule: FieldRule,
+  opts: CompressOptions = {},
+): CompressResult {
+  const { previous, openEnd } = opts;
+  if (points.length === 0) return { keep: [], dropTs: [] };
+  if (points.length < 3 && previous === undefined) return { keep: [...points], dropTs: [] };
+
+  // Prepending the previous retained sample lets the algorithms judge this
+  // window's opening value against what was already stored, rather than keeping
+  // it just for being first. It is stripped from the result — it is already in
+  // the table and must not be re-reported as a keeper here.
+  const work = previous !== undefined ? [previous, ...points] : points;
+  const offset = previous !== undefined ? 1 : 0;
+  const raw = retainedIndices(work, fieldRule, openEnd !== true);
+
+  const keepIdx = new Set<number>();
+  for (const i of raw) if (i >= offset) keepIdx.add(i - offset);
+  return indicesToResult(points, keepIdx);
 }
 
 /**
@@ -827,7 +919,10 @@ function retainOnWrite(
   if (fieldRule.rule.kind === "never") return true;
   if (!prev) return true; // first sight of this field
   if (e.ts <= prev.ts) return true; // out of order — store it, don't judge it
-  if (e.ts - prev.ts >= fieldRule.maxGapS) return true; // anchor
+  // maxGapS of 0 means "no anchor": liveness is witnessed by `positions`, not by
+  // re-storing every field. Without this guard a zero interval would read as
+  // "always due" and the gate would pass everything through.
+  if (fieldRule.maxGapS > 0 && e.ts - prev.ts >= fieldRule.maxGapS) return true; // anchor
   if (fieldRule.rule.kind === "analog") {
     const a = numeric(prev.v);
     const b = numeric(e.value);

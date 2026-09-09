@@ -71,21 +71,16 @@ describe("write gate — step fields", () => {
     ]);
   });
 
-  it("re-anchors once maxGapS has passed, so a gap still means lost data", async () => {
+  it("never re-stores a field just because time passed", async () => {
+    // There is no per-field anchor: twelve hours of an unchanging value is one
+    // row, not one per interval. Liveness is witnessed by `positions` instead.
     const env = makeEnv();
     await ensureSchema(env);
-    // Twelve hours of an unchanging value, one sample a minute.
     for (let i = 0; i <= 720; i++) {
       await recordEvents(env, VIN, [{ field: "sentry", value: "armed", ts: T + i * 60 }], { compress: true });
     }
-    const rs = await env.DB.prepare(
-      `SELECT ts FROM telemetry_events WHERE vin = ?1 AND field = 'sentry' ORDER BY ts`,
-    ).bind(VIN).all<{ ts: number }>();
-    const stamps = (rs.results ?? []).map((r) => r.ts);
-    expect(stamps.length).toBe(1 + Math.floor((720 * 60) / DEFAULT_MAX_GAP_S)); // first + one per anchor interval
-    for (let i = 1; i < stamps.length; i++) {
-      expect(stamps[i]! - stamps[i - 1]!).toBeLessThanOrEqual(DEFAULT_MAX_GAP_S + 60);
-    }
+    expect(await countRows(env, "sentry")).toBe(1);
+    expect(DEFAULT_MAX_GAP_S).toBe(0);
   });
 });
 

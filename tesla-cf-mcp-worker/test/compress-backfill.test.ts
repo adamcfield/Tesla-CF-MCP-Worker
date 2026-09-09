@@ -182,22 +182,10 @@ describe("compressOldHistory", () => {
     await seed(env, "locked", COLD_DAY, () => 1, 1440);
     await compressOldHistory(env, {});
 
-    const gaps = async (from: number): Promise<number[]> => {
-      const rs = await env.DB.prepare(
-        `SELECT ts FROM telemetry_events WHERE vin = ?1 AND field = 'locked' AND ts >= ?2 AND ts < ?3 ORDER BY ts`,
-      ).bind(VIN, from, from + DAY).all<{ ts: number }>();
-      const ts = (rs.results ?? []).map((r) => r.ts);
-      return ts.slice(1).map((t, i) => t - ts[i]!);
-    };
-    const warm = await gaps(OLD_DAY);
-    const cold = await gaps(COLD_DAY);
-
-    // Both collapse from 1440 rows to a handful; what the tier changes is how
-    // far apart the survivors are allowed to be.
-    expect(warm.length + 1).toBeLessThan(10);
-    expect(cold.length + 1).toBeLessThan(10);
-    expect(Math.max(...cold)).toBeGreaterThan(Math.max(...warm));
-    expect(cold.length).toBeGreaterThan(0); // still legible, just coarser
+    // Both days held one unchanging value, so both collapse to essentially
+    // nothing regardless of tier — the anchors that used to floor them are gone.
+    expect(await count(env, "locked", OLD_DAY, OLD_DAY + DAY)).toBeLessThan(3);
+    expect(await count(env, "locked", COLD_DAY, COLD_DAY + DAY)).toBeLessThan(3);
   });
 
   it("leaves an unclassified field untouched", async () => {
@@ -252,6 +240,79 @@ function parkedDay(dayStart: number, odometer = 1000): PosRow[] {
   }
   return rows;
 }
+
+describe("a completely uneventful day", () => {
+  /**
+   * The scenario this whole design target came from: the car spends a full day
+   * in an underground car park, plugged in, battery full, nothing whatsoever
+   * happening. That day should cost essentially nothing to keep.
+   */
+  it("costs zero telemetry rows and one or two positions rows", async () => {
+    const env = makeEnv();
+    await ensureSchema(env);
+
+    const STATIC = {
+      locked: 1, sentry: "armed", door_state: "Closed", hvac_power: 0,
+      charging_state: "Complete", charge_port_latch: 1, charge_port_door_open: 1,
+      fast_charger_present: 0, bms_full_charge: 1, odometer: 51234.5,
+      // Underground: temperature barely moves, and what movement there is sits
+      // inside the band.
+      isolation_resistance: 900, tpms_fl: 2.9, brick_v_max: 3.95, brick_v_min: 3.948,
+      pack_current: 0.1,
+    } as const;
+
+    // Yesterday established every value; today repeats it 288 times.
+    const priorTs = OLD_DAY - 600;
+    const seedRows = [];
+    const stmt = env.DB.prepare(
+      `INSERT OR REPLACE INTO telemetry_events (vin, ts, field, value_num, value_text) VALUES (?1, ?2, ?3, ?4, ?5)`,
+    );
+    for (const [field, v] of Object.entries(STATIC)) {
+      seedRows.push(stmt.bind(VIN, priorTs, field, typeof v === "number" ? v : null, typeof v === "number" ? null : v));
+      for (let i = 0; i < 288; i++) {
+        seedRows.push(
+          stmt.bind(VIN, OLD_DAY + i * 300, field, typeof v === "number" ? v : null, typeof v === "number" ? null : v),
+        );
+      }
+    }
+    await env.DB.batch(seedRows);
+    await seedPositions(
+      env,
+      Array.from({ length: 288 }, (_, i) => ({
+        ts: OLD_DAY + i * 300, soc: 100, odometer: 51234.5,
+        activity: "charging", charging_state: "Complete",
+      })),
+    );
+
+    const before = (
+      await env.DB.prepare(`SELECT COUNT(*) AS n FROM telemetry_events WHERE vin = ?1 AND ts >= ?2 AND ts < ?3`)
+        .bind(VIN, OLD_DAY, OLD_DAY + DAY).first<{ n: number }>()
+    )!.n;
+    expect(before).toBe(Object.keys(STATIC).length * 288);
+
+    await compressOldHistory(env, {});
+
+    const after = (
+      await env.DB.prepare(`SELECT COUNT(*) AS n FROM telemetry_events WHERE vin = ?1 AND ts >= ?2 AND ts < ?3`)
+        .bind(VIN, OLD_DAY, OLD_DAY + DAY).first<{ n: number }>()
+    )!.n;
+    const positions = await positionCount(env);
+
+    // The day itself is gone from telemetry_events entirely: every value was
+    // already on record from before it started.
+    expect(after).toBe(0);
+    // And `positions` keeps only the liveness witness, which is what makes the
+    // absence above readable as "unchanged" rather than "telemetry was down".
+    expect(positions).toBeLessThanOrEqual(2);
+    expect(positions).toBeGreaterThanOrEqual(1);
+
+    // The values are still recoverable — they are on the row from before.
+    const prior = await env.DB.prepare(
+      `SELECT COUNT(*) AS n FROM telemetry_events WHERE vin = ?1 AND ts = ?2`,
+    ).bind(VIN, priorTs).first<{ n: number }>();
+    expect(prior?.n).toBe(Object.keys(STATIC).length);
+  });
+});
 
 describe("compressOldHistory — positions", () => {
   let env: Env;

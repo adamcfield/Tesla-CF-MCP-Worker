@@ -2668,7 +2668,12 @@ export async function getTirePressures(env: Env, vin: string, days = 30): Promis
       latestTs = Math.max(latestTs, lastPt[0]);
     }
     // Least-squares slope in bar/week (needs ≥5 points across ≥2 days).
-    if (pts.length >= 5 && pts[pts.length - 1]![0] - pts[0]![0] >= 2 * 86400) {
+    // Two points is enough BECAUSE of compression, not in spite of it: the door
+    // only reduces a run to its endpoints when a straight line between them
+    // reproduces every sample it dropped to within epsilon. Demanding five would
+    // refuse to trend exactly the signals that are cleanest. The two-day span
+    // guard below is what still stops a trend being fitted to a moment.
+    if (pts.length >= 2 && pts[pts.length - 1]![0] - pts[0]![0] >= 2 * 86400) {
       // Duration-weighted least squares, not ordinary least squares. The series
       // is already unevenly spaced today — telemetry only sends on change — so
       // an unweighted fit is pulled toward whichever periods happen to be

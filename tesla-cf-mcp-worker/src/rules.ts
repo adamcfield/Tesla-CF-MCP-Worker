@@ -26,7 +26,7 @@
 import { generateBrief, generateCoachNote } from "./ai";
 import { getVehicle, getVehicleData } from "./api";
 import { getBudgetCallLog, getBudgetForecast, getBudgetStatus } from "./budget";
-import { compressSeries, DEFAULT_MAX_GAP_S, FIELD_GROUPS, FieldRule, Point, registeredFields, ruleFor, ruleForTier, Tier, TIER_COLD_AFTER_DAYS, TIER_WARM_AFTER_DAYS } from "./compress";
+import { compressSeries, DEFAULT_MAX_GAP_S, FIELD_GROUPS, FieldRule, Point, registeredFields, ruleFor, ruleForTier, Tier, TIER_COLD_AFTER_DAYS, TIER_WARM_AFTER_DAYS, POSITION_HEARTBEAT_S } from "./compress";
 import { cachedRead, pruneReadCache, readBudget } from "./d1meter";
 import * as cmd from "./commands";
 import { applyVehicleData } from "./ingest";
@@ -1148,6 +1148,25 @@ function parkedRuns(points: Point[], drives: DriveWindow[]): Point[][] {
   return runs;
 }
 
+/**
+ * The last sample retained for this field BEFORE `from`.
+ *
+ * The sweep works a day at a time, but a signal does not stop at midnight.
+ * Handing this to compressSeries is what lets an unchanged opening value be
+ * dropped instead of retained just for being first — the difference between a
+ * static day costing one row per field and costing none. One indexed seek per
+ * field-day.
+ */
+async function previousSample(env: Env, vin: string, field: string, from: number): Promise<Point | undefined> {
+  const row = await env.DB.prepare(
+    `SELECT ts, value_num, value_text FROM telemetry_events
+     WHERE vin = ?1 AND field = ?2 AND ts < ?3 ORDER BY ts DESC LIMIT 1`,
+  )
+    .bind(vin, field, from)
+    .first<{ ts: number; value_num: number | null; value_text: string | null }>();
+  return row ? { ts: row.ts, value: row.value_num ?? row.value_text } : undefined;
+}
+
 /** Read one field's samples for one UTC day. Seeks the (vin, field, ts) PK. */
 async function readFieldDay(env: Env, vin: string, field: string, from: number, to: number): Promise<Point[]> {
   const rs = await env.DB.prepare(
@@ -1179,7 +1198,7 @@ async function compressFieldDay(
   const series = new Map<string, Point[]>();
   for (const field of fields) {
     const pts = await readFieldDay(env, vin, field, from, to);
-    if (pts.length >= 3) series.set(field, pts);
+    if (pts.length > 0) series.set(field, pts);
   }
   if (series.size === 0) return 0;
 
@@ -1193,8 +1212,16 @@ async function compressFieldDay(
     const rule = ruleForTier(field, tier);
     const keep = new Set<number>();
     for (const p of pts) if (insideDrive(p.ts, drives)) keep.add(p.ts);
-    for (const run of parkedRuns(pts, drives)) {
-      for (const p of compressSeries(run, rule).keep) keep.add(p.ts);
+    const prior = await previousSample(env, vin, field, from);
+    const runs = parkedRuns(pts, drives);
+    for (let i = 0; i < runs.length; i++) {
+      // Only the first run continues from before the window, and only the last
+      // one is continued by the next window.
+      const opts = {
+        previous: i === 0 ? prior : undefined,
+        openEnd: i === runs.length - 1,
+      };
+      for (const p of compressSeries(runs[i]!, rule, opts).keep) keep.add(p.ts);
     }
     keepTs.set(field, keep);
     if (rule.group !== undefined) {
@@ -1244,8 +1271,32 @@ const POSITION_DOOR_COLUMNS = [
 /** `activity` is derived rather than a telemetry field, so it needs its own rule. */
 const ACTIVITY_RULE: FieldRule = { rule: { kind: "step" }, maxGapS: DEFAULT_MAX_GAP_S };
 
-/** Process positions in sub-day windows so the keeper list stays small. */
-const POSITION_WINDOW_S = 6 * 3600;
+/**
+ * `positions` is swept a whole day at a time, not in slices.
+ *
+ * Slicing it kept each DELETE's keeper list small, but every slice also had to
+ * retain its own opening row, which put a floor of one row per slice per day
+ * under a table whose entire remaining job is to be a once-per-20h heartbeat.
+ * A parked day holds a few hundred rows, so one statement covers it; the
+ * keeper cap below catches the pathological case.
+ */
+const POSITION_WINDOW_S = DAY_S;
+/** Positions keeper lists are a union over 23 columns, so they run longer. */
+const MAX_POSITION_KEEPERS = 1000;
+
+/** The last retained parked `positions` row before `from`, for cross-window context. */
+async function previousPositionRow(
+  env: Env,
+  vin: string,
+  from: number,
+): Promise<(Record<string, unknown> & { ts: number }) | null> {
+  return await env.DB.prepare(
+    `SELECT ts, activity, ${POSITION_DOOR_COLUMNS.join(", ")} FROM positions
+     WHERE vin = ?1 AND ts < ?2 AND drive_id IS NULL ORDER BY ts DESC LIMIT 1`,
+  )
+    .bind(vin, from)
+    .first<Record<string, unknown> & { ts: number }>();
+}
 
 /**
  * Thin one window of PARKED `positions` rows.
@@ -1279,7 +1330,24 @@ async function compressPositionsWindow(
   const rows = rs.results ?? [];
   if (rows.length < 3) return 0;
 
-  const keep = new Set<number>([rows[0]!.ts, rows[rows.length - 1]!.ts]);
+  // The liveness witness. Every per-field anchor was removed in favour of this
+  // one row: a positions row inside a window proves telemetry was flowing
+  // through it, so a field with nothing stored there simply did not change.
+  //
+  // The clock continues from the last row retained BEFORE this window rather
+  // than restarting at its first row — otherwise every day would owe a heartbeat
+  // of its own, and a car left parked for a week would pay seven instead of the
+  // eight the interval actually calls for.
+  const prevRow = await previousPositionRow(env, vin, from);
+  const keep = new Set<number>();
+  let lastHeartbeat = prevRow?.ts ?? -Infinity;
+  if (prevRow === null) keep.add(rows[0]!.ts); // nothing before it: this is the first witness
+  for (const r of rows) {
+    if (r.ts - lastHeartbeat >= POSITION_HEARTBEAT_S) {
+      keep.add(r.ts);
+      lastHeartbeat = r.ts;
+    }
+  }
   // drive_id already excludes tagged rows, but a synthetic drive has no
   // positions at all, so an untagged row can still sit inside a drive window.
   for (const r of rows) if (insideDrive(r.ts, drives)) keep.add(r.ts);
@@ -1291,13 +1359,19 @@ async function compressPositionsWindow(
       ts: r.ts,
       value: (r[col] ?? null) as number | string | null,
     }));
-    for (const run of parkedRuns(pts, drives)) {
-      for (const p of compressSeries(run, rule).keep) keep.add(p.ts);
+    const runs = parkedRuns(pts, drives);
+    for (let i = 0; i < runs.length; i++) {
+      const prior =
+        i === 0 && prevRow !== null
+          ? { ts: prevRow.ts, value: (prevRow[col] ?? null) as number | string | null }
+          : undefined;
+      const opts = { previous: prior, openEnd: i === runs.length - 1 };
+      for (const p of compressSeries(runs[i]!, rule, opts).keep) keep.add(p.ts);
     }
   }
 
   if (keep.size >= rows.length) return 0;
-  if (keep.size > MAX_KEEPERS_PER_STATEMENT) return 0;
+  if (keep.size > MAX_POSITION_KEEPERS) return 0;
   const list = [...keep].sort((a, b) => a - b).join(",");
   const res = await env.DB.prepare(
     `DELETE FROM positions
