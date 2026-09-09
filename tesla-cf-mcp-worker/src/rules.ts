@@ -26,7 +26,7 @@
 import { generateBrief, generateCoachNote } from "./ai";
 import { getVehicle, getVehicleData } from "./api";
 import { getBudgetCallLog, getBudgetForecast, getBudgetStatus } from "./budget";
-import { compressSeries, DEFAULT_MAX_GAP_S, FIELD_GROUPS, FieldRule, Point, registeredFields, ruleFor, ruleForTier, Tier, TIER_COLD_AFTER_DAYS, TIER_WARM_AFTER_DAYS, POSITION_HEARTBEAT_S } from "./compress";
+import { compressSeries, DEFAULT_MAX_GAP_S, FIELD_GROUPS, FieldRule, Point, registeredFields, ruleFor, Rule, ruleForTier, scaleForTier, Tier, tierForAge, TIER_COLD_AFTER_DAYS, TIER_WARM_AFTER_DAYS, POSITION_HEARTBEAT_S } from "./compress";
 import { cachedRead, pruneReadCache, readBudget } from "./d1meter";
 import * as cmd from "./commands";
 import { applyVehicleData } from "./ingest";
@@ -1383,6 +1383,142 @@ async function compressPositionsWindow(
 }
 
 /**
+ * Accelerations above which a sample is a harsh event and is kept whatever its
+ * age. Mirrors scoring.ts (HARSH_ACCEL 2.5, HARSH_BRAKE 3.0, HARSH_LAT 3.5) with
+ * a little margin, so the route door can never quietly erase the samples the
+ * chart explorer draws its safety markers from — that file carries an explicit
+ * "downsampling must not eat safety events" guarantee and this must not become
+ * the thing that breaks it.
+ *
+ * The per-drive COUNTS live on the drives row and are untouchable by this pass;
+ * this is about the dots on the timeline still lining up with them.
+ */
+const HARSH_KEEP_MS2 = 2.4;
+
+/**
+ * Rule overrides that apply ONLY inside a drive.
+ *
+ * `odometer` is a `counter` everywhere else, meaning run-endpoint retention —
+ * exactly right while parked, where it is flat and both ends of every run must
+ * survive so backfillSyntheticDrives still sees the same odometer jumps. Inside
+ * a drive it climbs on every single sample, so every row is a run boundary and
+ * the rule degenerates to keeping the entire route.
+ *
+ * That is safe to override here precisely because the synthetic-drive recovery
+ * only ever inspects rows with `drive_id IS NULL`. Within a drive the odometer
+ * is a smooth ramp, which is the door's best case: two points, with every
+ * intermediate distance recovered by interpolation to within the band.
+ */
+const DRIVE_ROUTE_OVERRIDES: Record<string, Rule> = {
+  odometer: { kind: "analog", epsilon: 0.01 }, // km, so ~10 m before tier scaling
+  charge_energy_added: { kind: "analog", epsilon: 0.05 },
+};
+
+/** Drives to consider per run, bounding one invocation's round-trips. */
+const DRIVE_COMPACT_BATCH = 25;
+
+/**
+ * Thin one finished drive's route with the value-aware door.
+ *
+ * A GPS trace run through the lat/lon door with a metric tolerance IS
+ * Douglas-Peucker on that trace — the standard route-simplification algorithm,
+ * already written and tested here. At the cold tier lat/lon carry roughly a 9 m
+ * band, invisible at map zoom, while dropping most of the straight-line samples
+ * a motorway generates.
+ *
+ * Safe because every derived figure about a drive — distance, energy,
+ * efficiency, avg/max speed and power, and the whole behaviour block including
+ * the harsh-event counts and behavior_score — is computed in closeDrive AT CLOSE
+ * and stored on the `drives` row. Nothing here can move any of them. It is the
+ * repo's own principle: the summary is permanent, the fine-grained history is not.
+ */
+async function compressDriveRoute(env: Env, driveId: number, tier: Tier): Promise<number> {
+  const rs = await env.DB.prepare(
+    `SELECT ts, ${POSITION_DOOR_COLUMNS.join(", ")} FROM positions
+     WHERE drive_id = ?1 ORDER BY ts ASC`,
+  )
+    .bind(driveId)
+    .all<Record<string, unknown> & { ts: number }>();
+  const rows = rs.results ?? [];
+  if (rows.length < 3) return 0;
+
+  // Endpoints always survive: they anchor the drawn route to the drive's own
+  // start_ts/end_ts and start/end coordinates.
+  const keep = new Set<number>([rows[0]!.ts, rows[rows.length - 1]!.ts]);
+
+  for (const r of rows) {
+    const lon = Number(r.lon_accel);
+    const lat = Number(r.lat_accel);
+    if (
+      (Number.isFinite(lon) && Math.abs(lon) >= HARSH_KEEP_MS2) ||
+      (Number.isFinite(lat) && Math.abs(lat) >= HARSH_KEEP_MS2)
+    ) {
+      keep.add(r.ts);
+    }
+  }
+
+  for (const col of POSITION_DOOR_COLUMNS) {
+    const override = DRIVE_ROUTE_OVERRIDES[col];
+    const rule = override !== undefined
+      ? { ...ruleForTier(col, tier), rule: scaleForTier(override, tier) }
+      : ruleForTier(col, tier);
+    if (rule.rule.kind === "never") continue;
+    const pts: Point[] = rows.map((r) => ({
+      ts: r.ts,
+      value: (r[col] ?? null) as number | string | null,
+    }));
+    // One drive is one series: there is no neighbouring window to carry context
+    // across, so the endpoints are seeded rather than inherited.
+    for (const p of compressSeries(pts, rule).keep) keep.add(p.ts);
+  }
+
+  if (keep.size >= rows.length) return 0;
+  if (keep.size > MAX_POSITION_KEEPERS) return 0;
+  const list = [...keep].sort((a, b) => a - b).join(",");
+  const res = await env.DB.prepare(
+    `DELETE FROM positions WHERE drive_id = ?1 AND ts NOT IN (${list})`,
+  )
+    .bind(driveId)
+    .run();
+  return res.meta.changes ?? 0;
+}
+
+/**
+ * Thin the routes of drives old enough to have aged out of the hot tier.
+ *
+ * Marks `drives.positions_compacted` on the way through, which makes this
+ * idempotent AND makes the backlog an index seek (idx_drives_compact) instead of
+ * a scan. It is the same marker the 365-day stride-based decimateSeries pass
+ * uses, so a drive the door has already handled is skipped there rather than
+ * thinned a second time by a value-blind algorithm.
+ */
+async function compressOldDriveRoutes(
+  env: Env,
+  rowBudget: number,
+): Promise<{ drives: number; removed: number }> {
+  const nowTs = Math.floor(Date.now() / 1000);
+  const cutoff = nowTs - TIER_WARM_AFTER_DAYS * DAY_S;
+  const rs = await env.DB.prepare(
+    `SELECT id, start_ts FROM drives
+     WHERE status = 'complete' AND start_ts < ?1
+       AND (positions_compacted IS NULL OR positions_compacted = 0)
+     ORDER BY start_ts ASC LIMIT ?2`,
+  )
+    .bind(cutoff, DRIVE_COMPACT_BATCH)
+    .all<{ id: number; start_ts: number }>();
+
+  let removed = 0;
+  let drives = 0;
+  for (const d of rs.results ?? []) {
+    if (removed >= rowBudget) break;
+    removed += await compressDriveRoute(env, d.id, tierForAge(nowTs - d.start_ts));
+    await env.DB.prepare(`UPDATE drives SET positions_compacted = 1 WHERE id = ?1`).bind(d.id).run();
+    drives++;
+  }
+  return { drives, removed };
+}
+
+/**
  * Oldest stored sample for a VIN across BOTH thinnable tables, or null.
  *
  * Both tables matter: a VIN can have `positions` and no EAV rows at all (every
@@ -1452,6 +1588,13 @@ export async function compressOldHistory(env: Env, summary: Record<string, unkno
   const daysByTier: Record<string, number> = {};
 
   try {
+    // Drive routes first. Once parked history has been swept they are what is
+    // left of the table, and each one is an indexed backlog entry rather than a
+    // day to walk, so they are the cheapest rows in the run.
+    const routes = await compressOldDriveRoutes(env, rowBudget);
+    removed += routes.removed;
+    if (routes.drives > 0) summary.compressed_drives = routes;
+
     // Coldest first: those days are the cheapest to shrink and the least likely
     // to be looked at, so when a run's budget is short they are what it should
     // spend it on.

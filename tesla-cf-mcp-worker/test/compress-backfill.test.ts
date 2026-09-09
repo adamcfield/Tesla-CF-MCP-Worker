@@ -329,10 +329,13 @@ describe("compressOldHistory — positions", () => {
     expect(left).toBeGreaterThan(0);
   });
 
-  it("never touches rows attached to a drive", async () => {
+  it("never touches rows attached to a RECENT drive", async () => {
+    // Routes are thinned once they age past the warm threshold (see the
+    // drive-routes suite below); inside it they must stay at full resolution.
+    const recent = NOW - 3 * DAY;
     await env.DB.prepare(
       `INSERT INTO drives (vin, start_ts, end_ts, status) VALUES (?1, ?2, ?3, 'complete')`,
-    ).bind(VIN, OLD_DAY + 3600, OLD_DAY + 5400).run();
+    ).bind(VIN, recent, recent + 1800).run();
     const driveId = (
       await env.DB.prepare(`SELECT id FROM drives WHERE vin = ?1`).bind(VIN).first<{ id: number }>()
     )!.id;
@@ -340,7 +343,7 @@ describe("compressOldHistory — positions", () => {
     const rows: PosRow[] = [];
     for (let i = 0; i < 60; i++) {
       rows.push({
-        ts: OLD_DAY + 3600 + i * 30,
+        ts: recent + i * 30,
         soc: 70,
         odometer: 1000 + i * 0.2,
         activity: "driving",
@@ -452,5 +455,111 @@ describe("compressOldHistory — positions", () => {
 
     expect(before.total_soc_lost_pct).toBeCloseTo(2.4, 1);
     expect(after.total_soc_lost_pct).toBeCloseTo(before.total_soc_lost_pct, 1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// drive routes
+// ---------------------------------------------------------------------------
+
+describe("compressOldHistory — drive routes", () => {
+  let env: Env;
+  beforeEach(async () => {
+    env = makeEnv();
+    await ensureSchema(env);
+  });
+
+  /** A drive of `n` samples along a straight road, with one hard brake. */
+  async function insertDrive(startTs: number, n = 360): Promise<number> {
+    const res = await env.DB.prepare(
+      `INSERT INTO drives (vin, start_ts, end_ts, status, distance_km, behavior_score,
+                           harsh_brake_count, harsh_accel_count, max_decel_ms2, sample_count)
+       VALUES (?1, ?2, ?3, 'complete', 12.5, 91, 1, 0, 3.4, ?4)`,
+    )
+      .bind(VIN, startTs, startTs + n * 5, n)
+      .run();
+    const driveId = Number(res.meta.last_row_id ?? 0);
+    for (let i = 0; i < n; i++) {
+      // A straight road: the route door should collapse this hard.
+      const brake = i === 200 ? -3.4 : 0;
+      await env.DB.prepare(
+        `INSERT OR IGNORE INTO positions (vin, ts, drive_id, activity, lat, lon, speed, odometer, soc, lon_accel)
+         VALUES (?1, ?2, ?3, 'driving', ?4, ?5, 90, ?6, 80, ?7)`,
+      )
+        .bind(VIN, startTs + i * 5, driveId, 32.0 + i * 0.0002, 34.8, 1000 + i * 0.125, brake)
+        .run();
+    }
+    return driveId;
+  }
+
+  async function routeLength(driveId: number): Promise<number> {
+    return (
+      (
+        await env.DB.prepare(`SELECT COUNT(*) AS n FROM positions WHERE drive_id = ?1`)
+          .bind(driveId)
+          .first<{ n: number }>()
+      )?.n ?? 0
+    );
+  }
+
+  it("leaves a recent drive completely alone", async () => {
+    const id = await insertDrive(NOW - 2 * DAY);
+    await compressOldHistory(env, {});
+    expect(await routeLength(id)).toBe(360);
+  });
+
+  it("thins an old route but keeps its endpoints", async () => {
+    const startTs = NOW - 120 * DAY;
+    const id = await insertDrive(startTs);
+    await compressOldHistory(env, {});
+
+    const rs = await env.DB.prepare(
+      `SELECT ts FROM positions WHERE drive_id = ?1 ORDER BY ts`,
+    ).bind(id).all<{ ts: number }>();
+    const ts = (rs.results ?? []).map((r) => r.ts);
+    expect(ts.length).toBeLessThan(360);
+    expect(ts.length).toBeGreaterThan(1);
+    expect(ts[0]).toBe(startTs);
+    expect(ts[ts.length - 1]).toBe(startTs + 359 * 5);
+  });
+
+  it("never drops a harsh-braking sample", async () => {
+    // The chart explorer redraws safety markers from full-resolution rows, so
+    // the door must not be what eats them.
+    const startTs = NOW - 120 * DAY;
+    const id = await insertDrive(startTs);
+    await compressOldHistory(env, {});
+    const harsh = await env.DB.prepare(
+      `SELECT COUNT(*) AS n FROM positions WHERE drive_id = ?1 AND ABS(lon_accel) >= 3`,
+    ).bind(id).first<{ n: number }>();
+    expect(harsh?.n).toBe(1);
+  });
+
+  it("cannot move anything stored on the drive row", async () => {
+    // Every derived figure is computed at closeDrive and stored; thinning the
+    // route afterwards must be invisible to all of it.
+    const id = await insertDrive(NOW - 120 * DAY);
+    const before = await env.DB.prepare(
+      `SELECT distance_km, behavior_score, harsh_brake_count, max_decel_ms2, sample_count
+       FROM drives WHERE id = ?1`,
+    ).bind(id).first();
+    await compressOldHistory(env, {});
+    const after = await env.DB.prepare(
+      `SELECT distance_km, behavior_score, harsh_brake_count, max_decel_ms2, sample_count
+       FROM drives WHERE id = ?1`,
+    ).bind(id).first();
+    expect(after).toEqual(before);
+  });
+
+  it("is idempotent — the marker stops a second pass re-reading it", async () => {
+    const id = await insertDrive(NOW - 120 * DAY);
+    const first: Record<string, unknown> = {};
+    await compressOldHistory(env, first);
+    const afterFirst = await routeLength(id);
+
+    const second: Record<string, unknown> = {};
+    await compressOldHistory(env, second);
+    expect(await routeLength(id)).toBe(afterFirst);
+    expect(second.compressed_drives).toBeUndefined();
   });
 });

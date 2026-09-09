@@ -510,6 +510,19 @@ export function tierForAge(ageS: number): Tier {
 }
 
 /**
+ * Widen one rule for an age tier, honouring its ceiling. Exported for callers
+ * that supply their own rule rather than the registry's — the drive-route pass
+ * overrides a couple of fields whose parked-time semantics do not hold inside a
+ * drive, and those overrides must still age like everything else.
+ */
+export function scaleForTier(rule: Rule, tier: Tier): Rule {
+  if (tier === "hot" || rule.kind !== "analog") return rule;
+  const widened = rule.epsilon * TIER_SCALE[tier].epsilon;
+  const epsilon = rule.maxEpsilon !== undefined ? Math.min(widened, rule.maxEpsilon) : widened;
+  return { ...rule, epsilon };
+}
+
+/**
  * The rule for a field at a given age.
  *
  * Only the epsilon scales — there are no per-field anchors left to widen. It

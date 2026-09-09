@@ -116,6 +116,28 @@ describe("hot-path query plans (D1 rows_read)", () => {
       [VIN, NOW, NOW - DAY],
     );
     expect(fullScans(windows, "drives")).toBe(false);
+
+    // The drive-route pass: its backlog rides idx_drives_compact, and both the
+    // route read and the route delete ride idx_positions_drive.
+    const backlog = await plan(
+      env,
+      `SELECT id, start_ts FROM drives
+       WHERE status = 'complete' AND start_ts < ?1
+         AND (positions_compacted IS NULL OR positions_compacted = 0)
+       ORDER BY start_ts ASC LIMIT ?2`,
+      [NOW, 25],
+    );
+    expect(backlog).toContain("idx_drives_compact");
+
+    const route = await plan(env, `SELECT ts, lat, lon FROM positions WHERE drive_id = ?1 ORDER BY ts ASC`, [1]);
+    expect(fullScans(route, "positions")).toBe(false);
+
+    const routeDelete = await plan(
+      env,
+      `DELETE FROM positions WHERE drive_id = ?1 AND ts NOT IN (1,2,3)`,
+      [1],
+    );
+    expect(fullScans(routeDelete, "positions")).toBe(false);
   });
 
   it("the /health liveness probe seeks the newest sample instead of grouping every one", async () => {
