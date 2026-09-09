@@ -1366,6 +1366,50 @@ function batteryStage(activity: string | null, chargingState: string | null): st
   return chargingState != null && CONNECTED_NOT_CHARGING.has(chargingState) ? "connected" : "resting";
 }
 
+interface StageSegment {
+  stage: string;
+  start_ts: number;
+  end_ts: number;
+}
+
+/**
+ * Collapse per-sample stage labels into contiguous spans.
+ *
+ * Each span runs to the START of the next one, not to its own last sample. The
+ * interval between two consecutive samples belongs to whichever stage was in
+ * effect during it, and closing a span on its own last row throws every one of
+ * those intervals away: invisible at a 60s cadence, but hours a day once the
+ * series is thinned, and a stage that appears exactly once would contribute
+ * literally zero seconds. `stage_hours.resting` is a headline number on the
+ * battery timeline, so that under-count is not cosmetic.
+ *
+ * The final span has nothing after it to bound it and so ends at its last
+ * sample — what the car did after the newest reading is not knowable here.
+ */
+function stageSegments(
+  rows: { ts: number; activity: string | null; charging_state: string | null }[],
+): StageSegment[] {
+  const segments: StageSegment[] = [];
+  for (const r of rows) {
+    const stage = batteryStage(r.activity, r.charging_state);
+    const last = segments[segments.length - 1];
+    if (last && last.stage === stage) {
+      last.end_ts = r.ts;
+      continue;
+    }
+    if (last) last.end_ts = r.ts;
+    segments.push({ stage, start_ts: r.ts, end_ts: r.ts });
+  }
+  return segments;
+}
+
+/** Seconds per stage, keyed for the four stages batteryStage can return. */
+function stageSecondsOf(segments: StageSegment[]): Record<string, number> {
+  const secs: Record<string, number> = { driving: 0, charging: 0, resting: 0, connected: 0 };
+  for (const seg of segments) secs[seg.stage] = (secs[seg.stage] ?? 0) + (seg.end_ts - seg.start_ts);
+  return secs;
+}
+
 /**
  * SoC over time with a driving/charging/resting/connected-not-charging stage per
  * sample, for a stock-chart-style timeline (issue: click-through from Overview's
@@ -1388,15 +1432,8 @@ export async function getBatteryTimeline(env: Env, vin: string, hours = 24): Pro
     .all<{ ts: number; soc: number; activity: string | null; charging_state: string | null }>();
   const rows = rs.results ?? [];
 
-  const segments: { stage: string; start_ts: number; end_ts: number }[] = [];
-  const stageSeconds: Record<string, number> = { driving: 0, charging: 0, resting: 0, connected: 0 };
-  for (const r of rows) {
-    const stage = batteryStage(r.activity, r.charging_state);
-    const last = segments[segments.length - 1];
-    if (last && last.stage === stage) last.end_ts = r.ts;
-    else segments.push({ stage, start_ts: r.ts, end_ts: r.ts });
-  }
-  for (const seg of segments) stageSeconds[seg.stage] = (stageSeconds[seg.stage] ?? 0) + (seg.end_ts - seg.start_ts);
+  const segments = stageSegments(rows);
+  const stageSeconds = stageSecondsOf(segments);
 
   const step = Math.max(1, Math.ceil(rows.length / 2000));
   const points = rows
@@ -1477,15 +1514,8 @@ export async function getTimelineChart(
   const rows = rs.results ?? [];
 
   // Stage layer — same derivation as the Battery timeline screen.
-  const segments: { stage: string; start_ts: number; end_ts: number }[] = [];
-  const stageSeconds: Record<string, number> = { driving: 0, charging: 0, resting: 0, connected: 0 };
-  for (const r of rows) {
-    const stage = batteryStage(r.activity, r.charging_state);
-    const last = segments[segments.length - 1];
-    if (last && last.stage === stage) last.end_ts = r.ts;
-    else segments.push({ stage, start_ts: r.ts, end_ts: r.ts });
-  }
-  for (const seg of segments) stageSeconds[seg.stage] = (stageSeconds[seg.stage] ?? 0) + (seg.end_ts - seg.start_ts);
+  const segments = stageSegments(rows);
+  const stageSeconds = stageSecondsOf(segments);
 
   // Activity-aware downsampling: independent strides for driving vs everything
   // else, plus every activity-boundary row so stage edges stay sharp.
@@ -1764,25 +1794,62 @@ export async function getVampireDrain(env: Env, vin: string, days = 30): Promise
   };
 
   const rows = rs.results ?? [];
-  const MIN_GAP_S = 30 * 60; // 30 min
-  const MAX_GAP_S = 3 * 86400; // ignore multi-day telemetry outages
+  /** Ignore a pause too short to measure drain across. */
+  const MIN_IDLE_S = 30 * 60;
+  /** A hole longer than this means we genuinely lost track; split the run there
+   *  rather than attribute the missing days' drain to it. */
+  const MAX_DATA_GAP_S = 3 * 86400;
   interface Span { start_ts: number; end_ts: number; hours: number; soc_lost: number; pct_per_day: number; kind: "sleep" | "awake" }
   const spans: Span[] = [];
   let totalLoss = 0;
   let totalHours = 0;
   const bucket = { sleep: { hours: 0, soc_lost: 0 }, awake: { hours: 0, soc_lost: 0 } };
 
-  for (let i = 1; i < rows.length; i++) {
-    const a = rows[i - 1]!;
-    const b = rows[i]!;
+  // Measure each contiguous IDLE RUN end to end, rather than each adjacent pair
+  // of samples.
+  //
+  // The pairwise version was silently coupled to sampling density. It required
+  // 30 min < dt < 3 days between two ADJACENT rows, so with the poller at ~300s
+  // essentially nothing qualified and the function was really only measuring
+  // drain across telemetry outages — a small, unrepresentative slice of the
+  // parked time. Thin the series and the opposite happens: every pair suddenly
+  // clears 30 min and the population explodes. Either way the answer moves
+  // because of how the data was STORED, and it feeds a push alert.
+  //
+  // A run is bounded by a non-idle sample or by a real data gap, and its drain
+  // is the SoC difference between its two endpoints. That is the same number
+  // however densely the interior was sampled, which is exactly the property
+  // needed before any of these rows can be compressed.
+  type Row = (typeof rows)[number];
+  const isIdle = (r: Row): boolean =>
+    r.activity !== "driving" &&
+    r.activity !== "charging" &&
+    !CHARGING.has(String(r.charging_state ?? ""));
+
+  const runs: Row[][] = [];
+  let current: Row[] = [];
+  for (const r of rows) {
+    if (!isIdle(r)) {
+      if (current.length) runs.push(current);
+      current = [];
+      continue;
+    }
+    const prev = current[current.length - 1];
+    if (prev && r.ts - prev.ts > MAX_DATA_GAP_S) {
+      runs.push(current);
+      current = [];
+    }
+    current.push(r);
+  }
+  if (current.length) runs.push(current);
+
+  for (const run of runs) {
+    const a = run[0]!;
+    const b = run[run.length - 1]!;
     const dt = b.ts - a.ts;
-    const idle =
-      a.activity !== "driving" && a.activity !== "charging" &&
-      b.activity !== "driving" && b.activity !== "charging" &&
-      !CHARGING.has(String(a.charging_state ?? "")) && !CHARGING.has(String(b.charging_state ?? ""));
-    if (!idle || dt < MIN_GAP_S || dt > MAX_GAP_S) continue;
+    if (dt < MIN_IDLE_S) continue;
     const loss = a.soc - b.soc;
-    if (loss <= 0) continue; // charging/regen or noise
+    if (loss <= 0) continue; // net gain over the run: regen, a top-up, or noise
     const hours = dt / 3600;
     const kind: Span["kind"] = asleepOverlap(a.ts, b.ts) / dt >= 0.5 ? "sleep" : "awake";
     totalLoss += loss;
@@ -1810,10 +1877,76 @@ export async function getVampireDrain(env: Env, vin: string, days = 30): Promise
 // Derived: battery pack health (brick voltages, module temps, isolation)
 // ---------------------------------------------------------------------------
 
+/**
+ * How much time one stored sample is allowed to stand for.
+ *
+ * The last sample before a multi-day telemetry outage must not claim to
+ * represent those days — that would let a single reading dominate a 90-day
+ * average.
+ *
+ * THIS MUST STAY LARGER THAN THE WIDEST COMPRESSION ANCHOR (compress.ts, 20h at
+ * the cold tier). A gap between two anchored samples is real elapsed time during
+ * which the value genuinely held; capping below the anchor interval truncates
+ * every one of them and silently under-weights exactly the samples compression
+ * chose to keep. Setting the cap under the anchor cost four percentage points on
+ * a boolean that was true 96% of the day, which is how this coupling was found.
+ *
+ * 26h therefore clears the widest anchor with room to spare, while still
+ * truncating a genuine multi-day outage to "we stopped knowing".
+ */
+const DWELL_CAP_S = 26 * 3600;
+
+/** Dwell for a series with a single sample — nothing to infer a cadence from. */
+const DWELL_LONE_SAMPLE_S = 60;
+
+/**
+ * SQL: turn a `raw` CTE of (ts, v, next_ts) into a `dwell` CTE of (v, dt).
+ *
+ * The caller defines `raw` with a LEAD(ts) as next_ts. This adds the weighting.
+ *
+ * THE TRAILING SAMPLE is the subtle part. It has no successor, so its dwell has
+ * to be assumed, and the assumption cannot be "until now": a field whose last
+ * reading was a month ago would then swamp every earlier sample put together.
+ * That is not hypothetical — it would make the weak-brick check flag whichever
+ * brick happened to be lowest when telemetry last stopped.
+ *
+ * So the final sample stands for the SHORTER of one typical sampling interval
+ * (the mean interior gap) and the time actually elapsed since it, then clamped
+ * by DWELL_CAP_S. Both bounds are needed and each covers the other's blind spot:
+ * elapsed-time alone lets a stale series' last reading swamp everything before
+ * it, and the mean gap alone over-attributes on a sparse series whose last
+ * sample is only seconds old.
+ *
+ * That combination has a useful property: on an evenly-sampled series every
+ * dwell is identical, so the time-weighted answer collapses to exactly the row
+ * average this code used to compute. Weighting can therefore only change results
+ * where the spacing is genuinely uneven — which is precisely where the row
+ * average was wrong.
+ */
+const DWELL_FROM_RAW = `
+     span AS (SELECT MIN(ts) AS t0, MAX(ts) AS t1, COUNT(*) AS n FROM raw),
+     dwell AS (
+       SELECT r.v,
+              MIN(COALESCE(r.next_ts - r.ts,
+                           MIN(CASE WHEN s.n > 1 THEN (s.t1 - s.t0) / (s.n - 1)
+                                    ELSE ${DWELL_LONE_SAMPLE_S} END,
+                               MAX(CAST(strftime('%s','now') AS INTEGER) - r.ts, 0))),
+                  ${DWELL_CAP_S}) AS dt
+       FROM raw r CROSS JOIN span s
+     )`;
+
 const PACK_REST_MAX_A = 2; // |pack_current| below this = pack electrically at rest
 const PACK_LOAD_MIN_A = 20; // |pack_current| at/above this = genuinely under load
 const WEAK_BRICK_MIN_SHARE = 0.6;
-const WEAK_BRICK_MIN_SAMPLES = 10;
+/**
+ * Minimum observed dwell before the weak-brick share means anything.
+ *
+ * The old guard was "at least 10 rows". 600s is the same bar expressed in time
+ * at the 60s cadence NumBrickVoltageMin streams on, so the sensitivity of the
+ * check is unchanged — this rewrite is about how the share is weighted, not
+ * about how eager the hint should be.
+ */
+const WEAK_BRICK_MIN_OBSERVED_S = 600;
 
 /** Avg same-timestamp brick spread (mV) over [fromTs, toTs), rest samples only. */
 async function restSpreadAvgMv(env: Env, vin: string, fromTs: number, toTs: number): Promise<{ avg_mv: number | null; samples: number }> {
@@ -1829,10 +1962,24 @@ async function restSpreadAvgMv(env: Env, vin: string, fromTs: number, toTs: numb
   return { avg_mv: rs?.avg_mv ?? null, samples: rs?.n ?? 0 };
 }
 
+/**
+ * Time-weighted mean isolation resistance over [fromTs, toTs).
+ *
+ * This feeds a first-week vs last-week comparison whose `declining` verdict
+ * tells the owner to book a service inspection. A plain row average makes that
+ * a comparison between two differently-sampled populations, so a change in
+ * telemetry density alone could raise the alarm. Weighting by dwell removes
+ * that degree of freedom. Dwell is clamped to the window so a sample near the
+ * end cannot borrow time from beyond it.
+ */
 async function isolationAvgKohm(env: Env, vin: string, fromTs: number, toTs: number): Promise<number | null> {
   const rs = await env.DB.prepare(
-    `SELECT AVG(value_num) AS avg FROM telemetry_events
-     WHERE vin = ?1 AND field = 'isolation_resistance' AND ts >= ?2 AND ts < ?3 AND value_num IS NOT NULL`,
+    `WITH raw AS (
+       SELECT ts, value_num AS v, LEAD(ts) OVER (ORDER BY ts) AS next_ts
+       FROM telemetry_events
+       WHERE vin = ?1 AND field = 'isolation_resistance' AND ts >= ?2 AND ts < ?3 AND value_num IS NOT NULL
+     ),${DWELL_FROM_RAW}
+     SELECT SUM(v * dt) / NULLIF(SUM(dt), 0) AS avg FROM dwell WHERE dt > 0`,
   )
     .bind(vin, fromTs, toTs)
     .first<{ avg: number | null }>();
@@ -1944,19 +2091,33 @@ export async function getPackHealth(env: Env, vin: string, days = 30): Promise<u
   for (const i of isoRs.results ?? []) rowFor(i.day).min_isolation_kohm = round(i.min_kohm, 0);
   const daily = [...byDay.values()].sort((a, b) => a.day.localeCompare(b.day));
 
+  // Which brick spends the most TIME as the pack's lowest, not which brick was
+  // written most often. Counting rows inverts this signal outright: a
+  // consistently weak brick barely ever changes, so it emits almost no events,
+  // while a brick that flickers in and out of last place emits one every time.
+  // Row counting would therefore hide the genuinely weak cell and flag a noisy
+  // healthy one — and the whole point of the check is to catch the former.
   const brickRs = await env.DB.prepare(
-    `SELECT CAST(value_num AS INTEGER) AS brick, COUNT(*) AS n
-     FROM telemetry_events WHERE vin = ?1 AND field = 'brick_v_min_num' AND ts >= ?2 AND value_num IS NOT NULL
-     GROUP BY brick ORDER BY n DESC`,
+    `WITH raw AS (
+       SELECT ts, CAST(value_num AS INTEGER) AS v, LEAD(ts) OVER (ORDER BY ts) AS next_ts
+       FROM telemetry_events
+       WHERE vin = ?1 AND field = 'brick_v_min_num' AND ts >= ?2 AND value_num IS NOT NULL
+     ),
+${DWELL_FROM_RAW}
+     SELECT v AS brick, SUM(dt) AS secs FROM dwell WHERE dt > 0 GROUP BY v ORDER BY secs DESC`,
   )
     .bind(vin, sinceTs)
-    .all<{ brick: number; n: number }>();
+    .all<{ brick: number; secs: number }>();
   const brickRows = brickRs.results ?? [];
-  const brickTotal = brickRows.reduce((s, r) => s + r.n, 0);
+  const brickTotal = brickRows.reduce((s, r) => s + r.secs, 0);
   const topBrick = brickRows[0];
   const weakBrick =
-    topBrick && brickTotal >= WEAK_BRICK_MIN_SAMPLES && topBrick.n / brickTotal > WEAK_BRICK_MIN_SHARE
-      ? { number: topBrick.brick, share: round(topBrick.n / brickTotal, 3), samples: brickTotal }
+    topBrick && brickTotal >= WEAK_BRICK_MIN_OBSERVED_S && topBrick.secs / brickTotal > WEAK_BRICK_MIN_SHARE
+      ? {
+          number: topBrick.brick,
+          share: round(topBrick.secs / brickTotal, 3),
+          observed_hours: round(brickTotal / 3600, 1),
+        }
       : null;
 
   // First vs last 7 days of the window (they overlap when days < 14 — the
@@ -2010,7 +2171,7 @@ export async function getPackHealth(env: Env, vin: string, days = 30): Promise<u
   }
   if (weakBrick) {
     bits.push(
-      `Brick ${weakBrick.number} reads lowest in ${Math.round(weakBrick.share * 100)}% of samples — a consistently-lowest brick is the earliest weak-cell signal, worth keeping an eye on.`,
+      `Brick ${weakBrick.number} reads lowest ${Math.round(weakBrick.share * 100)}% of the time — a consistently-lowest brick is the earliest weak-cell signal, worth keeping an eye on.`,
     );
   }
   if (isoRef != null) {
@@ -2507,16 +2668,34 @@ export async function getTirePressures(env: Env, vin: string, days = 30): Promis
       latestTs = Math.max(latestTs, lastPt[0]);
     }
     // Least-squares slope in bar/week (needs ≥5 points across ≥2 days).
-    if (pts.length >= 5 && pts[pts.length - 1]![0] - pts[0]![0] >= 2 * 86400) {
-      const n = pts.length;
-      const mx = pts.reduce((s, p) => s + p[0], 0) / n;
-      const my = pts.reduce((s, p) => s + p[1], 0) / n;
-      let sxx = 0, sxy = 0;
-      for (const p of pts) {
-        sxx += (p[0] - mx) ** 2;
-        sxy += (p[0] - mx) * (p[1] - my);
+    // Two points is enough BECAUSE of compression, not in spite of it: the door
+    // only reduces a run to its endpoints when a straight line between them
+    // reproduces every sample it dropped to within epsilon. Demanding five would
+    // refuse to trend exactly the signals that are cleanest. The two-day span
+    // guard below is what still stops a trend being fitted to a moment.
+    if (pts.length >= 2 && pts[pts.length - 1]![0] - pts[0]![0] >= 2 * 86400) {
+      // Duration-weighted least squares, not ordinary least squares. The series
+      // is already unevenly spaced today — telemetry only sends on change — so
+      // an unweighted fit is pulled toward whichever periods happen to be
+      // sampled most densely. For TPMS that means the hot, high-pressure
+      // samples taken while driving outvote the long cold nights that make up
+      // most of the elapsed time. The slow-leak push alert fires off this
+      // slope, so the bias is a false-alarm generator, and thinning the series
+      // would make it worse in a way that is impossible to see from the output.
+      const nowTs = Math.floor(Date.now() / 1000);
+      const wt = pts.map((p, i) => Math.max(0, Math.min((pts[i + 1]?.[0] ?? nowTs) - p[0], DWELL_CAP_S)));
+      const total = wt.reduce((s, x) => s + x, 0);
+      if (total > 0) {
+        const mx = pts.reduce((s, p, i) => s + wt[i]! * p[0], 0) / total;
+        const my = pts.reduce((s, p, i) => s + wt[i]! * p[1], 0) / total;
+        let sxx = 0, sxy = 0;
+        for (let i = 0; i < pts.length; i++) {
+          const p = pts[i]!;
+          sxx += wt[i]! * (p[0] - mx) ** 2;
+          sxy += wt[i]! * (p[0] - mx) * (p[1] - my);
+        }
+        if (sxx > 0) trend[w] = round((sxy / sxx) * 7 * 86400, 3);
       }
-      if (sxx > 0) trend[w] = round((sxy / sxx) * 7 * 86400, 3);
     }
   }
 
@@ -2601,22 +2780,45 @@ export async function getChargeTaperCurve(env: Env, vin: string): Promise<unknow
 // Small EAV aggregate helpers shared by the safety/climate derivations below.
 // ---------------------------------------------------------------------------
 
-async function boolFieldFraction(env: Env, vin: string, field: string, sinceTs: number): Promise<{ frac_on: number | null; samples: number }> {
+/**
+ * Time-weighted mean of a numeric EAV field: SUM(value * dwell) / SUM(dwell),
+ * where a sample's dwell is the distance to the next one.
+ *
+ * WHY NOT AVG(value_num). Fleet Telemetry only sends a field when it changes,
+ * so the stored series is already unevenly spaced and a plain row average is
+ * already subtly wrong today — a seat heater held on level 3 for two hours
+ * counts once, exactly like a one-second brush against level 1. Per-field
+ * compression makes that error enormous rather than introducing it: a boolean
+ * that is true 99% of the time but toggles as often as it holds would read ~50%.
+ *
+ * Weighting by dwell answers the question the callers actually ask ("what
+ * fraction of the TIME") and is invariant to how densely the series is stored,
+ * which is what lets compression run over these fields at all.
+ *
+ * For booleans the same expression is the fraction of time the field was on,
+ * so this replaces the former boolFieldFraction and avgFieldValue both.
+ */
+async function dwellWeightedAvg(
+  env: Env,
+  vin: string,
+  field: string,
+  sinceTs: number,
+): Promise<{ avg: number | null; samples: number; observed_s: number }> {
+  const nowTs = Math.floor(Date.now() / 1000);
   const rs = await env.DB.prepare(
-    `SELECT AVG(value_num) AS frac_on, COUNT(*) AS n FROM telemetry_events WHERE vin = ?1 AND field = ?2 AND ts >= ?3 AND value_num IS NOT NULL`,
+    `WITH raw AS (
+       SELECT ts, value_num AS v, LEAD(ts) OVER (ORDER BY ts) AS next_ts
+       FROM telemetry_events
+       WHERE vin = ?1 AND field = ?2 AND ts >= ?3 AND value_num IS NOT NULL
+     ),${DWELL_FROM_RAW}
+     SELECT SUM(v * dt) / NULLIF(SUM(dt), 0) AS avg,
+            COUNT(*) AS n,
+            COALESCE(SUM(dt), 0) AS observed_s
+     FROM dwell WHERE dt > 0`,
   )
     .bind(vin, field, sinceTs)
-    .first<{ frac_on: number | null; n: number }>();
-  return { frac_on: rs?.frac_on ?? null, samples: rs?.n ?? 0 };
-}
-
-async function avgFieldValue(env: Env, vin: string, field: string, sinceTs: number): Promise<{ avg: number | null; samples: number }> {
-  const rs = await env.DB.prepare(
-    `SELECT AVG(value_num) AS avg, COUNT(*) AS n FROM telemetry_events WHERE vin = ?1 AND field = ?2 AND ts >= ?3 AND value_num IS NOT NULL`,
-  )
-    .bind(vin, field, sinceTs)
-    .first<{ avg: number | null; n: number }>();
-  return { avg: rs?.avg ?? null, samples: rs?.n ?? 0 };
+    .first<{ avg: number | null; n: number; observed_s: number }>();
+  return { avg: rs?.avg ?? null, samples: rs?.n ?? 0, observed_s: rs?.observed_s ?? 0 };
 }
 
 /** Counts 0→1 transitions of a boolean field — "how many times did this fire", not "how long was it on". */
@@ -2633,11 +2835,22 @@ async function countActivations(env: Env, vin: string, field: string, sinceTs: n
   return rs?.n ?? 0;
 }
 
+/**
+ * The setting held for the most TIME, not the one written to most often.
+ *
+ * Ordering by COUNT(*) answers "which value was transitioned into most", which
+ * is a different question and the wrong one: a setting left alone for months
+ * loses to one that flickers.
+ */
 async function mostCommonEnumValue(env: Env, vin: string, field: string, sinceTs: number): Promise<string | null> {
+  const nowTs = Math.floor(Date.now() / 1000);
   const rs = await env.DB.prepare(
-    `SELECT value_text AS v FROM telemetry_events
-     WHERE vin = ?1 AND field = ?2 AND ts >= ?3 AND value_text IS NOT NULL AND value_text != ''
-     GROUP BY value_text ORDER BY COUNT(*) DESC LIMIT 1`,
+    `WITH raw AS (
+       SELECT ts, value_text AS v, LEAD(ts) OVER (ORDER BY ts) AS next_ts
+       FROM telemetry_events
+       WHERE vin = ?1 AND field = ?2 AND ts >= ?3 AND value_text IS NOT NULL AND value_text != ''
+     ),${DWELL_FROM_RAW}
+     SELECT v FROM dwell WHERE dt > 0 GROUP BY v ORDER BY SUM(dt) DESC LIMIT 1`,
   )
     .bind(vin, field, sinceTs)
     .first<{ v: string }>();
@@ -2653,7 +2866,7 @@ export async function getSafetyFeatureStats(env: Env, vin: string, days = 90): P
   await ensureSchema(env);
   const sinceTs = Math.floor(Date.now() / 1000) - days * 86400;
   const [aeb, blindSpotChimes, laneDeparture, fcwSensitivity] = await Promise.all([
-    boolFieldFraction(env, vin, "aeb_off", sinceTs),
+    dwellWeightedAvg(env, vin, "aeb_off", sinceTs),
     countActivations(env, vin, "blind_spot_chime", sinceTs),
     mostCommonEnumValue(env, vin, "lane_departure", sinceTs),
     mostCommonEnumValue(env, vin, "fcw_sensitivity", sinceTs),
@@ -2669,7 +2882,7 @@ export async function getSafetyFeatureStats(env: Env, vin: string, days = 90): P
     vin,
     days,
     has_data: true,
-    aeb_disabled_pct: aeb.frac_on != null ? round(aeb.frac_on * 100, 1) : null,
+    aeb_disabled_pct: aeb.avg != null ? round(aeb.avg * 100, 1) : null,
     aeb_samples: aeb.samples,
     blind_spot_chime_count: blindSpotChimes,
     lane_departure_setting: laneDeparture,
@@ -2687,12 +2900,12 @@ export async function getClimateHabits(env: Env, vin: string, days = 90): Promis
   await ensureSchema(env);
   const sinceTs = Math.floor(Date.now() / 1000) - days * 86400;
   const [autoL, autoR, heaterL, heaterR, coolFL, coolFR] = await Promise.all([
-    boolFieldFraction(env, vin, "auto_seat_climate_l", sinceTs),
-    boolFieldFraction(env, vin, "auto_seat_climate_r", sinceTs),
-    avgFieldValue(env, vin, "seat_heater_l", sinceTs),
-    avgFieldValue(env, vin, "seat_heater_r", sinceTs),
-    avgFieldValue(env, vin, "seat_cool_fl", sinceTs),
-    avgFieldValue(env, vin, "seat_cool_fr", sinceTs),
+    dwellWeightedAvg(env, vin, "auto_seat_climate_l", sinceTs),
+    dwellWeightedAvg(env, vin, "auto_seat_climate_r", sinceTs),
+    dwellWeightedAvg(env, vin, "seat_heater_l", sinceTs),
+    dwellWeightedAvg(env, vin, "seat_heater_r", sinceTs),
+    dwellWeightedAvg(env, vin, "seat_cool_fl", sinceTs),
+    dwellWeightedAvg(env, vin, "seat_cool_fr", sinceTs),
   ]);
   const totalSamples = autoL.samples + autoR.samples + heaterL.samples + heaterR.samples + coolFL.samples + coolFR.samples;
   if (!totalSamples) {
@@ -2706,8 +2919,8 @@ export async function getClimateHabits(env: Env, vin: string, days = 90): Promis
     vin,
     days,
     has_data: true,
-    auto_climate_left_pct: autoL.frac_on != null ? round(autoL.frac_on * 100, 0) : null,
-    auto_climate_right_pct: autoR.frac_on != null ? round(autoR.frac_on * 100, 0) : null,
+    auto_climate_left_pct: autoL.avg != null ? round(autoL.avg * 100, 0) : null,
+    auto_climate_right_pct: autoR.avg != null ? round(autoR.avg * 100, 0) : null,
     avg_seat_heater_left: heaterL.avg != null ? round(heaterL.avg, 1) : null,
     avg_seat_heater_right: heaterR.avg != null ? round(heaterR.avg, 1) : null,
     seat_heater_divergence: heaterL.avg != null && heaterR.avg != null ? round(Math.abs(heaterL.avg - heaterR.avg), 2) : null,

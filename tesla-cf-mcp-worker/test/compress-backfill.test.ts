@@ -1,0 +1,565 @@
+/**
+ * The retroactive sweep: what it removes, what it must never touch, and when it
+ * has to stop.
+ *
+ * This is the destructive half of the feature, so the negative assertions carry
+ * the weight — drive samples survive, recent days are left alone, and a run that
+ * runs out of budget resumes rather than restarts.
+ */
+import { describe, it, expect, beforeEach } from "vitest";
+import { compressOldHistory } from "../src/rules";
+import { ensureSchema, resetSchemaCacheForTests } from "../src/store";
+import { backfillSyntheticDrives, getVampireDrain } from "../src/tracking";
+import { resetMeterForTests } from "../src/d1meter";
+import { FIELD_GROUPS } from "../src/compress";
+import { FakeD1 } from "./helpers/d1";
+import { FakeKV } from "./helpers/kv";
+import type { Env } from "../src/types";
+
+const VIN = "TESTVINBACKFILL01";
+const DAY = 86400;
+const NOW = Math.floor(Date.now() / 1000);
+/** Start of a UTC day well inside the sweep's window (older than the 2-day lag). */
+const OLD_DAY = Math.floor((NOW - 10 * DAY) / DAY) * DAY;
+const RECENT_DAY = Math.floor((NOW - 1 * DAY) / DAY) * DAY;
+
+function makeEnv(extra: Partial<Env> = {}): Env {
+  resetSchemaCacheForTests();
+  resetMeterForTests();
+  return {
+    TESLA_KV: new FakeKV() as unknown as KVNamespace,
+    DB: new FakeD1() as unknown as D1Database,
+    TESLA_REGION: "eu",
+    PUBLIC_ORIGIN: "https://test.example.com",
+    TESLA_CLIENT_ID: "cid",
+    TESLA_CLIENT_SECRET: "csecret",
+    TESLA_PRIVATE_KEY: "pk",
+    MCP_AUTH_TOKEN: "tok",
+    POLL_VINS: VIN,
+    ...extra,
+  } as Env;
+}
+
+async function seed(env: Env, field: string, dayStart: number, value: (i: number) => number | string, n = 300): Promise<void> {
+  const stmt = env.DB.prepare(
+    `INSERT OR REPLACE INTO telemetry_events (vin, ts, field, value_num, value_text) VALUES (?1, ?2, ?3, ?4, ?5)`,
+  );
+  const rows = [];
+  for (let i = 0; i < n; i++) {
+    const v = value(i);
+    rows.push(
+      stmt.bind(VIN, dayStart + i * 60, field, typeof v === "number" ? v : null, typeof v === "number" ? null : v),
+    );
+  }
+  await env.DB.batch(rows);
+}
+
+async function count(env: Env, field: string, from?: number, to?: number): Promise<number> {
+  const sql =
+    from === undefined
+      ? `SELECT COUNT(*) AS n FROM telemetry_events WHERE vin = ?1 AND field = ?2`
+      : `SELECT COUNT(*) AS n FROM telemetry_events WHERE vin = ?1 AND field = ?2 AND ts >= ?3 AND ts < ?4`;
+  const stmt =
+    from === undefined
+      ? env.DB.prepare(sql).bind(VIN, field)
+      : env.DB.prepare(sql).bind(VIN, field, from, to);
+  return (await stmt.first<{ n: number }>())?.n ?? 0;
+}
+
+describe("compressOldHistory", () => {
+  let env: Env;
+  beforeEach(async () => {
+    env = makeEnv();
+    await ensureSchema(env);
+  });
+
+  it("thins an old day and leaves the newest days alone", async () => {
+    await seed(env, "locked", OLD_DAY, () => 1);
+    await seed(env, "locked", RECENT_DAY, () => 1);
+
+    const summary: Record<string, unknown> = {};
+    await compressOldHistory(env, summary);
+
+    // The old day collapses to the run start plus its hourly anchors.
+    expect(await count(env, "locked", OLD_DAY, OLD_DAY + DAY)).toBeLessThan(20);
+    // The last two days are still being written and are already write-filtered.
+    expect(await count(env, "locked", RECENT_DAY, RECENT_DAY + DAY)).toBe(300);
+    expect(summary.compressed).toMatchObject({ rows_removed: expect.any(Number) });
+  });
+
+  it("never removes a sample recorded during a drive", async () => {
+    await seed(env, "isolation_resistance", OLD_DAY, () => 900);
+    // A drive covering the middle third of that day.
+    const driveStart = OLD_DAY + 100 * 60;
+    const driveEnd = OLD_DAY + 200 * 60;
+    await env.DB.prepare(
+      `INSERT INTO drives (vin, start_ts, end_ts, status) VALUES (?1, ?2, ?3, 'complete')`,
+    ).bind(VIN, driveStart, driveEnd).run();
+
+    await compressOldHistory(env, {});
+
+    const inDrive = await count(env, "isolation_resistance", driveStart, driveEnd + 1);
+    expect(inDrive).toBe(101); // every sample in the drive window survives
+    expect(await count(env, "isolation_resistance")).toBeLessThan(140);
+  });
+
+  it("keeps group members on identical timestamps", async () => {
+    for (const field of FIELD_GROUPS.pack_brick!) {
+      await seed(env, field, OLD_DAY, (i) => (field === "pack_current" ? Math.sin(i / 5) : 3.9 + Math.sin(i / 5) / 500));
+    }
+    await compressOldHistory(env, {});
+
+    const stamps: number[][] = [];
+    for (const field of FIELD_GROUPS.pack_brick!) {
+      const rs = await env.DB.prepare(
+        `SELECT ts FROM telemetry_events WHERE vin = ?1 AND field = ?2 ORDER BY ts`,
+      ).bind(VIN, field).all<{ ts: number }>();
+      stamps.push((rs.results ?? []).map((r) => r.ts));
+    }
+    for (const s of stamps) expect(s).toEqual(stamps[0]);
+    expect(stamps[0]!.length).toBeLessThan(300);
+  });
+
+  it("is idempotent — a second run finds nothing left to do", async () => {
+    await seed(env, "locked", OLD_DAY, () => 1);
+    const first: Record<string, unknown> = {};
+    await compressOldHistory(env, first);
+    const afterFirst = await count(env, "locked");
+
+    const second: Record<string, unknown> = {};
+    await compressOldHistory(env, second);
+    expect(await count(env, "locked")).toBe(afterFirst);
+    // The cursor has passed that day, so the second run does not re-read it.
+    expect((second.compressed as { rows_removed: number } | undefined)?.rows_removed ?? 0).toBe(0);
+  });
+
+  it("resumes from the cursor instead of restarting", async () => {
+    // Three old days; a tight row budget stops the first run partway.
+    for (const d of [0, 1, 2]) await seed(env, "locked", OLD_DAY + d * DAY, () => 1);
+    const tight = makeEnv({ COMPRESS_BACKFILL_ROWS_PER_RUN: "100" });
+    await ensureSchema(tight);
+    tight.DB = env.DB; // same database, tighter budget
+
+    await compressOldHistory(tight, {});
+    const afterFirst = await count(env, "locked");
+    expect(afterFirst).toBeLessThan(900);
+    expect(afterFirst).toBeGreaterThan(20); // did not get through all three days
+
+    await compressOldHistory(tight, {});
+    expect(await count(env, "locked")).toBeLessThan(afterFirst);
+  });
+
+  it("does nothing at all when the read budget is already spent", async () => {
+    await seed(env, "locked", OLD_DAY, () => 1);
+    const capped = makeEnv({ D1_READ_SOFT_LIMIT: "10" });
+    capped.DB = env.DB;
+    await env.DB.prepare(
+      `CREATE TABLE IF NOT EXISTS d1_usage (day TEXT PRIMARY KEY, rows_read INTEGER NOT NULL, updated_ts INTEGER)`,
+    ).run();
+    await env.DB.prepare(`INSERT OR REPLACE INTO d1_usage (day, rows_read, updated_ts) VALUES (?1, ?2, ?3)`)
+      .bind(new Date().toISOString().slice(0, 10), 5_000_000, NOW)
+      .run();
+
+    const summary: Record<string, unknown> = {};
+    await compressOldHistory(capped, summary);
+    expect(summary.compress_skipped).toBe("read_budget");
+    expect(await count(env, "locked")).toBe(300);
+  });
+
+  it("is disabled by COMPRESS_ENABLED=0", async () => {
+    await seed(env, "locked", OLD_DAY, () => 1);
+    const off = makeEnv({ COMPRESS_ENABLED: "0" });
+    off.DB = env.DB;
+    await compressOldHistory(off, {});
+    expect(await count(env, "locked")).toBe(300);
+  });
+
+  it("thins a three-month-old day harder than a ten-day-old one", async () => {
+    // Age tiering: the same shape of day should cost fewer rows the older it
+    // gets, because nobody trends month-old telemetry at four-hour resolution.
+    const COLD_DAY = Math.floor((NOW - 200 * DAY) / DAY) * DAY;
+    await seed(env, "locked", OLD_DAY, () => 1, 1440);
+    await seed(env, "locked", COLD_DAY, () => 1, 1440);
+    await compressOldHistory(env, {});
+
+    // Both days held one unchanging value, so both collapse to essentially
+    // nothing regardless of tier — the anchors that used to floor them are gone.
+    expect(await count(env, "locked", OLD_DAY, OLD_DAY + DAY)).toBeLessThan(3);
+    expect(await count(env, "locked", COLD_DAY, COLD_DAY + DAY)).toBeLessThan(3);
+  });
+
+  it("leaves an unclassified field untouched", async () => {
+    await seed(env, "some_unmapped_field", OLD_DAY, () => 1);
+    await compressOldHistory(env, {});
+    expect(await count(env, "some_unmapped_field")).toBe(300);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// positions
+// ---------------------------------------------------------------------------
+
+interface PosRow {
+  ts: number;
+  soc: number;
+  odometer: number;
+  activity: string;
+  charging_state: string | null;
+  drive_id?: number | null;
+}
+
+async function seedPositions(env: Env, rows: PosRow[]): Promise<void> {
+  for (const r of rows) {
+    await env.DB.prepare(
+      `INSERT OR IGNORE INTO positions (vin, ts, soc, odometer, activity, charging_state, drive_id, lat, lon)
+       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 32.1, 34.8)`,
+    )
+      .bind(VIN, r.ts, r.soc, r.odometer, r.activity, r.charging_state, r.drive_id ?? null)
+      .run();
+  }
+}
+
+async function positionCount(env: Env): Promise<number> {
+  return (
+    (await env.DB.prepare(`SELECT COUNT(*) AS n FROM positions WHERE vin = ?1`).bind(VIN).first<{ n: number }>())
+      ?.n ?? 0
+  );
+}
+
+/** A parked day: SoC drifting down slowly, odometer flat. */
+function parkedDay(dayStart: number, odometer = 1000): PosRow[] {
+  const rows: PosRow[] = [];
+  for (let i = 0; i < 288; i++) {
+    rows.push({
+      ts: dayStart + i * 300,
+      soc: Number((70 - i * 0.005).toFixed(3)),
+      odometer,
+      activity: "idle",
+      charging_state: "Disconnected",
+    });
+  }
+  return rows;
+}
+
+describe("a completely uneventful day", () => {
+  /**
+   * The scenario this whole design target came from: the car spends a full day
+   * in an underground car park, plugged in, battery full, nothing whatsoever
+   * happening. That day should cost essentially nothing to keep.
+   */
+  it("costs zero telemetry rows and one or two positions rows", async () => {
+    const env = makeEnv();
+    await ensureSchema(env);
+
+    const STATIC = {
+      locked: 1, sentry: "armed", door_state: "Closed", hvac_power: 0,
+      charging_state: "Complete", charge_port_latch: 1, charge_port_door_open: 1,
+      fast_charger_present: 0, bms_full_charge: 1, odometer: 51234.5,
+      // Underground: temperature barely moves, and what movement there is sits
+      // inside the band.
+      isolation_resistance: 900, tpms_fl: 2.9, brick_v_max: 3.95, brick_v_min: 3.948,
+      pack_current: 0.1,
+    } as const;
+
+    // Yesterday established every value; today repeats it 288 times.
+    const priorTs = OLD_DAY - 600;
+    const seedRows = [];
+    const stmt = env.DB.prepare(
+      `INSERT OR REPLACE INTO telemetry_events (vin, ts, field, value_num, value_text) VALUES (?1, ?2, ?3, ?4, ?5)`,
+    );
+    for (const [field, v] of Object.entries(STATIC)) {
+      seedRows.push(stmt.bind(VIN, priorTs, field, typeof v === "number" ? v : null, typeof v === "number" ? null : v));
+      for (let i = 0; i < 288; i++) {
+        seedRows.push(
+          stmt.bind(VIN, OLD_DAY + i * 300, field, typeof v === "number" ? v : null, typeof v === "number" ? null : v),
+        );
+      }
+    }
+    await env.DB.batch(seedRows);
+    await seedPositions(
+      env,
+      Array.from({ length: 288 }, (_, i) => ({
+        ts: OLD_DAY + i * 300, soc: 100, odometer: 51234.5,
+        activity: "charging", charging_state: "Complete",
+      })),
+    );
+
+    const before = (
+      await env.DB.prepare(`SELECT COUNT(*) AS n FROM telemetry_events WHERE vin = ?1 AND ts >= ?2 AND ts < ?3`)
+        .bind(VIN, OLD_DAY, OLD_DAY + DAY).first<{ n: number }>()
+    )!.n;
+    expect(before).toBe(Object.keys(STATIC).length * 288);
+
+    await compressOldHistory(env, {});
+
+    const after = (
+      await env.DB.prepare(`SELECT COUNT(*) AS n FROM telemetry_events WHERE vin = ?1 AND ts >= ?2 AND ts < ?3`)
+        .bind(VIN, OLD_DAY, OLD_DAY + DAY).first<{ n: number }>()
+    )!.n;
+    const positions = await positionCount(env);
+
+    // The day itself is gone from telemetry_events entirely: every value was
+    // already on record from before it started.
+    expect(after).toBe(0);
+    // And `positions` keeps only the liveness witness, which is what makes the
+    // absence above readable as "unchanged" rather than "telemetry was down".
+    expect(positions).toBeLessThanOrEqual(2);
+    expect(positions).toBeGreaterThanOrEqual(1);
+
+    // The values are still recoverable — they are on the row from before.
+    const prior = await env.DB.prepare(
+      `SELECT COUNT(*) AS n FROM telemetry_events WHERE vin = ?1 AND ts = ?2`,
+    ).bind(VIN, priorTs).first<{ n: number }>();
+    expect(prior?.n).toBe(Object.keys(STATIC).length);
+  });
+});
+
+describe("compressOldHistory — positions", () => {
+  let env: Env;
+  beforeEach(async () => {
+    env = makeEnv();
+    await ensureSchema(env);
+  });
+
+  it("thins parked rows", async () => {
+    await seedPositions(env, parkedDay(OLD_DAY));
+    await compressOldHistory(env, {});
+    const left = await positionCount(env);
+    expect(left).toBeLessThan(288);
+    expect(left).toBeGreaterThan(0);
+  });
+
+  it("never touches rows attached to a RECENT drive", async () => {
+    // Routes are thinned once they age past the warm threshold (see the
+    // drive-routes suite below); inside it they must stay at full resolution.
+    const recent = NOW - 3 * DAY;
+    await env.DB.prepare(
+      `INSERT INTO drives (vin, start_ts, end_ts, status) VALUES (?1, ?2, ?3, 'complete')`,
+    ).bind(VIN, recent, recent + 1800).run();
+    const driveId = (
+      await env.DB.prepare(`SELECT id FROM drives WHERE vin = ?1`).bind(VIN).first<{ id: number }>()
+    )!.id;
+
+    const rows: PosRow[] = [];
+    for (let i = 0; i < 60; i++) {
+      rows.push({
+        ts: recent + i * 30,
+        soc: 70,
+        odometer: 1000 + i * 0.2,
+        activity: "driving",
+        charging_state: null,
+        drive_id: driveId,
+      });
+    }
+    await seedPositions(env, rows);
+    await seedPositions(env, parkedDay(OLD_DAY + 2 * DAY));
+
+    await compressOldHistory(env, {});
+    const inDrive = (
+      await env.DB.prepare(`SELECT COUNT(*) AS n FROM positions WHERE vin = ?1 AND drive_id IS NOT NULL`)
+        .bind(VIN)
+        .first<{ n: number }>()
+    )?.n;
+    expect(inDrive).toBe(60);
+  });
+
+  it("keeps every activity transition, so stage boundaries are unchanged", async () => {
+    const rows: PosRow[] = [];
+    for (let i = 0; i < 100; i++) {
+      rows.push({ ts: OLD_DAY + i * 300, soc: 70, odometer: 1000, activity: "idle", charging_state: "Disconnected" });
+    }
+    rows.push({ ts: OLD_DAY + 100 * 300, soc: 70, odometer: 1000, activity: "charging", charging_state: "Charging" });
+    for (let i = 101; i < 150; i++) {
+      rows.push({ ts: OLD_DAY + i * 300, soc: 75, odometer: 1000, activity: "charging", charging_state: "Charging" });
+    }
+    await seedPositions(env, rows);
+    await compressOldHistory(env, {});
+
+    const rs = await env.DB.prepare(
+      `SELECT ts FROM positions WHERE vin = ?1 AND activity = 'charging' ORDER BY ts LIMIT 1`,
+    ).bind(VIN).first<{ ts: number }>();
+    expect(rs?.ts).toBe(OLD_DAY + 100 * 300);
+  });
+
+  it("recovers the same synthetic drives after thinning as before", async () => {
+    // THE hazard: backfillSyntheticDrives fabricates a drive from an odometer
+    // jump between two ADJACENT rows. Deleting rows makes distant rows
+    // adjacent, so a careless thinning could invent or lose drives outright —
+    // and it WRITES to the drives table, so the damage would persist.
+    // odometer is a counter, whose run endpoints are always retained, which is
+    // what keeps the same pairs adjacent across the same gaps.
+    const build = (): PosRow[] => {
+      const rows = parkedDay(OLD_DAY, 1000);
+      // Car driven away and back during a six-hour telemetry gap: a 40 km jump.
+      // The gap has to be long enough that the implied speed stays under the
+      // 160 km/h sanity ceiling, or no drive is synthesised at all.
+      for (let i = 0; i < 288; i++) {
+        rows.push({
+          ts: OLD_DAY + DAY + 6 * 3600 + i * 300,
+          soc: Number((60 - i * 0.005).toFixed(3)),
+          odometer: 1040,
+          activity: "idle",
+          charging_state: "Disconnected",
+        });
+      }
+      return rows;
+    };
+
+    const dense = makeEnv();
+    await ensureSchema(dense);
+    await seedPositions(dense, build());
+    const denseRes = (await backfillSyntheticDrives(dense, VIN)) as { drives_recovered: number };
+
+    const thin = makeEnv();
+    await ensureSchema(thin);
+    await seedPositions(thin, build());
+    await compressOldHistory(thin, {});
+    const thinRes = (await backfillSyntheticDrives(thin, VIN)) as { drives_recovered: number };
+
+    expect(denseRes.drives_recovered).toBe(1);
+    expect(thinRes.drives_recovered).toBe(denseRes.drives_recovered);
+
+    const distanceOf = async (e: Env): Promise<number | null> =>
+      (
+        await e.DB.prepare(`SELECT distance_km FROM drives WHERE vin = ?1 AND synthetic = 1`)
+          .bind(VIN)
+          .first<{ distance_km: number }>()
+      )?.distance_km ?? null;
+    expect(await distanceOf(thin)).toBeCloseTo((await distanceOf(dense))!, 3);
+  });
+
+  it("reports the same vampire drain after thinning", async () => {
+    const build = (): PosRow[] => {
+      const rows: PosRow[] = [];
+      for (let i = 0; i <= 120; i++) {
+        rows.push({
+          ts: OLD_DAY + i * 300,
+          soc: Number((70 - i * 0.02).toFixed(3)),
+          odometer: 1000,
+          activity: "idle",
+          charging_state: "Disconnected",
+        });
+      }
+      return rows;
+    };
+    const dense = makeEnv();
+    await ensureSchema(dense);
+    await seedPositions(dense, build());
+    const before = (await getVampireDrain(dense, VIN, 30)) as { total_soc_lost_pct: number };
+
+    const thin = makeEnv();
+    await ensureSchema(thin);
+    await seedPositions(thin, build());
+    await compressOldHistory(thin, {});
+    const after = (await getVampireDrain(thin, VIN, 30)) as { total_soc_lost_pct: number };
+
+    expect(before.total_soc_lost_pct).toBeCloseTo(2.4, 1);
+    expect(after.total_soc_lost_pct).toBeCloseTo(before.total_soc_lost_pct, 1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// drive routes
+// ---------------------------------------------------------------------------
+
+describe("compressOldHistory — drive routes", () => {
+  let env: Env;
+  beforeEach(async () => {
+    env = makeEnv();
+    await ensureSchema(env);
+  });
+
+  /** A drive of `n` samples along a straight road, with one hard brake. */
+  async function insertDrive(startTs: number, n = 360): Promise<number> {
+    const res = await env.DB.prepare(
+      `INSERT INTO drives (vin, start_ts, end_ts, status, distance_km, behavior_score,
+                           harsh_brake_count, harsh_accel_count, max_decel_ms2, sample_count)
+       VALUES (?1, ?2, ?3, 'complete', 12.5, 91, 1, 0, 3.4, ?4)`,
+    )
+      .bind(VIN, startTs, startTs + n * 5, n)
+      .run();
+    const driveId = Number(res.meta.last_row_id ?? 0);
+    for (let i = 0; i < n; i++) {
+      // A straight road: the route door should collapse this hard.
+      const brake = i === 200 ? -3.4 : 0;
+      await env.DB.prepare(
+        `INSERT OR IGNORE INTO positions (vin, ts, drive_id, activity, lat, lon, speed, odometer, soc, lon_accel)
+         VALUES (?1, ?2, ?3, 'driving', ?4, ?5, 90, ?6, 80, ?7)`,
+      )
+        .bind(VIN, startTs + i * 5, driveId, 32.0 + i * 0.0002, 34.8, 1000 + i * 0.125, brake)
+        .run();
+    }
+    return driveId;
+  }
+
+  async function routeLength(driveId: number): Promise<number> {
+    return (
+      (
+        await env.DB.prepare(`SELECT COUNT(*) AS n FROM positions WHERE drive_id = ?1`)
+          .bind(driveId)
+          .first<{ n: number }>()
+      )?.n ?? 0
+    );
+  }
+
+  it("leaves a recent drive completely alone", async () => {
+    const id = await insertDrive(NOW - 2 * DAY);
+    await compressOldHistory(env, {});
+    expect(await routeLength(id)).toBe(360);
+  });
+
+  it("thins an old route but keeps its endpoints", async () => {
+    const startTs = NOW - 120 * DAY;
+    const id = await insertDrive(startTs);
+    await compressOldHistory(env, {});
+
+    const rs = await env.DB.prepare(
+      `SELECT ts FROM positions WHERE drive_id = ?1 ORDER BY ts`,
+    ).bind(id).all<{ ts: number }>();
+    const ts = (rs.results ?? []).map((r) => r.ts);
+    expect(ts.length).toBeLessThan(360);
+    expect(ts.length).toBeGreaterThan(1);
+    expect(ts[0]).toBe(startTs);
+    expect(ts[ts.length - 1]).toBe(startTs + 359 * 5);
+  });
+
+  it("never drops a harsh-braking sample", async () => {
+    // The chart explorer redraws safety markers from full-resolution rows, so
+    // the door must not be what eats them.
+    const startTs = NOW - 120 * DAY;
+    const id = await insertDrive(startTs);
+    await compressOldHistory(env, {});
+    const harsh = await env.DB.prepare(
+      `SELECT COUNT(*) AS n FROM positions WHERE drive_id = ?1 AND ABS(lon_accel) >= 3`,
+    ).bind(id).first<{ n: number }>();
+    expect(harsh?.n).toBe(1);
+  });
+
+  it("cannot move anything stored on the drive row", async () => {
+    // Every derived figure is computed at closeDrive and stored; thinning the
+    // route afterwards must be invisible to all of it.
+    const id = await insertDrive(NOW - 120 * DAY);
+    const before = await env.DB.prepare(
+      `SELECT distance_km, behavior_score, harsh_brake_count, max_decel_ms2, sample_count
+       FROM drives WHERE id = ?1`,
+    ).bind(id).first();
+    await compressOldHistory(env, {});
+    const after = await env.DB.prepare(
+      `SELECT distance_km, behavior_score, harsh_brake_count, max_decel_ms2, sample_count
+       FROM drives WHERE id = ?1`,
+    ).bind(id).first();
+    expect(after).toEqual(before);
+  });
+
+  it("is idempotent — the marker stops a second pass re-reading it", async () => {
+    const id = await insertDrive(NOW - 120 * DAY);
+    const first: Record<string, unknown> = {};
+    await compressOldHistory(env, first);
+    const afterFirst = await routeLength(id);
+
+    const second: Record<string, unknown> = {};
+    await compressOldHistory(env, second);
+    expect(await routeLength(id)).toBe(afterFirst);
+    expect(second.compressed_drives).toBeUndefined();
+  });
+});

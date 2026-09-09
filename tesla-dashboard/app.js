@@ -5,7 +5,7 @@ import { destroyMaps, renderPointMap, renderRouteMap, renderLifetimeMap, createR
 // Bump on every change to this dashboard (UI, features, or the /data/*
 // endpoints it depends on) and add a matching entry to CHANGELOG.md — see
 // the versioning policy in the repo's CLAUDE.md. Shown in the sidebar footer.
-const APP_VERSION = "1.25.2";
+const APP_VERSION = "1.26.0";
 
 const root = document.getElementById("app");
 let shellBound = false; // guards one-time attach of the root click handler + sync timer
@@ -244,6 +244,7 @@ const NAV = [
   { label: "Charging", items: [["ch", "Charges"], ["cs", "Charging stats"]] },
   { label: "Battery", items: [["bh", "Battery health"], ["pr", "Predictions"], ["vd", "Vampire drain"]] },
   { label: "Data", items: [["tc", "Chart explorer"], ["tf", "Telemetry fields"]] },
+  { label: "Automation", items: [["au", "⚡ Automations"]] },
 ];
 
 const TITLES = {
@@ -252,6 +253,7 @@ const TITLES = {
   tl: ["Timeline", "drives, charges & sleep/wake"],
   st: ["Statistics", "last 12 months"],
   al: ["Alerts", "budget, watchdog & automation notices"],
+  au: ["Automations", "notify me when the car does something"],
   dr: ["Drives", ""],
   dv: ["Drivers", "behaviour & risk scoring"],
   pl: ["Places", "saved locations & suggestions"],
@@ -490,6 +492,16 @@ function renderShell() {
   // would stack duplicate handlers and timers.
   if (!shellBound) {
     root.addEventListener("click", onRootClick);
+    // The Automations trigger picker swaps its conditional field (minutes /
+    // battery %) and its hint when the selection changes. `change` rather than
+    // the delegated click handler, so keyboard selection works too.
+    root.addEventListener("change", (ev) => {
+      if (ev.target?.id !== "tm-au-when") return;
+      const editingId = document.querySelector("[data-action='au-save']")?.dataset.id || null;
+      // Re-render with whatever is currently typed so switching trigger doesn't
+      // discard the webhook URLs or cooldown the user already entered.
+      openModal(automationModalHtml(automationFromModal(editingId), editingId));
+    });
     root.addEventListener("contextmenu", onRootContextMenu);
     setInterval(tickSyncLabel, 1000);
     document.addEventListener("keydown", (ev) => {
@@ -698,6 +710,33 @@ function onRootClick(e) {
     setNavOpen(false);
     return;
   }
+  // --- Automations screen ------------------------------------------------
+  if (action === "au-new") {
+    openModal(automationModalHtml(null));
+    return;
+  } else if (action === "au-edit") {
+    const rule = (state.cache.automations || []).find((r) => r.id === t.dataset.id);
+    if (rule) openModal(automationModalHtml(rule, rule.id));
+    return;
+  } else if (action === "au-save") {
+    saveAutomationFromModal(t.dataset.id || null);
+    return;
+  } else if (action === "au-toggle") {
+    const rule = (state.cache.automations || []).find((r) => r.id === t.dataset.id);
+    if (!rule) return;
+    data.saveAutomation({ ...rule, enabled: rule.enabled === false })
+      .then(() => { state.cache.automations = null; return showScreen(); })
+      .catch(() => {});
+    return;
+  } else if (action === "au-delete") {
+    const rule = (state.cache.automations || []).find((r) => r.id === t.dataset.id);
+    if (!rule || !confirm(`Delete "${automationLabel(rule)}"?`)) return;
+    data.deleteAutomation(rule.id)
+      .then(() => { state.cache.automations = null; return showScreen(); })
+      .catch(() => {});
+    return;
+  }
+
   if (action === "nav") {
     state.screen = t.dataset.screen;
     state.openDriveId = null;
@@ -1089,6 +1128,8 @@ function skeletonHtml(screen) {
       return `<div style="max-width:760px;">${skel("height:12px;width:120px;margin-bottom:12px;")}${table(6)}</div>`;
     case "al":
       return table(9);
+    case "au":
+      return `<div class="tm-flex-row" style="gap:8px;margin-bottom:12px;">${skel("height:30px;width:150px;border-radius:999px;")}</div>${table(4)}`;
     case "st":
       return `${metrics}${chart}${chart}${table(6)}`;
     case "dr":
@@ -1138,6 +1179,7 @@ async function showScreen() {
       case "tl": await renderTimeline(); break;
       case "st": await renderStatistics(); break;
       case "al": await renderAlerts(); break;
+      case "au": await renderAutomations(); break;
       case "dr": await renderDrives(); break;
       case "dv": await renderDrivers(); break;
       case "pl": await renderPlaces(); break;
@@ -1331,6 +1373,205 @@ async function refreshAlertsBadge() {
   updateAlertsBadge(alerts.filter((a) => a.ts > seen).length);
 }
 
+// ---------------------------------------------------------------------------
+// Automations — create the rules that notify you when the car does something.
+//
+// Scope note: /data/automations is FULL-scope on the worker, unlike every
+// other /data route a read-scope device token can reach. A rule can actuate
+// the car (geofence on_enter runs commands) and its notify[] URLs usually
+// carry a token, so a shared dashboard link deliberately gets 403 here. The
+// screen says so plainly rather than showing a misleading empty list.
+//
+// This screen only authors NOTIFICATION rules. The worker refuses command
+// payloads on this route outright; rules that actuate the car are set through
+// the MCP tool, where the full-scope bearer is used deliberately.
+// ---------------------------------------------------------------------------
+
+/** The triggers this screen can author, in the order they're offered. */
+const AUTOMATION_TRIGGERS = [
+  { when: "drive_started", label: "Car starts driving", hint: "Fires on the parked → driving edge." },
+  { when: "drive_ended", label: "Car parks", hint: "Fires when a drive ends — including when it ends on a charger." },
+  {
+    when: "approaching_destination",
+    label: "Approaching the navigation destination",
+    hint: "Uses the car's own ETA, so it accounts for traffic. Only fires when a route is active.",
+    field: { key: "minutes_before", label: "Minutes before arrival", def: 5, min: 1, max: 60 },
+  },
+  { when: "charging_started", label: "Charging starts", hint: "" },
+  { when: "charging_stopped", label: "Charging stops", hint: "" },
+  {
+    when: "soc_below",
+    label: "Battery drops below a level",
+    hint: "Fires on the downward crossing, once per cooldown.",
+    field: { key: "threshold", label: "Battery %", def: 20, min: 1, max: 100 },
+  },
+  { when: "sentry_event", label: "Sentry Mode is triggered", hint: "Someone near the car, or an impact." },
+  { when: "door_unlocked_while_away", label: "Unlocked away from home", hint: "" },
+  { when: "tire_pressure_drop", label: "A tyre loses pressure", hint: "" },
+  { name: "port_open_not_plugged", when: "port_open_not_plugged", label: "Charge port left open", hint: "Open with no cable for 10+ minutes." },
+];
+
+const triggerMeta = (when) => AUTOMATION_TRIGGERS.find((t) => t.when === when) || null;
+
+/** Human label for a rule row — falls back to the raw `when` for MCP-authored rules. */
+function automationLabel(rule) {
+  if (rule.type === "geofence") return `Enters/leaves ${rule.name || "a place"}`;
+  const meta = triggerMeta(rule.when);
+  if (!meta) return String(rule.when || rule.type || "rule").replace(/_/g, " ");
+  const f = meta.field;
+  const v = f ? rule[f.key] ?? f.def : null;
+  if (rule.when === "approaching_destination") return `Approaching destination (${v} min before)`;
+  if (rule.when === "soc_below") return `Battery drops below ${v}%`;
+  return meta.label;
+}
+
+async function renderAutomations() {
+  let rules = null;
+  let forbidden = false;
+  let missing = false;
+  try {
+    rules = await cached("automations", () => data.automations());
+  } catch (e) {
+    if (e?.status === 403) forbidden = true;
+    else if (e?.status === 404) missing = true;
+    else throw e;
+  }
+
+  if (forbidden) {
+    return setContent(emptyHtml(
+      "Automations need the full-access token",
+      "This device is signed in with a read-only token. Rules can act on the car and their webhook URLs carry credentials, so the worker only serves them to the full-access token.",
+    ));
+  }
+  if (missing) {
+    return setContent(emptyHtml(
+      "Automations aren't available on the deployed worker",
+      "This screen reads /data/automations, which the live worker doesn't answer yet. Deploy the worker and this screen starts working.",
+    ));
+  }
+
+  const list = Array.isArray(rules) ? rules : [];
+  const mine = list.filter((r) => !r.vin || r.vin === vin());
+  const rows = mine.map((r) => {
+    const on = r.enabled !== false;
+    return `
+      <div class="tm-table-row no-click" style="grid-template-columns:1fr 92px 84px;align-items:center;">
+        <div style="min-width:0;">
+          <div style="font-size:13.5px;">${esc(automationLabel(r))}</div>
+          <div class="tm-mono" style="font-size:11px;color:var(--faint);margin-top:2px;">
+            ${esc(r.id || "")}${r.notify?.length ? ` · ${r.notify.length} webhook${r.notify.length === 1 ? "" : "s"}` : ""}
+          </div>
+        </div>
+        <div>
+          <button class="tm-pill ${on ? "tm-pill-good" : "tm-pill-chip"}" data-action="au-toggle" data-id="${esc(r.id)}"
+                  title="${on ? "Disable" : "Enable"} this rule">${on ? "On" : "Off"}</button>
+        </div>
+        <div style="text-align:right;">
+          <button class="tm-icon-btn" data-action="au-edit" data-id="${esc(r.id)}" title="Edit">✎</button>
+          <button class="tm-icon-btn" data-action="au-delete" data-id="${esc(r.id)}" title="Delete">🗑</button>
+        </div>
+      </div>`;
+  }).join("");
+
+  setContent(`
+    <div class="tm-flex-row" style="gap:8px;flex-wrap:wrap;margin-bottom:12px;">
+      <button class="tm-chip-btn" data-action="au-new">+ New automation</button>
+      <span class="tm-pill tm-pill-chip">${mine.length} rule${mine.length === 1 ? "" : "s"}</span>
+    </div>
+    ${mine.length ? `<div class="tm-card tm-table-wrap"><div style="min-width:520px;">${rows}
+      <div class="tm-foot-note">Alerts arrive as push notifications on every device that enabled them on the Alerts screen, plus any webhook URLs you add. Rules that <em>act</em> on the car (unlock, climate, charging) are set through Claude, not here.</div>
+    </div></div>` : emptyHtml("No automations yet", "Create one to get notified when the car starts driving, parks, or is approaching your destination.")}
+  `);
+}
+
+/**
+ * Modal body. `rule` seeds the fields (an existing rule, or the in-progress
+ * draft when the trigger picker re-renders); `editingId` is the id being
+ * edited, or null when creating. They are separate because changing the
+ * trigger re-renders with a draft that is NOT an edit.
+ */
+function automationModalHtml(rule, editingId = null) {
+  const editing = !!editingId;
+  const when = rule?.when || AUTOMATION_TRIGGERS[0].when;
+  const meta = triggerMeta(when);
+  const f = meta?.field;
+  const fieldVal = f ? (rule?.[f.key] ?? f.def) : null;
+  return `
+    <div class="tm-modal-head">
+      <div class="tm-modal-title">${editing ? "Edit automation" : "New automation"}</div>
+      <button class="tm-icon-btn" data-action="modal-close" title="Close">✕</button>
+    </div>
+    <div style="padding:0 4px;">
+      <div class="tm-stat-label" style="margin-bottom:5px;">When</div>
+      <select id="tm-au-when" class="tm-gate-input" style="width:100%;">
+        ${AUTOMATION_TRIGGERS.map((t) => `<option value="${esc(t.when)}"${t.when === when ? " selected" : ""}>${esc(t.label)}</option>`).join("")}
+      </select>
+      <div class="tm-foot-note" style="margin:6px 0 14px;">${esc(meta?.hint || "")}</div>
+
+      ${f ? `
+        <div class="tm-stat-label" style="margin-bottom:5px;">${esc(f.label)}</div>
+        <input id="tm-au-field" class="tm-gate-input" style="width:100%;" type="number" min="${f.min}" max="${f.max}" value="${esc(String(fieldVal))}" style="margin-bottom:14px;">
+      ` : ""}
+
+      <div class="tm-stat-label" style="margin-bottom:5px;">Also POST to these URLs (optional, one per line)</div>
+      <textarea id="tm-au-notify" class="tm-gate-input" style="width:100%;" rows="2"
+        placeholder="https://ntfy.sh/my-topic">${esc((rule?.notify || []).join("\n"))}</textarea>
+      <div class="tm-foot-note" style="margin:6px 0 14px;">
+        Push notifications go to your devices automatically. Add a URL here only if you also want ntfy, Pushover or Home Assistant to receive it.
+      </div>
+
+      <div class="tm-stat-label" style="margin-bottom:5px;">Don't repeat within (minutes)</div>
+      <input id="tm-au-cooldown" class="tm-gate-input" style="width:100%;" type="number" min="0" max="1440"
+             value="${esc(String(rule?.cooldown_minutes ?? ""))}" placeholder="trigger default" style="margin-bottom:6px;">
+
+      <div id="tm-au-error" class="tm-foot-note" style="color:var(--bad);min-height:16px;"></div>
+    </div>
+    <div class="tm-flex-row" style="gap:10px;justify-content:flex-end;margin-top:16px;">
+      <button class="tm-link-btn" data-action="modal-close">Cancel</button>
+      <button class="tm-chip-btn" data-action="au-save"${editing ? ` data-id="${esc(editingId)}"` : ""}>Save</button>
+    </div>`;
+}
+
+/** Reads the modal fields into a rule document the worker will accept. */
+function automationFromModal(id) {
+  const when = document.getElementById("tm-au-when")?.value;
+  const meta = triggerMeta(when);
+  const rule = {
+    // A stable id keeps edit-in-place working; the worker upserts on it.
+    id: id || `ui-${when}-${Date.now().toString(36)}`,
+    type: "alert",
+    vin: vin(),
+    when,
+    enabled: true,
+  };
+  if (meta?.field) {
+    const raw = Number(document.getElementById("tm-au-field")?.value);
+    if (Number.isFinite(raw)) rule[meta.field.key] = raw;
+  }
+  const notify = (document.getElementById("tm-au-notify")?.value || "")
+    .split("\n").map((u) => u.trim()).filter(Boolean);
+  if (notify.length) rule.notify = notify;
+  const cd = Number(document.getElementById("tm-au-cooldown")?.value);
+  if (Number.isFinite(cd) && cd >= 0 && document.getElementById("tm-au-cooldown")?.value !== "") {
+    rule.cooldown_minutes = cd;
+  }
+  return rule;
+}
+
+async function saveAutomationFromModal(id) {
+  const err = document.getElementById("tm-au-error");
+  try {
+    await data.saveAutomation(automationFromModal(id));
+    closeModal();
+    state.cache.automations = null;
+    await showScreen();
+  } catch (e) {
+    // Show the worker's own message (e.g. the command-payload refusal) rather
+    // than closing the modal and losing what the user typed.
+    if (err) err.textContent = e?.message || "Couldn't save this rule.";
+  }
+}
+
 // --- Web Push (the "Push notifications" card at the top of the screen) -----
 // The worker's cron delivers undelivered alert-log entries as encrypted push
 // messages (webpush.ts); this side owns the browser half: permission +
@@ -1366,7 +1607,7 @@ function pushCardHtml(p) {
     unsupported: "This browser doesn't expose web push. On iPhone/iPad it's only available to the installed app — Share → Add to Home Screen (iOS 16.4+), then open it from the Home Screen and enable push here.",
     denied: "Notifications are blocked for this site. Re-enable them in the browser's site settings (or, for the installed app, in the system notification settings), then reload.",
     "no-server": "The deployed worker can't push yet — either it predates /data/push-vapid-key (redeploy it) or it has no VAPID keys: run node scripts/gen-vapid-keys.mjs in tesla-cf-mcp-worker/, set the two printed secrets, and redeploy.",
-    enabled: "Enabled on this device — undelivered alerts (budget, watchdog, rule errors) arrive as notifications on the worker's next automation tick (~15 min), even with the dashboard closed.",
+    enabled: "Enabled on this device — automation alerts (car started driving, parked, approaching your destination…) arrive the moment they fire, even with the dashboard closed. Budget and watchdog notices arrive on the worker's next automation tick.",
     off: "Get the worker's alerts — budget warnings, watchdog notices, rule errors — as notifications on this device, even when the dashboard is closed.",
   };
   const button =

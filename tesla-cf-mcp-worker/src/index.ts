@@ -23,6 +23,10 @@
  *   GET  /data/export/{drives.csv,charges.csv,drive.gpx}
  *   GET  /data/push-vapid-key / POST /data/push-{subscribe,unsubscribe}
  *                                 — Web Push for alert notifications (webpush.ts)
+ *   GET/POST/DELETE /data/automations  (FULL scope only) — rule CRUD for the
+ *                                 dashboard's Automations screen. Stricter than
+ *                                 the rest of /data because rules can actuate
+ *                                 the car and notify[] URLs carry credentials.
  *   GET  /geocode?q=              — GovMap→Nominatim forward geocode
  *   POST /auth/device-token?label=&vin=   (full) — mint revocable read token
  *   GET  /auth/device-token / POST /auth/revoke-device-token?id=  (full)
@@ -62,7 +66,7 @@ import { getTelemetryFieldStatus, handleIngest } from "./ingest";
 import { handleMcp, SERVER_VERSION } from "./mcp";
 import { pollOnce } from "./poll";
 import { loadCommandKey } from "./protocol";
-import { runCronTick } from "./rules";
+import { deleteAutomation, getAutomations, runCronTick, saveAutomation, type AutomationRule } from "./rules";
 import { ensureSchedulerArmed, PollScheduler } from "./scheduler";
 import { cachedRead, flushMeter, meterD1, readBudget } from "./d1meter";
 import { getAppState, getLatest, knownVins, listAlerts, putAppState, querySeries } from "./store";
@@ -121,7 +125,7 @@ const json = (data: unknown, status = 200): Response =>
  */
 const CORS_HEADERS: Record<string, string> = {
   "access-control-allow-origin": "*",
-  "access-control-allow-methods": "GET, POST, OPTIONS",
+  "access-control-allow-methods": "GET, POST, DELETE, OPTIONS",
   "access-control-allow-headers": "authorization, content-type, mcp-protocol-version, mcp-session-id",
   "access-control-max-age": "86400",
 };
@@ -556,6 +560,55 @@ export default {
       // stop it already detected — into a saved geofence in one step, instead
       // of requiring a separate MCP tool call. Also doubles as the edit route
       // (pass id) for renaming/re-tagging an already-saved location.
+      // --- automations (rule CRUD for the dashboard's Automations screen) ---
+      //
+      // FULL SCOPE, all verbs — deliberately stricter than every other /data
+      // route, which a read-scope device token can reach.
+      //
+      // Reading is gated because a rule's notify[] URLs are credentials in
+      // practice: an ntfy/Pushover/Home-Assistant endpoint usually carries its
+      // token in the URL, and handing those to a shared dashboard link would
+      // leak a write capability on someone else's service.
+      //
+      // Writing is gated because an automation is CODE THAT RUNS AGAINST THE
+      // CAR. geofence.on_enter / alert.actions execute commands, so a rule
+      // author is an actuator author. A read-scope token that could write
+      // rules would be a privilege escalation straight past the read/full
+      // split. On top of that, command payloads are rejected outright here
+      // (see below): the dashboard authors NOTIFICATION rules, and anything
+      // that actuates the vehicle stays on the MCP path where the full-scope
+      // bearer is used directly and deliberately.
+      if (path === "/data/automations") {
+        if (scope !== "full") return json({ error: "forbidden" }, 403);
+        if (request.method === "GET") return json(await getAutomations(env));
+        if (request.method === "POST") {
+          const rule = (await request.json().catch(() => null)) as Record<string, unknown> | null;
+          if (!rule || typeof rule !== "object") return json({ error: "rule body required" }, 400);
+          if (typeof rule.type !== "string" || typeof rule.vin !== "string") {
+            return json({ error: "rule.type and rule.vin are required" }, 400);
+          }
+          // Notification rules only. Anything that can actuate the vehicle is
+          // refused rather than silently stripped, so a caller is never left
+          // believing it saved a rule that acts.
+          for (const key of ["actions", "on_enter", "on_exit"]) {
+            const v = (rule as Record<string, unknown>)[key];
+            if (Array.isArray(v) && v.length > 0) {
+              return json(
+                { error: `${key} is not accepted here — command actions must be set via the MCP set_automation tool` },
+                400,
+              );
+            }
+          }
+          return json(await saveAutomation(env, rule as unknown as AutomationRule));
+        }
+        if (request.method === "DELETE") {
+          const id = url.searchParams.get("id");
+          if (!id) return json({ error: "id query param required" }, 400);
+          return json({ deleted: await deleteAutomation(env, id) });
+        }
+        return json({ error: "method not allowed" }, 405);
+      }
+
       if (path === "/data/save-location" && request.method === "POST") {
         if (scope === null) return json({ error: "unauthorized" }, 401);
         const name = url.searchParams.get("name")?.trim().slice(0, 120);

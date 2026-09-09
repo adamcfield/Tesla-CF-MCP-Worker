@@ -926,8 +926,11 @@ const TOOLS: Tool[] = [
       "solar_surplus (source, start_above_w, stop_below_w, volts, phases, min/max_amps, at{lat,lon,radius_m}), " +
       "scheduled_precondition (time, days, tz_offset_minutes, conditions{outside_temp_below_c, soc_above}, temp_celsius), " +
       "geofence (lat, lon, radius_m, on_enter[], on_exit[] of {command,args}), " +
-      "alert (when: door_unlocked_while_away|soc_below|tire_pressure_drop|charging_started|charging_stopped|unexpected_wake, " +
+      "alert (when: drive_started|drive_ended|approaching_destination (minutes_before, default 5)|" +
+      "door_unlocked_while_away|soc_below|tire_pressure_drop|sentry_event|port_open_not_plugged|" +
+      "charging_started|charging_stopped|unexpected_wake|not_ready_by, " +
       "notify[] webhook URLs). Common fields: vin, enabled, notify, allow_poll, cooldown_minutes. " +
+      "Alerts reach registered Web Push subscriptions immediately as well as any notify[] webhooks. " +
       "Automations can never unlock or open trunks, and never wake a sleeping vehicle. See README for examples.",
     inputSchema: {
       type: "object",

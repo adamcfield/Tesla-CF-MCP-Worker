@@ -1,0 +1,132 @@
+# Deploy the Cloudflare Worker from CI.
+#
+# WHY THIS EXISTS. The worker was supposed to deploy through Cloudflare's
+# native Workers Builds Git integration (see tesla-cf-mcp-worker/README.md).
+# It stopped firing: between 2026-09-01 and 2026-09-07 four merges to main
+# (#70, #71, #72) never reached production, while the account hit D1's
+# free-tier rows_read ceiling and went offline every single day. The tell is
+# runMaintenanceIfDue, which stamps `maintenance` on the automation-tick
+# summary the first time it runs — no tick in six days carried it, so that
+# code was demonstrably never live.
+#
+# The Cloudflare-side integration is opaque from here: it posts no check run,
+# no log, and no failure anywhere visible in the repo. This workflow replaces
+# it with a deploy path that is inspectable (an Actions log), triggerable on
+# demand (workflow_dispatch), and fails LOUDLY when it breaks — which is the
+# property that was actually missing.
+#
+# SETUP — two repository secrets are required (Settings → Secrets and
+# variables → Actions):
+#
+#   CLOUDFLARE_API_TOKEN   Create at dash.cloudflare.com/profile/api-tokens
+#                          using the "Edit Cloudflare Workers" template. Do
+#                          NOT use a Global API Key: that credential can do
+#                          anything to the account, and this repo is public.
+#   CLOUDFLARE_ACCOUNT_ID  Workers & Pages → Account ID (right-hand sidebar).
+#
+# Secrets are never exposed to pull requests from forks, and this workflow
+# deliberately does not trigger on `pull_request` at all — it runs only on
+# pushes to main and on manual dispatch, both of which are gated by write
+# access to the repo.
+#
+# Wrangler reads bindings and vars from wrangler.toml. Worker SECRETS
+# (TESLA_CLIENT_SECRET, MCP_AUTH_TOKEN, …) live on the Cloudflare side and are
+# untouched by a deploy — this workflow neither needs nor sets them.
+#
+# If the native Workers Builds integration is ever repaired, both paths would
+# deploy the same commit; that is harmless (identical artifact), just noisy.
+# Turn one of them off at that point.
+
+name: deploy-worker
+
+on:
+  push:
+    branches: [main]
+    # Mirror the Workers Builds root-directory scoping: dashboard-only or
+    # docs-only commits should not redeploy the worker.
+    paths:
+      - "tesla-cf-mcp-worker/**"
+      - ".github/workflows/deploy-worker.yml"
+  workflow_dispatch: {}
+
+# Least privilege: the job only needs to read the source it deploys.
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-worker
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: tesla-cf-mcp-worker
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22" # test/helpers/d1.ts needs node:sqlite
+          cache: npm
+          cache-dependency-path: tesla-cf-mcp-worker/package-lock.json
+
+      - name: Install
+        run: npm ci
+
+      # The same gate Workers Builds was configured to run. A worker that
+      # fails its own tests must never reach the car.
+      - name: Test
+        run: npm test
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Fail early if the deploy credentials are missing
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          missing=""
+          [ -z "${CLOUDFLARE_API_TOKEN}" ] && missing="$missing CLOUDFLARE_API_TOKEN"
+          [ -z "${CLOUDFLARE_ACCOUNT_ID}" ] && missing="$missing CLOUDFLARE_ACCOUNT_ID"
+          if [ -n "$missing" ]; then
+            echo "::error::Missing repository secret(s):$missing — see the header of .github/workflows/deploy-worker.yml for how to create them."
+            exit 1
+          fi
+
+      - name: Deploy
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: npx wrangler deploy
+
+      # Proves the deploy actually took, rather than trusting that it did —
+      # the exact confusion that let six days pass unnoticed. /health is
+      # unauthenticated for these fields; `d1_reads` sits behind a token and is
+      # checked separately by the tick workflow's watchdog.
+      - name: Verify the worker is serving
+        run: |
+          set -euo pipefail
+          for i in 1 2 3 4 5; do
+            if curl -sS --fail --max-time 30 \
+                "https://tesla-cf-mcp-worker.adamcfield.workers.dev/health" > /tmp/health.json; then
+              cat /tmp/health.json
+              python3 -c '
+          import json, sys
+          b = json.load(open("/tmp/health.json"))
+          print(f"version={b.get(\"version\")} kv={b.get(\"kv\")} d1={b.get(\"d1\")}")
+          # d1 "error" is expected while the daily rows_read cap is spent; that
+          # is a quota state, not a bad deploy, so it must not fail the deploy.
+          if not b.get("ok") and b.get("d1") != "error":
+              sys.exit("health reports not-ok for a reason other than the D1 quota")
+          '
+              exit 0
+            fi
+            echo "health not ready yet (attempt $i) — retrying"
+            sleep 10
+          done
+          echo "::error::/health did not respond after the deploy"
+          exit 1

@@ -26,13 +26,14 @@
 import { generateBrief, generateCoachNote } from "./ai";
 import { getVehicle, getVehicleData } from "./api";
 import { getBudgetCallLog, getBudgetForecast, getBudgetStatus } from "./budget";
-import { pruneReadCache } from "./d1meter";
+import { compressSeries, DEFAULT_MAX_GAP_S, FIELD_GROUPS, FieldRule, Point, registeredFields, ruleFor, Rule, ruleForTier, scaleForTier, Tier, tierForAge, TIER_COLD_AFTER_DAYS, TIER_WARM_AFTER_DAYS, POSITION_HEARTBEAT_S } from "./compress";
+import { cachedRead, pruneReadCache, readBudget } from "./d1meter";
 import * as cmd from "./commands";
 import { applyVehicleData } from "./ingest";
 import { getAppState, getLatest, knownVins, LatestState, logAlert, putAppState, tzOffsetMinutes } from "./store";
 import { createTelemetryConfig } from "./telemetry";
 import { TELEMETRY_CA, TELEMETRY_HOSTNAME, TELEMETRY_PLANS, TELEMETRY_PORT, TelemetryPlanStep } from "./telemetry-plans";
-import { closeStaleSessions, getTirePressures, getVampireDrain, recordConnectivityState } from "./tracking";
+import { closeStaleSessions, deriveActivity, getTirePressures, getVampireDrain, recordConnectivityState } from "./tracking";
 import { Env } from "./types";
 import { listPushSubscriptions, sendWebPush } from "./webpush";
 
@@ -224,7 +225,7 @@ async function dispatchWebhooks(
   data: unknown,
 ): Promise<void> {
   const urls = rule.notify ?? [];
-  let delivered = urls.length === 0;
+  let webhookOk = false;
   for (const url of urls) {
     try {
       const resp = await fetch(url, {
@@ -235,12 +236,52 @@ async function dispatchWebhooks(
         },
         body: JSON.stringify({ rule_id: rule.id, kind, vin: rule.vin, message, data, ts: Math.floor(Date.now() / 1000) }),
       });
-      delivered = delivered || resp.ok;
+      webhookOk = webhookOk || resp.ok;
     } catch {
       // logged below as undelivered
     }
   }
-  await logAlert(env, { vin: rule.vin, ruleId: rule.id, kind, message, payload: data, delivered });
+
+  // Web Push, at FIRE time. Two defects used to make rule alerts unreachable
+  // in the app:
+  //   1. `delivered` was set to `urls.length === 0`, so a rule with no webhook
+  //      URLs was logged as already-delivered — and deliverPendingAlerts only
+  //      ever pushes rows with delivered = 0. Rule alerts therefore produced
+  //      no push at all, only budget/watchdog/rule_error ones did.
+  //   2. Even when a row was pending, the fan-out ran on the automation tick.
+  //      The dashboard advertises "~15 min"; GitHub throttles that schedule to
+  //      5-12 runs a day, so a "car started driving" alert could land hours
+  //      later. Useless for anything event-shaped.
+  // Pushing here makes the ingest path the delivery path: an alert reaches the
+  // phone in the same request that detected it. The tick's pass stays as the
+  // retry for anything still undelivered.
+  let pushOk = false;
+  let hadSubscriptions = false;
+  try {
+    if (env.VAPID_PUBLIC_KEY && env.VAPID_PRIVATE_KEY) {
+      const subs = await listPushSubscriptions(env);
+      hadSubscriptions = subs.length > 0;
+      for (const sub of subs) {
+        if (await sendWebPush(env, sub, { title: `Tesla — ${kind}`, body: message, tag: `${rule.id}:${kind}`, url: "/#al" })) {
+          pushOk = true;
+        }
+      }
+    }
+  } catch {
+    /* push is best-effort; the alert is still logged below */
+  }
+
+  // delivered = it actually reached the user somewhere. When NEITHER channel
+  // is configured the row is marked delivered anyway: leaving it pending would
+  // build a backlog the tick retries forever with nowhere to send it.
+  await logAlert(env, {
+    vin: rule.vin,
+    ruleId: rule.id,
+    kind,
+    message,
+    payload: data,
+    delivered: webhookOk || pushOk || (urls.length === 0 && !hadSubscriptions),
+  });
 }
 
 async function fire(
@@ -438,6 +479,63 @@ async function evalAlert(
     return;
   }
 
+  // --- Drive lifecycle -------------------------------------------------
+  // Edge-triggered off the SAME activity derivation the tracking engine uses
+  // (gear D/R, or speed > 1), so an alert can never disagree with the drive
+  // the dashboard shows. Both sides come from the merged latest-state doc, so
+  // this costs no extra D1 reads.
+  if (when === "drive_started" || when === "drive_ended") {
+    const before = deriveActivity(previous);
+    const after = deriveActivity(current);
+    const started = before !== "driving" && after === "driving";
+    // "ended" is deliberately not "activity === idle": a drive that ends on a
+    // charger goes driving -> charging, and that is still parking.
+    const ended = before === "driving" && after !== "driving";
+    if (when === "drive_started" && started) {
+      if (await underCooldown(env, rule, 2)) return;
+      await fire(env, rule, "alert", `${rule.vin} started driving`, {
+        lat: asNum(current.lat), lon: asNum(current.lon),
+        odometer: asNum(current.odometer), soc: asNum(current.soc),
+      }, rule.actions as Action[] | undefined);
+    } else if (when === "drive_ended" && ended) {
+      if (await underCooldown(env, rule, 2)) return;
+      const dest = typeof current.nav_destination_name === "string" ? current.nav_destination_name : null;
+      await fire(env, rule, "alert", `${rule.vin} parked${dest ? ` at ${dest}` : ""}`, {
+        lat: asNum(current.lat), lon: asNum(current.lon),
+        odometer: asNum(current.odometer), soc: asNum(current.soc),
+        destination: dest, charging: after === "charging",
+      }, rule.actions as Action[] | undefined);
+    }
+    return;
+  }
+
+  // --- Approaching the navigation destination ---------------------------
+  // Uses the car's OWN ETA (MinutesToArrival, already ingested) rather than a
+  // radius around a saved place: it accounts for traffic, and it works for
+  // one-off destinations that were never saved as a geofence. A saved place
+  // you always go to is better served by a `geofence` rule.
+  //
+  // Edge-triggered on the downward crossing so it fires once per approach and
+  // not on every sample inside the window; the cooldown is only a backstop for
+  // an ETA that oscillates across the threshold in traffic.
+  if (when === "approaching_destination") {
+    const minutes = asNum(rule.minutes_before) ?? 5;
+    const before = asNum(previous.nav_minutes_to_arrival);
+    const after = asNum(current.nav_minutes_to_arrival);
+    if (before === undefined || after === undefined) return;
+    if (!(before > minutes && after <= minutes)) return;
+    // A cleared route reports 0; only alert while a route is genuinely active.
+    if (after <= 0 && deriveActivity(current) !== "driving") return;
+    if (await underCooldown(env, rule, 15)) return;
+    const dest = typeof current.nav_destination_name === "string" ? current.nav_destination_name : null;
+    await fire(env, rule, "alert", `${rule.vin} is ~${Math.round(after)} min from ${dest ?? "its destination"}`, {
+      minutes_to_arrival: after, destination: dest,
+      miles_to_arrival: asNum(current.nav_miles_to_arrival),
+      traffic_delay_min: asNum(current.nav_traffic_delay_min),
+    }, rule.actions as Action[] | undefined);
+    return;
+  }
+
   if (when === "charging_started" || when === "charging_stopped") {
     const before = String(previous.charging_state ?? "");
     const after = String(current.charging_state ?? "");
@@ -562,6 +660,7 @@ async function runCronTickInner(env: Env): Promise<Record<string, unknown>> {
   // runMaintenanceIfDue. Both work against ~year-old cutoffs, so a 15-minute
   // cadence bought nothing and cost the D1 rows_read budget every time.
   await runMaintenanceIfDue(env, summary);
+  await runCompressionIfDue(env, summary);
   // Second pass for anything logged later in the tick (ladder steps, rule
   // errors) — the first pass already marked its rows delivered, so this only
   // sends what's genuinely new.
@@ -625,6 +724,14 @@ async function evalAiBrief(env: Env, rule: AutomationRule): Promise<boolean> {
 }
 
 /**
+ * How long the sentinel's trend inputs (30-day TPMS series, 21-day drain
+ * windows) are memoised. Both are week-scale trend detectors with daily
+ * alert cooldowns, so 12h staleness changes nothing they can observe while
+ * cutting their rows_read from 96 recomputes/day to ~2.
+ */
+const SENTINEL_CACHE_TTL_S = 12 * 3600;
+
+/**
  * sentinel rule: statistical-process-control alerts over signals we already
  * compute but never acted on — a slow tyre leak, a phantom-drain regression,
  * abnormal awake-idle drain. Fires through the existing alert/webhook path,
@@ -633,8 +740,20 @@ async function evalAiBrief(env: Env, rule: AutomationRule): Promise<boolean> {
 async function evalSentinel(env: Env, rule: AutomationRule): Promise<boolean> {
   let fired = false;
   // Tyre slow-leak: any wheel losing pressure faster than the threshold/week.
+  // These two derivations read EVERY raw sample in a 21-30 day window (TPMS
+  // sits in the EAV telemetry_events table; drain scans positions) — at stream
+  // cadence that is hundreds of thousands of rows_read per call, and the tick
+  // used to pay it 96 times a day: the 2026-09-01/02 free-tier outages (5M
+  // rows_read/day takes the WHOLE database offline until UTC midnight) were
+  // this loop, not traffic. Both are multi-week trend detectors — a slow tyre
+  // leak and a drain regression move over days — so a 12h-memoised answer
+  // loses nothing, and past the soft read budget cachedRead serves the stale
+  // entry rather than recomputing (stale sentinel beats an offline database).
+  // Recomputes now happen ~2x/day instead of 96x/day.
   const leakBar = asNum(rule.leak_bar_per_week) ?? 0.15;
-  const tires = (await getTirePressures(env, rule.vin, 30).catch(() => null)) as
+  const tires = ((await cachedRead(env, `sentinel:tires:${rule.vin}:30`, SENTINEL_CACHE_TTL_S, () =>
+    getTirePressures(env, rule.vin, 30),
+  ).catch(() => null))?.value ?? null) as
     | { trend_bar_per_week?: Record<string, number> | null; latest?: Record<string, number> | null }
     | null;
   const trend = tires?.trend_bar_per_week;
@@ -649,7 +768,9 @@ async function evalSentinel(env: Env, rule: AutomationRule): Promise<boolean> {
     }
   }
   // Phantom-drain regression: awake-idle drain far above the sleep baseline.
-  const vamp = (await getVampireDrain(env, rule.vin, 21).catch(() => null)) as
+  const vamp = ((await cachedRead(env, `sentinel:vampire:${rule.vin}:21`, SENTINEL_CACHE_TTL_S, () =>
+    getVampireDrain(env, rule.vin, 21),
+  ).catch(() => null))?.value ?? null) as
     | { awake?: { pct_per_day?: number | null } | null; sleep?: { pct_per_day?: number | null } | null }
     | null;
   const awake = vamp?.awake?.pct_per_day;
@@ -960,6 +1081,591 @@ export async function runMaintenanceIfDue(env: Env, summary: Record<string, unkn
   const cacheRows = await pruneReadCache(env);
   if (cacheRows > 0) summary.read_cache_pruned = cacheRows;
   summary.maintenance = "ran";
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// Retroactive per-field compression
+// ---------------------------------------------------------------------------
+
+/** Its own cadence, not the daily maintenance one — see runCompressionIfDue. */
+const COMPRESS_INTERVAL_S = 6 * 3600;
+const COMPRESS_TS_KEY = "compress_ts";
+/** Leave the newest days alone: still being written, and already write-filtered. */
+const COMPRESS_LAG_DAYS = 2;
+const compressCursorKey = (vin: string, tier: Tier): string => `compress_cursor:${vin}:${tier}`;
+
+/**
+ * Each tier gets its own cursor, and every day is swept once per tier as it
+ * ages past that tier's threshold: hot when it is first eligible, again as warm
+ * at 7 days, again as cold at 90. A single monotonic cursor could not do this —
+ * it passes a day once and never returns, so the day would keep whatever
+ * precision it had when it was new, forever.
+ */
+const TIER_LAG_DAYS: Record<Tier, number> = {
+  hot: COMPRESS_LAG_DAYS,
+  warm: TIER_WARM_AFTER_DAYS,
+  cold: TIER_COLD_AFTER_DAYS,
+};
+const TIER_ORDER: Tier[] = ["cold", "warm", "hot"];
+/** Rows this sweep may delete per run. Deletes count against rows_written. */
+const COMPRESS_DEFAULT_ROWS_PER_RUN = 20_000;
+/** Skip a field-day whose keeper list is too long to express as one NOT IN. */
+const MAX_KEEPERS_PER_STATEMENT = 400;
+const DAY_S = 86400;
+
+interface DriveWindow {
+  start_ts: number;
+  end_ts: number;
+}
+
+/** Is this sample inside a recorded drive? Those are never thinned. */
+function insideDrive(ts: number, drives: DriveWindow[]): boolean {
+  for (const d of drives) if (ts >= d.start_ts && ts <= d.end_ts) return true;
+  return false;
+}
+
+/**
+ * Split one field's day into the runs that sit BETWEEN drives.
+ *
+ * Compressing the parked samples as one series would let the door interpolate
+ * straight across a drive and drop the readings on either side of it. Each
+ * parked run is compressed on its own instead, so it keeps its own endpoints
+ * and the drive stays bracketed by real samples.
+ */
+function parkedRuns(points: Point[], drives: DriveWindow[]): Point[][] {
+  const runs: Point[][] = [];
+  let current: Point[] = [];
+  for (const p of points) {
+    if (insideDrive(p.ts, drives)) {
+      if (current.length) runs.push(current);
+      current = [];
+      continue;
+    }
+    current.push(p);
+  }
+  if (current.length) runs.push(current);
+  return runs;
+}
+
+/**
+ * The last sample retained for this field BEFORE `from`.
+ *
+ * The sweep works a day at a time, but a signal does not stop at midnight.
+ * Handing this to compressSeries is what lets an unchanged opening value be
+ * dropped instead of retained just for being first — the difference between a
+ * static day costing one row per field and costing none. One indexed seek per
+ * field-day.
+ */
+async function previousSample(env: Env, vin: string, field: string, from: number): Promise<Point | undefined> {
+  const row = await env.DB.prepare(
+    `SELECT ts, value_num, value_text FROM telemetry_events
+     WHERE vin = ?1 AND field = ?2 AND ts < ?3 ORDER BY ts DESC LIMIT 1`,
+  )
+    .bind(vin, field, from)
+    .first<{ ts: number; value_num: number | null; value_text: string | null }>();
+  return row ? { ts: row.ts, value: row.value_num ?? row.value_text } : undefined;
+}
+
+/** Read one field's samples for one UTC day. Seeks the (vin, field, ts) PK. */
+async function readFieldDay(env: Env, vin: string, field: string, from: number, to: number): Promise<Point[]> {
+  const rs = await env.DB.prepare(
+    `SELECT ts, value_num, value_text FROM telemetry_events
+     WHERE vin = ?1 AND field = ?2 AND ts >= ?3 AND ts < ?4 ORDER BY ts ASC`,
+  )
+    .bind(vin, field, from, to)
+    .all<{ ts: number; value_num: number | null; value_text: string | null }>();
+  return (rs.results ?? []).map((r) => ({ ts: r.ts, value: r.value_num ?? r.value_text }));
+}
+
+/**
+ * Compress one (vin, field-or-group, UTC day) and delete what it no longer
+ * needs. Returns rows removed.
+ *
+ * Deleting by range-minus-keepers rather than by an IN list of victims keeps
+ * this to ONE statement per field however many rows go: the keepers are few by
+ * construction, the victims are not.
+ */
+async function compressFieldDay(
+  env: Env,
+  vin: string,
+  fields: string[],
+  from: number,
+  to: number,
+  drives: DriveWindow[],
+  tier: Tier,
+): Promise<number> {
+  const series = new Map<string, Point[]>();
+  for (const field of fields) {
+    const pts = await readFieldDay(env, vin, field, from, to);
+    if (pts.length > 0) series.set(field, pts);
+  }
+  if (series.size === 0) return 0;
+
+  // Keepers per field: everything inside a drive, plus the compressed parked
+  // runs. Group members are then reconciled onto a shared timestamp set.
+  const keepTs = new Map<string, Set<number>>();
+  const groupUnion = new Set<number>();
+  let grouped = false;
+
+  for (const [field, pts] of series) {
+    const rule = ruleForTier(field, tier);
+    const keep = new Set<number>();
+    for (const p of pts) if (insideDrive(p.ts, drives)) keep.add(p.ts);
+    const prior = await previousSample(env, vin, field, from);
+    const runs = parkedRuns(pts, drives);
+    for (let i = 0; i < runs.length; i++) {
+      // Only the first run continues from before the window, and only the last
+      // one is continued by the next window.
+      const opts = {
+        previous: i === 0 ? prior : undefined,
+        openEnd: i === runs.length - 1,
+      };
+      for (const p of compressSeries(runs[i]!, rule, opts).keep) keep.add(p.ts);
+    }
+    keepTs.set(field, keep);
+    if (rule.group !== undefined) {
+      grouped = true;
+      for (const ts of keep) groupUnion.add(ts);
+    }
+  }
+  if (grouped) {
+    for (const [field, pts] of series) {
+      if (ruleFor(field).group === undefined) continue;
+      const keep = keepTs.get(field)!;
+      for (const p of pts) if (groupUnion.has(p.ts)) keep.add(p.ts);
+    }
+  }
+
+  let removed = 0;
+  for (const [field, pts] of series) {
+    const keep = keepTs.get(field)!;
+    if (keep.size >= pts.length) continue;
+    if (keep.size > MAX_KEEPERS_PER_STATEMENT) continue; // barely compressible anyway
+    const list = [...keep].sort((a, b) => a - b).join(",");
+    const res = await env.DB.prepare(
+      `DELETE FROM telemetry_events
+       WHERE vin = ?1 AND field = ?2 AND ts >= ?3 AND ts < ?4 AND ts NOT IN (${list})`,
+    )
+      .bind(vin, field, from, to)
+      .run();
+    removed += res.meta.changes ?? 0;
+  }
+  return removed;
+}
+
+/**
+ * Columns the `positions` row door considers.
+ *
+ * `heading` is left out on purpose: it is circular, so 359 -> 0 is a one-degree
+ * change that any linear cone reads as 359 and would force every row to be kept.
+ * It is constant while parked anyway, which is the only time this runs.
+ */
+const POSITION_DOOR_COLUMNS = [
+  "lat", "lon", "elevation", "speed", "power", "odometer", "soc", "usable_soc",
+  "energy_remaining", "rated_range", "est_range", "ideal_range", "inside_temp",
+  "outside_temp", "charging_state", "charger_power", "charger_voltage",
+  "charger_current", "charge_energy_added", "lon_accel", "lat_accel", "brake_pedal",
+];
+
+/** `activity` is derived rather than a telemetry field, so it needs its own rule. */
+const ACTIVITY_RULE: FieldRule = { rule: { kind: "step" }, maxGapS: DEFAULT_MAX_GAP_S };
+
+/**
+ * `positions` is swept a whole day at a time, not in slices.
+ *
+ * Slicing it kept each DELETE's keeper list small, but every slice also had to
+ * retain its own opening row, which put a floor of one row per slice per day
+ * under a table whose entire remaining job is to be a once-per-20h heartbeat.
+ * A parked day holds a few hundred rows, so one statement covers it; the
+ * keeper cap below catches the pathological case.
+ */
+const POSITION_WINDOW_S = DAY_S;
+/** Positions keeper lists are a union over 23 columns, so they run longer. */
+const MAX_POSITION_KEEPERS = 1000;
+
+/** The last retained parked `positions` row before `from`, for cross-window context. */
+async function previousPositionRow(
+  env: Env,
+  vin: string,
+  from: number,
+): Promise<(Record<string, unknown> & { ts: number }) | null> {
+  return await env.DB.prepare(
+    `SELECT ts, activity, ${POSITION_DOOR_COLUMNS.join(", ")} FROM positions
+     WHERE vin = ?1 AND ts < ?2 AND drive_id IS NULL ORDER BY ts DESC LIMIT 1`,
+  )
+    .bind(vin, from)
+    .first<Record<string, unknown> & { ts: number }>();
+}
+
+/**
+ * Thin one window of PARKED `positions` rows.
+ *
+ * Unlike telemetry_events, the 23 position columns share a row keyed (vin, ts),
+ * so a column cannot be dropped on its own — nulling one saves bytes, and D1
+ * bills rows. This is therefore a multivariate door: every compressible column
+ * is run separately and the row survives if ANY of them still needs it.
+ *
+ * `odometer` is what makes this safe for drive recovery. As a counter it is flat
+ * while parked, so retaining both endpoints of every odometer run preserves the
+ * exact adjacent pairs backfillSyntheticDrives inspects — it still sees the same
+ * jumps across the same gaps and can neither fabricate nor lose a drive.
+ * `activity` and `charging_state` are step columns, so every stage transition
+ * survives and the battery-timeline segments stay exact.
+ */
+async function compressPositionsWindow(
+  env: Env,
+  vin: string,
+  from: number,
+  to: number,
+  drives: DriveWindow[],
+  tier: Tier,
+): Promise<number> {
+  const rs = await env.DB.prepare(
+    `SELECT ts, activity, ${POSITION_DOOR_COLUMNS.join(", ")} FROM positions
+     WHERE vin = ?1 AND ts >= ?2 AND ts < ?3 AND drive_id IS NULL ORDER BY ts ASC`,
+  )
+    .bind(vin, from, to)
+    .all<Record<string, unknown> & { ts: number }>();
+  const rows = rs.results ?? [];
+  if (rows.length < 3) return 0;
+
+  // The liveness witness. Every per-field anchor was removed in favour of this
+  // one row: a positions row inside a window proves telemetry was flowing
+  // through it, so a field with nothing stored there simply did not change.
+  //
+  // The clock continues from the last row retained BEFORE this window rather
+  // than restarting at its first row — otherwise every day would owe a heartbeat
+  // of its own, and a car left parked for a week would pay seven instead of the
+  // eight the interval actually calls for.
+  const prevRow = await previousPositionRow(env, vin, from);
+  const keep = new Set<number>();
+  let lastHeartbeat = prevRow?.ts ?? -Infinity;
+  if (prevRow === null) keep.add(rows[0]!.ts); // nothing before it: this is the first witness
+  for (const r of rows) {
+    if (r.ts - lastHeartbeat >= POSITION_HEARTBEAT_S) {
+      keep.add(r.ts);
+      lastHeartbeat = r.ts;
+    }
+  }
+  // drive_id already excludes tagged rows, but a synthetic drive has no
+  // positions at all, so an untagged row can still sit inside a drive window.
+  for (const r of rows) if (insideDrive(r.ts, drives)) keep.add(r.ts);
+
+  for (const col of ["activity", ...POSITION_DOOR_COLUMNS]) {
+    const rule = col === "activity" ? ACTIVITY_RULE : ruleForTier(col, tier);
+    if (rule.rule.kind === "never") continue;
+    const pts: Point[] = rows.map((r) => ({
+      ts: r.ts,
+      value: (r[col] ?? null) as number | string | null,
+    }));
+    const runs = parkedRuns(pts, drives);
+    for (let i = 0; i < runs.length; i++) {
+      const prior =
+        i === 0 && prevRow !== null
+          ? { ts: prevRow.ts, value: (prevRow[col] ?? null) as number | string | null }
+          : undefined;
+      const opts = { previous: prior, openEnd: i === runs.length - 1 };
+      for (const p of compressSeries(runs[i]!, rule, opts).keep) keep.add(p.ts);
+    }
+  }
+
+  if (keep.size >= rows.length) return 0;
+  if (keep.size > MAX_POSITION_KEEPERS) return 0;
+  const list = [...keep].sort((a, b) => a - b).join(",");
+  const res = await env.DB.prepare(
+    `DELETE FROM positions
+     WHERE vin = ?1 AND ts >= ?2 AND ts < ?3 AND drive_id IS NULL AND ts NOT IN (${list})`,
+  )
+    .bind(vin, from, to)
+    .run();
+  return res.meta.changes ?? 0;
+}
+
+/**
+ * Accelerations above which a sample is a harsh event and is kept whatever its
+ * age. Mirrors scoring.ts (HARSH_ACCEL 2.5, HARSH_BRAKE 3.0, HARSH_LAT 3.5) with
+ * a little margin, so the route door can never quietly erase the samples the
+ * chart explorer draws its safety markers from — that file carries an explicit
+ * "downsampling must not eat safety events" guarantee and this must not become
+ * the thing that breaks it.
+ *
+ * The per-drive COUNTS live on the drives row and are untouchable by this pass;
+ * this is about the dots on the timeline still lining up with them.
+ */
+const HARSH_KEEP_MS2 = 2.4;
+
+/**
+ * Rule overrides that apply ONLY inside a drive.
+ *
+ * `odometer` is a `counter` everywhere else, meaning run-endpoint retention —
+ * exactly right while parked, where it is flat and both ends of every run must
+ * survive so backfillSyntheticDrives still sees the same odometer jumps. Inside
+ * a drive it climbs on every single sample, so every row is a run boundary and
+ * the rule degenerates to keeping the entire route.
+ *
+ * That is safe to override here precisely because the synthetic-drive recovery
+ * only ever inspects rows with `drive_id IS NULL`. Within a drive the odometer
+ * is a smooth ramp, which is the door's best case: two points, with every
+ * intermediate distance recovered by interpolation to within the band.
+ */
+const DRIVE_ROUTE_OVERRIDES: Record<string, Rule> = {
+  odometer: { kind: "analog", epsilon: 0.01 }, // km, so ~10 m before tier scaling
+  charge_energy_added: { kind: "analog", epsilon: 0.05 },
+};
+
+/** Drives to consider per run, bounding one invocation's round-trips. */
+const DRIVE_COMPACT_BATCH = 25;
+
+/**
+ * Thin one finished drive's route with the value-aware door.
+ *
+ * A GPS trace run through the lat/lon door with a metric tolerance IS
+ * Douglas-Peucker on that trace — the standard route-simplification algorithm,
+ * already written and tested here. At the cold tier lat/lon carry roughly a 9 m
+ * band, invisible at map zoom, while dropping most of the straight-line samples
+ * a motorway generates.
+ *
+ * Safe because every derived figure about a drive — distance, energy,
+ * efficiency, avg/max speed and power, and the whole behaviour block including
+ * the harsh-event counts and behavior_score — is computed in closeDrive AT CLOSE
+ * and stored on the `drives` row. Nothing here can move any of them. It is the
+ * repo's own principle: the summary is permanent, the fine-grained history is not.
+ */
+async function compressDriveRoute(env: Env, driveId: number, tier: Tier): Promise<number> {
+  const rs = await env.DB.prepare(
+    `SELECT ts, ${POSITION_DOOR_COLUMNS.join(", ")} FROM positions
+     WHERE drive_id = ?1 ORDER BY ts ASC`,
+  )
+    .bind(driveId)
+    .all<Record<string, unknown> & { ts: number }>();
+  const rows = rs.results ?? [];
+  if (rows.length < 3) return 0;
+
+  // Endpoints always survive: they anchor the drawn route to the drive's own
+  // start_ts/end_ts and start/end coordinates.
+  const keep = new Set<number>([rows[0]!.ts, rows[rows.length - 1]!.ts]);
+
+  for (const r of rows) {
+    const lon = Number(r.lon_accel);
+    const lat = Number(r.lat_accel);
+    if (
+      (Number.isFinite(lon) && Math.abs(lon) >= HARSH_KEEP_MS2) ||
+      (Number.isFinite(lat) && Math.abs(lat) >= HARSH_KEEP_MS2)
+    ) {
+      keep.add(r.ts);
+    }
+  }
+
+  for (const col of POSITION_DOOR_COLUMNS) {
+    const override = DRIVE_ROUTE_OVERRIDES[col];
+    const rule = override !== undefined
+      ? { ...ruleForTier(col, tier), rule: scaleForTier(override, tier) }
+      : ruleForTier(col, tier);
+    if (rule.rule.kind === "never") continue;
+    const pts: Point[] = rows.map((r) => ({
+      ts: r.ts,
+      value: (r[col] ?? null) as number | string | null,
+    }));
+    // One drive is one series: there is no neighbouring window to carry context
+    // across, so the endpoints are seeded rather than inherited.
+    for (const p of compressSeries(pts, rule).keep) keep.add(p.ts);
+  }
+
+  if (keep.size >= rows.length) return 0;
+  if (keep.size > MAX_POSITION_KEEPERS) return 0;
+  const list = [...keep].sort((a, b) => a - b).join(",");
+  const res = await env.DB.prepare(
+    `DELETE FROM positions WHERE drive_id = ?1 AND ts NOT IN (${list})`,
+  )
+    .bind(driveId)
+    .run();
+  return res.meta.changes ?? 0;
+}
+
+/**
+ * Thin the routes of drives old enough to have aged out of the hot tier.
+ *
+ * Marks `drives.positions_compacted` on the way through, which makes this
+ * idempotent AND makes the backlog an index seek (idx_drives_compact) instead of
+ * a scan. It is the same marker the 365-day stride-based decimateSeries pass
+ * uses, so a drive the door has already handled is skipped there rather than
+ * thinned a second time by a value-blind algorithm.
+ */
+async function compressOldDriveRoutes(
+  env: Env,
+  rowBudget: number,
+): Promise<{ drives: number; removed: number }> {
+  const nowTs = Math.floor(Date.now() / 1000);
+  const cutoff = nowTs - TIER_WARM_AFTER_DAYS * DAY_S;
+  const rs = await env.DB.prepare(
+    `SELECT id, start_ts FROM drives
+     WHERE status = 'complete' AND start_ts < ?1
+       AND (positions_compacted IS NULL OR positions_compacted = 0)
+     ORDER BY start_ts ASC LIMIT ?2`,
+  )
+    .bind(cutoff, DRIVE_COMPACT_BATCH)
+    .all<{ id: number; start_ts: number }>();
+
+  let removed = 0;
+  let drives = 0;
+  for (const d of rs.results ?? []) {
+    if (removed >= rowBudget) break;
+    removed += await compressDriveRoute(env, d.id, tierForAge(nowTs - d.start_ts));
+    await env.DB.prepare(`UPDATE drives SET positions_compacted = 1 WHERE id = ?1`).bind(d.id).run();
+    drives++;
+  }
+  return { drives, removed };
+}
+
+/**
+ * Oldest stored sample for a VIN across BOTH thinnable tables, or null.
+ *
+ * Both tables matter: a VIN can have `positions` and no EAV rows at all (every
+ * field it streams is a structured column), and seeding the cursor from
+ * telemetry_events alone would skip that vehicle's positions forever. Each side
+ * is an index seek — idx_events_vin_ts and idx_positions_vin_ts.
+ */
+async function oldestSampleTs(env: Env, vin: string): Promise<number | null> {
+  const [ev, pos] = await Promise.all([
+    env.DB.prepare(`SELECT ts FROM telemetry_events WHERE vin = ?1 ORDER BY ts ASC LIMIT 1`)
+      .bind(vin)
+      .first<{ ts: number }>(),
+    env.DB.prepare(`SELECT ts FROM positions WHERE vin = ?1 ORDER BY ts ASC LIMIT 1`)
+      .bind(vin)
+      .first<{ ts: number }>(),
+  ]);
+  const found = [ev?.ts, pos?.ts].filter((t): t is number => typeof t === "number");
+  return found.length > 0 ? Math.min(...found) : null;
+}
+
+/** The units of work for one day: each field group whole, then the singletons. */
+function compressionUnits(): string[][] {
+  const grouped = new Set<string>();
+  const units: string[][] = [];
+  for (const members of Object.values(FIELD_GROUPS)) {
+    units.push([...members]);
+    for (const f of members) grouped.add(f);
+  }
+  for (const field of registeredFields()) {
+    if (grouped.has(field)) continue;
+    if (ruleFor(field).rule.kind === "never") continue;
+    units.push([field]);
+  }
+  return units;
+}
+
+/**
+ * Re-run the real swinging door over stored history, oldest day first.
+ *
+ * The write-side gate stops the table growing; this is what shrinks it. It is
+ * budget-aware in both directions, because on the free tier BOTH limits bind:
+ * reading a day of un-compressed history costs tens of thousands of rows_read,
+ * and every delete counts against the 100k/day rows_written cap. So it checks
+ * readBudget() before starting each day and stops the moment a run has removed
+ * COMPRESS_BACKFILL_ROWS_PER_RUN rows.
+ *
+ * That makes the backlog a slow grind on the free tier — a day or so of history
+ * per run — and a single night's work on a paid plan, without the code knowing
+ * which it is on. Progress is a per-VIN cursor in app_state, so a run that is
+ * cut short resumes exactly where it stopped rather than rescanning.
+ */
+export async function compressOldHistory(env: Env, summary: Record<string, unknown>): Promise<void> {
+  if (env.COMPRESS_ENABLED === "0" || env.COMPRESS_ENABLED === "false") return;
+  const rawBudget = Number(env.COMPRESS_BACKFILL_ROWS_PER_RUN);
+  const rowBudget = Number.isFinite(rawBudget) && rawBudget > 0 ? rawBudget : COMPRESS_DEFAULT_ROWS_PER_RUN;
+
+  const startBudget = await readBudget(env).catch(() => null);
+  if (startBudget?.over_soft) {
+    summary.compress_skipped = "read_budget";
+    return;
+  }
+
+  const nowTs = Math.floor(Date.now() / 1000);
+  const today = Math.floor(nowTs / DAY_S) * DAY_S;
+  const units = compressionUnits();
+  let removed = 0;
+  const daysByTier: Record<string, number> = {};
+
+  try {
+    // Drive routes first. Once parked history has been swept they are what is
+    // left of the table, and each one is an indexed backlog entry rather than a
+    // day to walk, so they are the cheapest rows in the run.
+    const routes = await compressOldDriveRoutes(env, rowBudget);
+    removed += routes.removed;
+    if (routes.drives > 0) summary.compressed_drives = routes;
+
+    // Coldest first: those days are the cheapest to shrink and the least likely
+    // to be looked at, so when a run's budget is short they are what it should
+    // spend it on.
+    for (const tier of TIER_ORDER) {
+      if (removed >= rowBudget) break;
+      const stopAfter = today - TIER_LAG_DAYS[tier] * DAY_S;
+
+      for (const vin of await knownVins(env)) {
+        if (removed >= rowBudget) break;
+        const stored = Number((await getAppState(env, compressCursorKey(vin, tier)).catch(() => null)) ?? "0");
+        let cursor: number;
+        if (Number.isFinite(stored) && stored > 0) {
+          cursor = stored;
+        } else {
+          const oldest = await oldestSampleTs(env, vin);
+          if (oldest === null) continue; // nothing stored for this VIN yet
+          cursor = Math.floor(oldest / DAY_S) * DAY_S;
+        }
+
+        while (cursor < stopAfter && removed < rowBudget) {
+          const from = cursor;
+          const to = cursor + DAY_S;
+          const driveRs = await env.DB.prepare(
+            `SELECT start_ts, COALESCE(end_ts, start_ts) AS end_ts FROM drives
+             WHERE vin = ?1 AND start_ts < ?2 AND COALESCE(end_ts, start_ts) >= ?3`,
+          )
+            .bind(vin, to, from)
+            .all<DriveWindow>();
+          const drives = driveRs.results ?? [];
+
+          for (const fields of units) {
+            removed += await compressFieldDay(env, vin, fields, from, to, drives, tier);
+          }
+          // The structured per-sample table too, in sub-day windows so the
+          // keeper list of one DELETE stays small.
+          for (let w = from; w < to; w += POSITION_WINDOW_S) {
+            removed += await compressPositionsWindow(env, vin, w, Math.min(w + POSITION_WINDOW_S, to), drives, tier);
+          }
+          daysByTier[tier] = (daysByTier[tier] ?? 0) + 1;
+          cursor = to;
+          await putAppState(env, compressCursorKey(vin, tier), String(cursor)).catch(() => {});
+
+          const budget = await readBudget(env).catch(() => null);
+          if (budget?.over_soft) {
+            summary.compress_stopped = "read_budget";
+            return;
+          }
+        }
+      }
+    }
+    const days = Object.values(daysByTier).reduce((a, b) => a + b, 0);
+    if (days > 0 || removed > 0) summary.compressed = { days, by_tier: daysByTier, rows_removed: removed };
+  } catch (e) {
+    summary.compress_error = String(e);
+  }
+}
+
+/**
+ * Runs the retroactive sweep at most once per COMPRESS_INTERVAL_S.
+ *
+ * Deliberately on a shorter clock than runMaintenanceIfDue's 24h: the backlog
+ * is bounded by the daily rows_written cap, so four modest runs a day clear
+ * meaningfully more of it than one, while each stays small enough that a run
+ * cut short by the budget loses nothing.
+ */
+export async function runCompressionIfDue(env: Env, summary: Record<string, unknown>): Promise<boolean> {
+  const now = Math.floor(Date.now() / 1000);
+  const last = Number((await getAppState(env, COMPRESS_TS_KEY).catch(() => "0")) ?? "0");
+  if (last && now - last < COMPRESS_INTERVAL_S) return false;
+  await putAppState(env, COMPRESS_TS_KEY, String(now)).catch(() => {});
+  await compressOldHistory(env, summary);
   return true;
 }
 

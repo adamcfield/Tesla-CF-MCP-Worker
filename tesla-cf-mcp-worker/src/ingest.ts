@@ -22,7 +22,7 @@
 import { recordSpend } from "./budget";
 import { evaluateOnIngest } from "./rules";
 import { getAppState, getLatest, LatestState, mergeLatest, POSITION_COLUMNS, putAppState, recordEvents, TelemetryEvent } from "./store";
-import { applyDerivation } from "./tracking";
+import { applyDerivation, deriveActivity } from "./tracking";
 import { Env } from "./types";
 
 /**
@@ -542,7 +542,12 @@ export async function applyIngest(env: Env, parsed: ParsedIngest): Promise<Lates
     return prior;
   }
 
-  await recordEvents(env, parsed.vin, events);
+  // Compress only while the car is parked. A drive is exactly when full
+  // fidelity matters, and it is a small share of the day; the parked hours are
+  // where the row volume actually comes from. deriveActivity needs the merged
+  // view, and mergeLatest has not run yet, so merge a throwaway copy here.
+  const driving = deriveActivity({ ...(prior ?? {}), ...patch, vin: parsed.vin, updated_at: parsed.ts }) === "driving";
+  await recordEvents(env, parsed.vin, events, { compress: !driving });
   const { previous, current } = await mergeLatest(env, parsed.vin, patch, parsed.ts);
   await applyDerivation(env, parsed.vin, parsed.ts, previous, current);
   await evaluateOnIngest(env, parsed.vin, previous, current);
@@ -788,5 +793,12 @@ export async function getTelemetryFieldStatus(env: Env, vin: string): Promise<un
         : null);
     return { tesla, canonical, value, last_seen: seen ?? null };
   });
-  return { vin, fields };
+  // `last_seen` now means "when this value last CHANGED", not "when the stream
+  // last carried it" — compression stores a field only when it moves, and
+  // liveness is witnessed once per vehicle by `positions` rather than by
+  // re-storing 163 fields on a timer. Without this companion stamp a field that
+  // has simply been steady for a month is indistinguishable from telemetry
+  // having died, and the Fields screen would read as broken when it is working
+  // exactly as intended.
+  return { vin, fields, stream_last_ts: pos?.last_ts ?? null };
 }

@@ -65,6 +65,81 @@ describe("hot-path query plans (D1 rows_read)", () => {
     await ensureSchema(env);
   });
 
+  it("the retroactive compression sweep seeks rather than scans", async () => {
+    // This sweep exists to REDUCE rows_read, so it must not be the thing that
+    // spends the budget. Every query it runs per (vin, field, day) has to ride
+    // an index: the PK (vin, field, ts) for the read and the delete,
+    // idx_events_vin_ts for the oldest-sample probe, idx_drives_vin_start for
+    // the drive windows it must not touch.
+    const read = await plan(
+      env,
+      `SELECT ts, value_num, value_text FROM telemetry_events
+       WHERE vin = ?1 AND field = ?2 AND ts >= ?3 AND ts < ?4 ORDER BY ts ASC`,
+      [VIN, "locked", NOW - DAY, NOW],
+    );
+    expect(fullScans(read, "telemetry_events")).toBe(false);
+
+    const del = await plan(
+      env,
+      `DELETE FROM telemetry_events
+       WHERE vin = ?1 AND field = ?2 AND ts >= ?3 AND ts < ?4 AND ts NOT IN (1,2,3)`,
+      [VIN, "locked", NOW - DAY, NOW],
+    );
+    expect(fullScans(del, "telemetry_events")).toBe(false);
+
+    const oldest = await plan(
+      env,
+      `SELECT ts FROM telemetry_events WHERE vin = ?1 ORDER BY ts ASC LIMIT 1`,
+      [VIN],
+    );
+    expect(fullScans(oldest, "telemetry_events")).toBe(false);
+
+    const oldestPos = await plan(
+      env,
+      `SELECT ts FROM positions WHERE vin = ?1 ORDER BY ts ASC LIMIT 1`,
+      [VIN],
+    );
+    expect(fullScans(oldestPos, "positions")).toBe(false);
+
+    const posWindow = await plan(
+      env,
+      `SELECT ts, activity, soc, odometer FROM positions
+       WHERE vin = ?1 AND ts >= ?2 AND ts < ?3 AND drive_id IS NULL ORDER BY ts ASC`,
+      [VIN, NOW - DAY, NOW],
+    );
+    expect(fullScans(posWindow, "positions")).toBe(false);
+
+    const windows = await plan(
+      env,
+      `SELECT start_ts, COALESCE(end_ts, start_ts) AS end_ts FROM drives
+       WHERE vin = ?1 AND start_ts < ?2 AND COALESCE(end_ts, start_ts) >= ?3`,
+      [VIN, NOW, NOW - DAY],
+    );
+    expect(fullScans(windows, "drives")).toBe(false);
+
+    // The drive-route pass: its backlog rides idx_drives_compact, and both the
+    // route read and the route delete ride idx_positions_drive.
+    const backlog = await plan(
+      env,
+      `SELECT id, start_ts FROM drives
+       WHERE status = 'complete' AND start_ts < ?1
+         AND (positions_compacted IS NULL OR positions_compacted = 0)
+       ORDER BY start_ts ASC LIMIT ?2`,
+      [NOW, 25],
+    );
+    expect(backlog).toContain("idx_drives_compact");
+
+    const route = await plan(env, `SELECT ts, lat, lon FROM positions WHERE drive_id = ?1 ORDER BY ts ASC`, [1]);
+    expect(fullScans(route, "positions")).toBe(false);
+
+    const routeDelete = await plan(
+      env,
+      `DELETE FROM positions WHERE drive_id = ?1 AND ts NOT IN (1,2,3)`,
+      [1],
+    );
+    expect(fullScans(routeDelete, "positions")).toBe(false);
+  });
+
   it("the /health liveness probe seeks the newest sample instead of grouping every one", async () => {
     // The old form — SELECT vin, MAX(ts) FROM positions GROUP BY vin — reads
     // one index entry per stored sample on EVERY watchdog call (every 15 min).

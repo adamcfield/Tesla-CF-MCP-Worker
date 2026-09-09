@@ -49,6 +49,11 @@ BUDGET_POLL_USD = "9.5"
 # Pause billed idle probes overnight (UTC hours). 21-3 = 00:00–06:00 Israel time.
 # Active driving/charging is still recorded; only the every-15-min idle probe pauses.
 QUIET_HOURS_UTC = "21-3"
+# Per-field telemetry compression at ingest. A parked car re-reports ~180 fields
+# every minute and almost none of them have changed; storing all of them is what
+# put the D1 free tier's 5M rows_read/day out of reach. Set "0" to store every
+# sample again (the retroactive grinder is unaffected by this switch).
+COMPRESS_ENABLED = "1"
 # IANA zone for night-scoring, monthly buckets, DST-aware schedules.
 DEFAULT_TZ = "Asia/Jerusalem"
 # Vehicles the Cloudflare cron polls each fire (reliable native polling).
