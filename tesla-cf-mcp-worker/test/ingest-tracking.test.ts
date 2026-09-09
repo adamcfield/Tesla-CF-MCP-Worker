@@ -249,10 +249,20 @@ describe("battery timeline derivation", () => {
     const tl = (await getBatteryTimeline(env, VIN, 24 * 366 * 100)) as any;
     const stages = tl.points.map((p: any) => p.stage);
     expect(stages).toEqual(["resting", "resting", "driving", "driving", "resting", "charging", "charging", "connected"]);
-    // stage_hours is rounded to 2dp, so 60s (0.016666h) rounds to 0.02.
-    expect(tl.stage_hours.driving).toBeCloseTo(60 / 3600, 2);
-    expect(tl.stage_hours.charging).toBeCloseTo(60 / 3600, 2);
-    expect(tl.stage_hours.resting).toBeCloseTo(60 / 3600, 2); // only the first resting segment has 2 samples
+    // A stage owns the time up to the START of the next stage, so the interval
+    // between two samples belongs to whichever stage was in effect during it.
+    // Closing a segment on its own last sample instead used to drop every
+    // inter-sample gap: driving read 60s rather than 120s, and the second
+    // resting segment — a single sample — contributed literally nothing.
+    //   resting  base+0   -> base+120  = 120s (two samples, then driving)
+    //   driving  base+120 -> base+240  = 120s
+    //   resting  base+240 -> base+300  =  60s (one sample, no longer zero)
+    //   charging base+300 -> base+420  = 120s
+    //   connected base+420             =   0s (nothing after it to bound it)
+    // The five segments now account for the whole 420s span, losing none of it.
+    expect(tl.stage_hours.driving).toBeCloseTo(120 / 3600, 2);
+    expect(tl.stage_hours.charging).toBeCloseTo(120 / 3600, 2);
+    expect(tl.stage_hours.resting).toBeCloseTo(180 / 3600, 2);
     // Last point is still open (no later sample), so it contributes no duration yet.
     expect(tl.stage_hours.connected).toBe(0);
     expect(tl.segments.length).toBe(5); // resting, driving, resting, charging, connected
