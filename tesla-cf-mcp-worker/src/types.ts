@@ -56,6 +56,12 @@ export interface Env {
    * volume that took D1 offline. Set "0" to store every sample again.
    */
   COMPRESS_ENABLED?: string;
+  /**
+   * Rows the retroactive compression sweep may delete per run (default 20000).
+   * Deletes count against D1's rows_written cap, which on the free tier is the
+   * binding constraint on how fast the backlog can clear.
+   */
+  COMPRESS_BACKFILL_ROWS_PER_RUN?: string;
 
   /**
    * Rows-read-per-UTC-day threshold past which the expensive analytical

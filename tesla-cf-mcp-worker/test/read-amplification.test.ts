@@ -65,6 +65,44 @@ describe("hot-path query plans (D1 rows_read)", () => {
     await ensureSchema(env);
   });
 
+  it("the retroactive compression sweep seeks rather than scans", async () => {
+    // This sweep exists to REDUCE rows_read, so it must not be the thing that
+    // spends the budget. Every query it runs per (vin, field, day) has to ride
+    // an index: the PK (vin, field, ts) for the read and the delete,
+    // idx_events_vin_ts for the oldest-sample probe, idx_drives_vin_start for
+    // the drive windows it must not touch.
+    const read = await plan(
+      env,
+      `SELECT ts, value_num, value_text FROM telemetry_events
+       WHERE vin = ?1 AND field = ?2 AND ts >= ?3 AND ts < ?4 ORDER BY ts ASC`,
+      [VIN, "locked", NOW - DAY, NOW],
+    );
+    expect(fullScans(read, "telemetry_events")).toBe(false);
+
+    const del = await plan(
+      env,
+      `DELETE FROM telemetry_events
+       WHERE vin = ?1 AND field = ?2 AND ts >= ?3 AND ts < ?4 AND ts NOT IN (1,2,3)`,
+      [VIN, "locked", NOW - DAY, NOW],
+    );
+    expect(fullScans(del, "telemetry_events")).toBe(false);
+
+    const oldest = await plan(
+      env,
+      `SELECT ts FROM telemetry_events WHERE vin = ?1 ORDER BY ts ASC LIMIT 1`,
+      [VIN],
+    );
+    expect(fullScans(oldest, "telemetry_events")).toBe(false);
+
+    const windows = await plan(
+      env,
+      `SELECT start_ts, COALESCE(end_ts, start_ts) AS end_ts FROM drives
+       WHERE vin = ?1 AND start_ts < ?2 AND COALESCE(end_ts, start_ts) >= ?3`,
+      [VIN, NOW, NOW - DAY],
+    );
+    expect(fullScans(windows, "drives")).toBe(false);
+  });
+
   it("the /health liveness probe seeks the newest sample instead of grouping every one", async () => {
     // The old form — SELECT vin, MAX(ts) FROM positions GROUP BY vin — reads
     // one index entry per stored sample on EVERY watchdog call (every 15 min).

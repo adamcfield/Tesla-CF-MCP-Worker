@@ -26,7 +26,8 @@
 import { generateBrief, generateCoachNote } from "./ai";
 import { getVehicle, getVehicleData } from "./api";
 import { getBudgetCallLog, getBudgetForecast, getBudgetStatus } from "./budget";
-import { cachedRead, pruneReadCache } from "./d1meter";
+import { compressSeries, FIELD_GROUPS, Point, registeredFields, ruleFor } from "./compress";
+import { cachedRead, pruneReadCache, readBudget } from "./d1meter";
 import * as cmd from "./commands";
 import { applyVehicleData } from "./ingest";
 import { getAppState, getLatest, knownVins, LatestState, logAlert, putAppState, tzOffsetMinutes } from "./store";
@@ -659,6 +660,7 @@ async function runCronTickInner(env: Env): Promise<Record<string, unknown>> {
   // runMaintenanceIfDue. Both work against ~year-old cutoffs, so a 15-minute
   // cadence bought nothing and cost the D1 rows_read budget every time.
   await runMaintenanceIfDue(env, summary);
+  await runCompressionIfDue(env, summary);
   // Second pass for anything logged later in the tick (ladder steps, rule
   // errors) — the first pass already marked its rows delivered, so this only
   // sends what's genuinely new.
@@ -1079,6 +1081,253 @@ export async function runMaintenanceIfDue(env: Env, summary: Record<string, unkn
   const cacheRows = await pruneReadCache(env);
   if (cacheRows > 0) summary.read_cache_pruned = cacheRows;
   summary.maintenance = "ran";
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// Retroactive per-field compression
+// ---------------------------------------------------------------------------
+
+/** Its own cadence, not the daily maintenance one — see runCompressionIfDue. */
+const COMPRESS_INTERVAL_S = 6 * 3600;
+const COMPRESS_TS_KEY = "compress_ts";
+const compressCursorKey = (vin: string): string => `compress_cursor:${vin}`;
+/** Rows this sweep may delete per run. Deletes count against rows_written. */
+const COMPRESS_DEFAULT_ROWS_PER_RUN = 20_000;
+/** Leave the newest days alone: still being written, and already write-filtered. */
+const COMPRESS_LAG_DAYS = 2;
+/** Skip a field-day whose keeper list is too long to express as one NOT IN. */
+const MAX_KEEPERS_PER_STATEMENT = 400;
+const DAY_S = 86400;
+
+interface DriveWindow {
+  start_ts: number;
+  end_ts: number;
+}
+
+/** Is this sample inside a recorded drive? Those are never thinned. */
+function insideDrive(ts: number, drives: DriveWindow[]): boolean {
+  for (const d of drives) if (ts >= d.start_ts && ts <= d.end_ts) return true;
+  return false;
+}
+
+/**
+ * Split one field's day into the runs that sit BETWEEN drives.
+ *
+ * Compressing the parked samples as one series would let the door interpolate
+ * straight across a drive and drop the readings on either side of it. Each
+ * parked run is compressed on its own instead, so it keeps its own endpoints
+ * and the drive stays bracketed by real samples.
+ */
+function parkedRuns(points: Point[], drives: DriveWindow[]): Point[][] {
+  const runs: Point[][] = [];
+  let current: Point[] = [];
+  for (const p of points) {
+    if (insideDrive(p.ts, drives)) {
+      if (current.length) runs.push(current);
+      current = [];
+      continue;
+    }
+    current.push(p);
+  }
+  if (current.length) runs.push(current);
+  return runs;
+}
+
+/** Read one field's samples for one UTC day. Seeks the (vin, field, ts) PK. */
+async function readFieldDay(env: Env, vin: string, field: string, from: number, to: number): Promise<Point[]> {
+  const rs = await env.DB.prepare(
+    `SELECT ts, value_num, value_text FROM telemetry_events
+     WHERE vin = ?1 AND field = ?2 AND ts >= ?3 AND ts < ?4 ORDER BY ts ASC`,
+  )
+    .bind(vin, field, from, to)
+    .all<{ ts: number; value_num: number | null; value_text: string | null }>();
+  return (rs.results ?? []).map((r) => ({ ts: r.ts, value: r.value_num ?? r.value_text }));
+}
+
+/**
+ * Compress one (vin, field-or-group, UTC day) and delete what it no longer
+ * needs. Returns rows removed.
+ *
+ * Deleting by range-minus-keepers rather than by an IN list of victims keeps
+ * this to ONE statement per field however many rows go: the keepers are few by
+ * construction, the victims are not.
+ */
+async function compressFieldDay(
+  env: Env,
+  vin: string,
+  fields: string[],
+  from: number,
+  to: number,
+  drives: DriveWindow[],
+): Promise<number> {
+  const series = new Map<string, Point[]>();
+  for (const field of fields) {
+    const pts = await readFieldDay(env, vin, field, from, to);
+    if (pts.length >= 3) series.set(field, pts);
+  }
+  if (series.size === 0) return 0;
+
+  // Keepers per field: everything inside a drive, plus the compressed parked
+  // runs. Group members are then reconciled onto a shared timestamp set.
+  const keepTs = new Map<string, Set<number>>();
+  const groupUnion = new Set<number>();
+  let grouped = false;
+
+  for (const [field, pts] of series) {
+    const rule = ruleFor(field);
+    const keep = new Set<number>();
+    for (const p of pts) if (insideDrive(p.ts, drives)) keep.add(p.ts);
+    for (const run of parkedRuns(pts, drives)) {
+      for (const p of compressSeries(run, rule).keep) keep.add(p.ts);
+    }
+    keepTs.set(field, keep);
+    if (rule.group !== undefined) {
+      grouped = true;
+      for (const ts of keep) groupUnion.add(ts);
+    }
+  }
+  if (grouped) {
+    for (const [field, pts] of series) {
+      if (ruleFor(field).group === undefined) continue;
+      const keep = keepTs.get(field)!;
+      for (const p of pts) if (groupUnion.has(p.ts)) keep.add(p.ts);
+    }
+  }
+
+  let removed = 0;
+  for (const [field, pts] of series) {
+    const keep = keepTs.get(field)!;
+    if (keep.size >= pts.length) continue;
+    if (keep.size > MAX_KEEPERS_PER_STATEMENT) continue; // barely compressible anyway
+    const list = [...keep].sort((a, b) => a - b).join(",");
+    const res = await env.DB.prepare(
+      `DELETE FROM telemetry_events
+       WHERE vin = ?1 AND field = ?2 AND ts >= ?3 AND ts < ?4 AND ts NOT IN (${list})`,
+    )
+      .bind(vin, field, from, to)
+      .run();
+    removed += res.meta.changes ?? 0;
+  }
+  return removed;
+}
+
+/** Oldest stored sample for a VIN, or null. Seeks idx_events_vin_ts. */
+async function oldestSampleTs(env: Env, vin: string): Promise<number | null> {
+  const row = await env.DB.prepare(
+    `SELECT ts FROM telemetry_events WHERE vin = ?1 ORDER BY ts ASC LIMIT 1`,
+  )
+    .bind(vin)
+    .first<{ ts: number }>();
+  return row?.ts ?? null;
+}
+
+/** The units of work for one day: each field group whole, then the singletons. */
+function compressionUnits(): string[][] {
+  const grouped = new Set<string>();
+  const units: string[][] = [];
+  for (const members of Object.values(FIELD_GROUPS)) {
+    units.push([...members]);
+    for (const f of members) grouped.add(f);
+  }
+  for (const field of registeredFields()) {
+    if (grouped.has(field)) continue;
+    if (ruleFor(field).rule.kind === "never") continue;
+    units.push([field]);
+  }
+  return units;
+}
+
+/**
+ * Re-run the real swinging door over stored history, oldest day first.
+ *
+ * The write-side gate stops the table growing; this is what shrinks it. It is
+ * budget-aware in both directions, because on the free tier BOTH limits bind:
+ * reading a day of un-compressed history costs tens of thousands of rows_read,
+ * and every delete counts against the 100k/day rows_written cap. So it checks
+ * readBudget() before starting each day and stops the moment a run has removed
+ * COMPRESS_BACKFILL_ROWS_PER_RUN rows.
+ *
+ * That makes the backlog a slow grind on the free tier — a day or so of history
+ * per run — and a single night's work on a paid plan, without the code knowing
+ * which it is on. Progress is a per-VIN cursor in app_state, so a run that is
+ * cut short resumes exactly where it stopped rather than rescanning.
+ */
+export async function compressOldHistory(env: Env, summary: Record<string, unknown>): Promise<void> {
+  if (env.COMPRESS_ENABLED === "0" || env.COMPRESS_ENABLED === "false") return;
+  const rawBudget = Number(env.COMPRESS_BACKFILL_ROWS_PER_RUN);
+  const rowBudget = Number.isFinite(rawBudget) && rawBudget > 0 ? rawBudget : COMPRESS_DEFAULT_ROWS_PER_RUN;
+
+  const startBudget = await readBudget(env).catch(() => null);
+  if (startBudget?.over_soft) {
+    summary.compress_skipped = "read_budget";
+    return;
+  }
+
+  const nowTs = Math.floor(Date.now() / 1000);
+  const stopAfter = Math.floor(nowTs / DAY_S) * DAY_S - COMPRESS_LAG_DAYS * DAY_S;
+  const units = compressionUnits();
+  let removed = 0;
+  let days = 0;
+
+  try {
+    for (const vin of await knownVins(env)) {
+      if (removed >= rowBudget) break;
+      const stored = Number((await getAppState(env, compressCursorKey(vin)).catch(() => null)) ?? "0");
+      let cursor: number;
+      if (Number.isFinite(stored) && stored > 0) {
+        cursor = stored;
+      } else {
+        const oldest = await oldestSampleTs(env, vin);
+        if (oldest === null) continue; // nothing stored for this VIN yet
+        cursor = Math.floor(oldest / DAY_S) * DAY_S;
+      }
+
+      while (cursor < stopAfter && removed < rowBudget) {
+        const from = cursor;
+        const to = cursor + DAY_S;
+        const driveRs = await env.DB.prepare(
+          `SELECT start_ts, COALESCE(end_ts, start_ts) AS end_ts FROM drives
+           WHERE vin = ?1 AND start_ts < ?2 AND COALESCE(end_ts, start_ts) >= ?3`,
+        )
+          .bind(vin, to, from)
+          .all<DriveWindow>();
+        const drives = driveRs.results ?? [];
+
+        for (const fields of units) {
+          removed += await compressFieldDay(env, vin, fields, from, to, drives);
+        }
+        days++;
+        cursor = to;
+        await putAppState(env, compressCursorKey(vin), String(cursor)).catch(() => {});
+
+        const budget = await readBudget(env).catch(() => null);
+        if (budget?.over_soft) {
+          summary.compress_stopped = "read_budget";
+          break;
+        }
+      }
+    }
+    if (days > 0 || removed > 0) summary.compressed = { days, rows_removed: removed };
+  } catch (e) {
+    summary.compress_error = String(e);
+  }
+}
+
+/**
+ * Runs the retroactive sweep at most once per COMPRESS_INTERVAL_S.
+ *
+ * Deliberately on a shorter clock than runMaintenanceIfDue's 24h: the backlog
+ * is bounded by the daily rows_written cap, so four modest runs a day clear
+ * meaningfully more of it than one, while each stays small enough that a run
+ * cut short by the budget loses nothing.
+ */
+export async function runCompressionIfDue(env: Env, summary: Record<string, unknown>): Promise<boolean> {
+  const now = Math.floor(Date.now() / 1000);
+  const last = Number((await getAppState(env, COMPRESS_TS_KEY).catch(() => "0")) ?? "0");
+  if (last && now - last < COMPRESS_INTERVAL_S) return false;
+  await putAppState(env, COMPRESS_TS_KEY, String(now)).catch(() => {});
+  await compressOldHistory(env, summary);
   return true;
 }
 
